@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -118,8 +122,10 @@ jobs:
             --publish 127.0.0.1:3000:3000 --read-only \
             --tmpfs /tmp:size=256m,mode=1777 \
             --security-opt no-new-privileges:true --cap-drop ALL "$TEST_IMAGE"
-          curl --fail --silent --show-error --retry 30 --retry-connrefused --retry-delay 1 \
-            http://127.0.0.1:3000/api/health | jq -e '.ok == true'
+          curl --fail --silent --show-error --retry 30 --retry-all-errors --retry-delay 1 \
+            --retry-max-time 60 --connect-timeout 2 --max-time 5 \
+            --output "$RUNNER_TEMP/health.json" http://127.0.0.1:3000/api/health
+          jq -e '.ok == true' "$RUNNER_TEMP/health.json"
           curl --fail --silent --show-error http://127.0.0.1:3000/api/status | jq -e '.initialized == false'
           curl --fail --silent --show-error http://127.0.0.1:3000/ > "$RUNNER_TEMP/index.html"
           grep -q 'id="root"' "$RUNNER_TEMP/index.html"
