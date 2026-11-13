@@ -1,0 +1,194 @@
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{Semaphore, watch};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug)]
+pub struct Error(pub StatusCode, pub String);
+impl Error {
+    pub fn bad(s: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, s.into())
+    }
+    pub fn denied(s: impl Into<String>) -> Self {
+        Self(StatusCode::FORBIDDEN, s.into())
+    }
+    pub fn missing() -> Self {
+        Self(StatusCode::NOT_FOUND, "内容不存在".into())
+    }
+    pub fn unauthorized() -> Self {
+        Self(StatusCode::UNAUTHORIZED, "请重新登录".into())
+    }
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.1)
+    }
+}
+impl std::error::Error for Error {}
+impl From<sqlx::Error> for Error {
+    fn from(e: sqlx::Error) -> Self {
+        tracing::error!(error = %e, "数据库操作失败");
+        Self(StatusCode::INTERNAL_SERVER_ERROR, "数据库操作失败".into())
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("文件操作失败：{}", e.kind()),
+        )
+    }
+}
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        (
+            self.0,
+            Json(json!({"error":self.1,"code":self.0.as_u16(),"msg":self.1,"data":null})),
+        )
+            .into_response()
+    }
+}
+
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+pub fn hash(v: impl AsRef<[u8]>) -> String {
+    Sha256::digest(v.as_ref())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+pub fn random() -> String {
+    rand::random::<[u8; 32]>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+pub fn guid(parts: &[&str]) -> String {
+    let h = hash(serde_json::to_vec(parts).unwrap());
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+pub fn text(v: &serde_json::Value, key: &str) -> String {
+    match &v[key] {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+#[derive(Clone)]
+pub struct App(pub Arc<Inner>);
+pub struct Inner {
+    pub db: SqlitePool,
+    pub data_dir: PathBuf,
+    pub forbid_proxy: watch::Sender<bool>,
+    pub allow_private: bool,
+    pub public_url: String,
+    pub probe_slots: Semaphore,
+    pub login_budget: Mutex<HashMap<String, (i64, usize)>>,
+    pub refresh_lock: tokio::sync::Mutex<()>,
+}
+impl std::ops::Deref for App {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
+}
+impl App {
+    pub async fn new(dir: PathBuf, allow_private: bool, public_url: String) -> Result<Self> {
+        tokio::fs::create_dir_all(&dir).await?;
+        let db = SqlitePoolOptions::new()
+            .max_connections(6)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(dir.join("tv.sqlite"))
+                    .create_if_missing(true)
+                    .foreign_keys(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_secs(10)),
+            )
+            .await?;
+        sqlx::raw_sql(include_str!("../migrations/0001.sql"))
+            .execute(&db)
+            .await?;
+        let blocked: String =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key='forbid_proxy'")
+                .fetch_one(&db)
+                .await?;
+        let (policy, _) = watch::channel(blocked == "true");
+        Ok(Self(Arc::new(Inner {
+            db,
+            data_dir: dir,
+            forbid_proxy: policy,
+            allow_private,
+            public_url,
+            probe_slots: Semaphore::new(2),
+            login_budget: Mutex::new(HashMap::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
+        })))
+    }
+    pub async fn cache_get(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        let v: Option<String> =
+            sqlx::query_scalar("SELECT value FROM cache WHERE key=? AND expires_at>?")
+                .bind(key)
+                .bind(now())
+                .fetch_optional(&self.db)
+                .await?;
+        Ok(v.and_then(|s| serde_json::from_str(&s).ok()))
+    }
+    pub async fn cache_put(&self, key: &str, v: &serde_json::Value, ttl: i64) -> Result<()> {
+        sqlx::query("INSERT INTO cache VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at")
+            .bind(key).bind(v.to_string()).bind(now()+ttl).execute(&self.db).await?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct User {
+    pub id: String,
+    pub username: String,
+    pub admin: bool,
+    pub disabled: bool,
+}
+#[derive(Clone)]
+pub struct Identity {
+    pub user: User,
+    pub auth_hash: String,
+    pub client: String,
+}
+impl Identity {
+    pub fn admin(&self) -> Result<()> {
+        if self.user.admin {
+            Ok(())
+        } else {
+            Err(Error::denied("仅管理员可执行此操作"))
+        }
+    }
+}

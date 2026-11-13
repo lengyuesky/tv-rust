@@ -1,0 +1,24 @@
+services:
+  tv-rust:
+    image: "${TV_IMAGE:-ghcr.io/lengyuesky/tv-rust:latest}"
+    build: .
+    ports:
+      - "${TV_PORT:-3000}:3000"
+    environment:
+      TV_PUBLIC_URL: "${TV_PUBLIC_URL:-}"
+      TV_ALLOW_PRIVATE_UPSTREAM: "${TV_ALLOW_PRIVATE_UPSTREAM:-0}"
+      RUST_LOG: tv_rust=info
+    volumes:
+      - tv-data:/data
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  tv-data:

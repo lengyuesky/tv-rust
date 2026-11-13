@@ -1,0 +1,12 @@
+/target/
+/data/
+/web/node_modules/
+/web/dist/
+/web/*.tsbuildinfo
+/tmp/
+/docs/images/
+/.env
+/.env.*
+!/.env.example
+*.sqlite*
+.DS_Store

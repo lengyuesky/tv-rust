@@ -1,0 +1,225 @@
+name: 检查与原生双架构镜像发布
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 格式、Rust 测试与网页构建
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装原生依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg build-essential cmake pkg-config
+      - name: 检查发布版本
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "$GITHUB_REF_NAME" = "v$version"
+          web_version=$(node -p "require('./web/package.json').version")
+          test "$web_version" = "$version"
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: web
+
+  docker:
+    name: 原生构建 ${{ matrix.arch }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 核对 runner 资源与架构
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          nproc
+          free -h
+          uname -m
+          test "$(dpkg --print-architecture)" = "$EXPECTED_ARCH"
+      - name: 镜像名称
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: 镜像标签与元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=TV Rust
+            org.opencontainers.image.description=Rust 影视聚合服务，支持配置订阅、网页播放与飞牛播放器
+            org.opencontainers.image.licenses=MIT
+      - name: 构建并载入当前原生架构
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: tv-rust-ci:${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,scope=tv-rust-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=tv-rust-${{ matrix.arch }}
+      - name: 验证镜像架构、空启动与网页
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          TEST_IMAGE: tv-rust-ci:${{ matrix.arch }}
+        run: |
+          test "$(docker run --rm --entrypoint dpkg "$TEST_IMAGE" --print-architecture)" = "$EXPECTED_ARCH"
+          docker run --detach --name tv-rust-smoke --init \
+            --publish 127.0.0.1:3000:3000 --read-only \
+            --tmpfs /tmp:size=256m,mode=1777 \
+            --security-opt no-new-privileges:true --cap-drop ALL "$TEST_IMAGE"
+          curl --fail --silent --show-error --retry 30 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:3000/api/health | jq -e '.ok == true'
+          curl --fail --silent --show-error http://127.0.0.1:3000/api/status | jq -e '.initialized == false'
+          curl --fail --silent --show-error http://127.0.0.1:3000/ > "$RUNNER_TEMP/index.html"
+          grep -q 'id="root"' "$RUNNER_TEMP/index.html"
+          docker exec tv-rust-smoke ffprobe -version
+      - name: 登录 GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 推送已验证架构的镜像摘要
+        id: publish
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+      - name: 保存镜像摘要
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          test -n "$DIGEST"
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH == 'true'
+        with:
+          name: image-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+          if-no-files-found: error
+      - name: 容器日志与清理
+        if: always()
+        run: |
+          docker logs tv-rust-smoke || true
+          docker rm --force --volumes tv-rust-smoke || true
+
+  publish:
+    name: 合并并验证双架构镜像
+    needs: docker
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 镜像名称
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 镜像标签与元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+      - name: 合并架构并发布标签
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          METADATA_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA_JSON")
+          args=()
+          for tag in "${tags[@]}"; do args+=(-t "$tag"); done
+          digests=("$RUNNER_TEMP"/digests/*)
+          test "${#digests[@]}" -eq 2
+          for file in "${digests[@]}"; do
+            digest=$(basename "$file")
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+            args+=("$IMAGE_NAME@sha256:$digest")
+          done
+          docker buildx imagetools create "${args[@]}"
+          docker buildx imagetools inspect "${tags[0]}" --raw \
+            | jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]'
+          {
+            echo '### 已发布双架构镜像'
+            echo
+            printf -- '- `%s`\n' "${tags[@]}"
+            echo
+            echo 'AMD64 与 ARM64 分别使用公开仓库的 4 核、16 GB Ubuntu runner 原生构建并通过容器启动检查。'
+          } >> "$GITHUB_STEP_SUMMARY"
