@@ -205,7 +205,8 @@ async fn list(app: &App, who: &Identity, v: &Value, favorites: bool) -> Result<V
     let page = v["page"].as_i64().unwrap_or(1).clamp(1, 500);
     let size = v["page_size"].as_i64().unwrap_or(50).clamp(1, 128);
     let mut rows = Vec::new();
-    if !query.trim().is_empty() && !favorites {
+    let remote_search = !query.trim().is_empty() && !favorites;
+    if remote_search {
         let result = catalog::search(app, &query, page, None).await?;
         for v in result["items"].as_array().into_iter().flatten() {
             let f = catalog::film(app, &text(v, "id")).await?;
@@ -249,7 +250,9 @@ async fn list(app: &App, who: &Identity, v: &Value, favorites: bool) -> Result<V
                 .contains(&query.to_lowercase())
         });
     }
-    rows.sort_by_key(|a| text(a, "title"));
+    if !remote_search {
+        rows.sort_by_key(|a| text(a, "title"));
+    }
     let total = rows.len();
     // 远端搜索已经按源分页；只对本地目录再次分页。
     let start = if query.trim().is_empty() || favorites {

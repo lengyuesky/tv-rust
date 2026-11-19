@@ -257,6 +257,19 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         .split('/')
         .collect::<Vec<_>>();
     match parts.as_slice() {
+        ["films", id, "posters"] if method == Method::GET => {
+            return Ok(json_response(catalog::film_posters(app, id).await?));
+        }
+        ["recommendations", id, "posters"] if method == Method::GET => {
+            return Ok(json_response(
+                catalog::recommendation_posters(
+                    app,
+                    id,
+                    query.get("kind").map(String::as_str).unwrap_or("movie"),
+                )
+                .await?,
+            ));
+        }
         ["users", id] if method == Method::PATCH => {
             who.admin()?;
             if *id == who.user.id {
@@ -283,16 +296,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         }
         ["subscriptions", id] if method == Method::DELETE => {
             who.admin()?;
-            let _guard = app.refresh_lock.lock().await;
-            // 保留来源身份及历史关联，删除操作使订阅停止更新和提供新播放。
-            sqlx::query("UPDATE subscriptions SET url='',name=name || '（已移除）' WHERE id=?")
-                .bind(id)
-                .execute(&app.db)
-                .await?;
-            sqlx::query("UPDATE sources SET present=0 WHERE subscription_id=?")
-                .bind(id)
-                .execute(&app.db)
-                .await?;
+            catalog::remove_subscription(app, id).await?;
         }
         ["sources", id] if method == Method::PATCH => {
             who.admin()?;

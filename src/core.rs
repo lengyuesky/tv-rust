@@ -112,6 +112,7 @@ pub struct Inner {
     pub allow_private: bool,
     pub public_url: String,
     pub probe_slots: Semaphore,
+    pub recommendation_slots: Semaphore,
     pub login_budget: Mutex<HashMap<String, (i64, usize)>>,
     pub refresh_lock: tokio::sync::Mutex<()>,
 }
@@ -138,6 +139,37 @@ impl App {
         sqlx::raw_sql(include_str!("../migrations/0001.sql"))
             .execute(&db)
             .await?;
+        let schema: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&db)
+            .await?;
+        if schema < 2 {
+            let mut tx = db.begin().await?;
+            sqlx::raw_sql(include_str!("../migrations/0002.sql"))
+                .execute(&mut *tx)
+                .await?;
+            // 旧版移除会清空 URL、追加后缀，并将所属来源全部标为失效。
+            // 同时检查这些条件，避免仅凭名字误判正常的文本订阅。
+            let legacy: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id,name FROM subscriptions AS sub WHERE url='' AND name LIKE '%（已移除）' \
+                 AND EXISTS(SELECT 1 FROM sources WHERE subscription_id=sub.id) \
+                 AND NOT EXISTS(SELECT 1 FROM sources WHERE subscription_id=sub.id AND present<>0)",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            for (id, name) in legacy {
+                let original = name.trim_end_matches("（已移除）").trim();
+                sqlx::query("UPDATE subscriptions SET name=?,removed_at=?,error='' WHERE id=?")
+                    .bind(if original.is_empty() { &name } else { original })
+                    .bind(now())
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            sqlx::query("PRAGMA user_version=2")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
         let blocked: String =
             sqlx::query_scalar("SELECT value FROM settings WHERE key='forbid_proxy'")
                 .fetch_one(&db)
@@ -150,6 +182,7 @@ impl App {
             allow_private,
             public_url,
             probe_slots: Semaphore::new(2),
+            recommendation_slots: Semaphore::new(4),
             login_budget: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
         })))

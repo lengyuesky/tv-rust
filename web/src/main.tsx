@@ -36,25 +36,11 @@ import {
   ChevronDown,
 } from "lucide-react";
 import "./style.css";
+import { api } from "./api";
+import { Poster } from "./poster";
+import { mergeSearchItems } from "./search";
 
 type Obj = Record<string, any>;
-async function api(
-  path: string,
-  method = "GET",
-  data?: unknown,
-  keepalive = false,
-): Promise<any> {
-  const r = await fetch("/api" + path, {
-    method,
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", "X-TV-Request": "1" },
-    body: data === undefined ? undefined : JSON.stringify(data),
-    keepalive,
-  });
-  const value = await r.json();
-  if (!r.ok) throw new Error(value.error || `请求失败（${r.status}）`);
-  return value;
-}
 const time = (s: number) =>
   `${Math.floor((s || 0) / 60)}:${String(Math.floor((s || 0) % 60)).padStart(2, "0")}`;
 const date = (s: number) =>
@@ -236,59 +222,17 @@ function Login({ setup, onLogin }: { setup: boolean; onLogin: () => void }) {
     </main>
   );
 }
-function Poster({ film }: { film: Obj }) {
-  const [failed, setFailed] = useState(false);
-  const src = film.cover || (film.poster ? `/api/posters/${film.id}` : "");
-  return (
-    <div className="poster">
-      {src && !failed ? (
-        <img
-          src={src}
-          loading="lazy"
-          referrerPolicy="no-referrer"
-          onError={() => setFailed(true)}
-          alt={film.title}
-        />
-      ) : (
-        <div className="poster-fallback">
-          <Film size={30} />
-          <span>{film.title}</span>
-        </div>
-      )}
-      <span className="poster-play">
-        <Play size={23} fill="currentColor" />
-      </span>
-      {film.rate && <span className="score">{film.rate}</span>}
-      {film.available === false && <span className="tag-off">来源失效</span>}
-      {film.source_count > 1 && (
-        <span className="source-count">{film.source_count} 个源</span>
-      )}
-      {film.progress?.duration > 0 && (
-        <div className="progress-bar">
-          <i
-            style={{
-              width:
-                Math.min(
-                  100,
-                  (film.progress.position / film.progress.duration) * 100,
-                ) + "%",
-            }}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
 function Cards({ items, onOpen }: { items: Obj[]; onOpen?: (f: Obj) => void }) {
   return (
     <div className="cards">
-      {items.map((f, i) => (
-        <button
-          key={`${f.id}-${i}`}
-          className="card"
-          onClick={() => (onOpen ? onOpen(f) : go("/film/" + f.id))}
-        >
+      {items.map((f) => (
+        <article key={f.group_key || f.id} className="card">
           <Poster film={f} />
+          <button
+            className="card-open"
+            aria-label={`打开${f.title}`}
+            onClick={() => (onOpen ? onOpen(f) : go("/film/" + f.id))}
+          />
           <strong>{f.title}</strong>
           <div className="card-meta">
             <span>{f.year || f.remarks || "等待探索"}</span>
@@ -296,7 +240,7 @@ function Cards({ items, onOpen }: { items: Obj[]; onOpen?: (f: Obj) => void }) {
               {f.progress ? time(f.progress.position) : f.source_name || ""}
             </span>
           </div>
-        </button>
+        </article>
       ))}
     </div>
   );
@@ -307,6 +251,7 @@ function Home({ me }: { me: Obj }) {
     [history, setHistory] = useState<Obj[]>([]),
     [rec, setRec] = useState<Obj[]>([]),
     [kind, setKind] = useState("movie"),
+    [recommendationRetry, setRecommendationRetry] = useState(0),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(true),
     [q, setQ] = useState("");
@@ -339,7 +284,7 @@ function Home({ me }: { me: Obj }) {
     return () => {
       active = false;
     };
-  }, [kind]);
+  }, [kind, recommendationRetry]);
   const search = (e: React.FormEvent) => {
     e.preventDefault();
     if (q.trim()) go("/search?q=" + encodeURIComponent(q));
@@ -475,7 +420,7 @@ function Home({ me }: { me: Obj }) {
             </div>
             <button
               className="ghost"
-              onClick={() => setKind(kind === "movie" ? "tv" : "movie")}
+              onClick={() => setRecommendationRetry((value) => value + 1)}
             >
               <RefreshCw size={16} />
               重试
@@ -501,7 +446,7 @@ function Home({ me }: { me: Obj }) {
 }
 function SearchPage({ route }: { route: string }) {
   const params = new URLSearchParams(route.split("?")[1] || "");
-  const query = params.get("q") || "";
+  const query = (params.get("q") || "").trim();
   const switchFrom = params.get("switch_from") || "";
   const switchQuery = switchFrom
     ? "&switch_from=" + encodeURIComponent(switchFrom)
@@ -518,22 +463,36 @@ function SearchPage({ route }: { route: string }) {
     [busy, setBusy] = useState(false),
     [page, setPage] = useState(1),
     [expanded, setExpanded] = useState<string | null>(null);
+  const requestVersion = useRef(0);
+  const pending = useRef<AbortController | null>(null);
   const load = useCallback(
     async (pg: number) => {
+      pending.current?.abort();
+      const controller = new AbortController();
+      pending.current = controller;
+      const version = ++requestVersion.current;
       setBusy(true);
       setError("");
       try {
         const r = await api(
           "/search?q=" + encodeURIComponent(query) + "&page=" + pg,
+          "GET",
+          undefined,
+          false,
+          controller.signal,
         );
-        setResult((old) =>
-          pg > 1 && old ? { ...r, items: [...old.items, ...r.items] } : r,
-        );
+        if (version !== requestVersion.current || controller.signal.aborted)
+          return;
+        setResult((old) => ({
+          ...r,
+          items: mergeSearchItems(pg > 1 && old ? old.items : [], r.items),
+        }));
         setPage(pg);
       } catch (e) {
-        setError((e as Error).message);
+        if (version === requestVersion.current && !controller.signal.aborted)
+          setError((e as Error).message);
       } finally {
-        setBusy(false);
+        if (version === requestVersion.current) setBusy(false);
       }
     },
     [query],
@@ -541,7 +500,15 @@ function SearchPage({ route }: { route: string }) {
   useEffect(() => {
     setQ(query);
     setResult(null);
+    setExpanded(null);
+    setPage(1);
+    setError("");
     if (query) void load(1);
+    else setBusy(false);
+    return () => {
+      ++requestVersion.current;
+      pending.current?.abort();
+    };
   }, [query, load]);
   const grouped = new Map<string, Obj[]>();
   for (const f of result?.items || []) {
@@ -593,7 +560,11 @@ function SearchPage({ route }: { route: string }) {
                   <div key={s.id} className={s.ok ? "" : "failed"}>
                     {s.ok ? <Check size={14} /> : <AlertCircle size={14} />}
                     <span>{s.name}</span>
-                    <small>{s.ok ? `${s.count} 条` : s.error}</small>
+                    <small>
+                      {s.ok
+                        ? `${s.count} 条${s.filtered_count ? ` · 已过滤 ${s.filtered_count} 条无关结果` : ""}`
+                        : s.error}
+                    </small>
                   </div>
                 ))}
               </div>
@@ -604,6 +575,7 @@ function SearchPage({ route }: { route: string }) {
               ...fs[0],
               source_count: fs.length,
               group_key: key,
+              poster_candidates: fs.map((f) => f.poster),
             }))}
             onOpen={(f) => {
               const fs = grouped.get(f.group_key)!;
@@ -1427,28 +1399,36 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
     [username, setUsername] = useState(""),
     [password, setPassword] = useState(""),
     [oldPassword, setOldPassword] = useState("");
-  const load = () => {
+  const actionBusy = useRef(false);
+  const load = useCallback(async () => {
     if (me.user.admin) {
-      api("/subscriptions")
-        .then(setData)
-        .catch((e) => setError(e.message));
-      api("/users")
-        .then(setUsers)
-        .catch((e) => setError(e.message));
+      const [subscriptions, users] = await Promise.allSettled([
+        api("/subscriptions"),
+        api("/users"),
+      ]);
+      if (subscriptions.status === "fulfilled") setData(subscriptions.value);
+      if (users.status === "fulfilled") setUsers(users.value);
+      if (subscriptions.status === "rejected") throw subscriptions.reason;
+      if (users.status === "rejected") throw users.reason;
     }
-  };
-  useEffect(load, [me.user.admin]);
+  }, [me.user.admin]);
+  useEffect(() => {
+    void load().catch((e) => setError(e.message));
+  }, [load]);
   const action = async (fn: () => Promise<unknown>, success = "已保存") => {
+    if (actionBusy.current) return;
+    actionBusy.current = true;
     setBusy(true);
     setError("");
     setMessage("");
     try {
       await fn();
+      await load();
       setMessage(success);
-      load();
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      actionBusy.current = false;
       setBusy(false);
     }
   };
@@ -1569,7 +1549,7 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
                     onClick={() =>
                       action(
                         () => api("/subscriptions/" + s.id, "DELETE", {}),
-                        "订阅已停用，收藏和历史仍保留",
+                        "订阅已移除，收藏和历史仍保留",
                       )
                     }
                   >

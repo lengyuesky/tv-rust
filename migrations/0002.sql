@@ -1,0 +1,1 @@
+ALTER TABLE subscriptions ADD COLUMN removed_at INTEGER NOT NULL DEFAULT 0;

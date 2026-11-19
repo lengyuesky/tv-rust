@@ -3,7 +3,7 @@ use axum::http::{HeaderMap, Method};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Source {
@@ -56,6 +56,9 @@ pub struct Episode {
 
 fn version_markers(f: &Film) -> Vec<&'static str> {
     let description = format!("{} {} {}", f.title, f.remarks, f.category);
+    work_markers(&description)
+}
+fn work_markers(description: &str) -> Vec<&'static str> {
     [
         "合集",
         "合辑",
@@ -279,12 +282,15 @@ pub async fn import(app: &App, v: &Value) -> Result<String> {
     let id = if provided.is_empty() {
         guid(&[&random()])
     } else {
-        let exists: i64 = sqlx::query_scalar("SELECT count(*) FROM subscriptions WHERE id=?")
-            .bind(&provided)
-            .fetch_one(&app.db)
-            .await?;
-        if exists == 0 {
-            return Err(Error::missing());
+        let removed: Option<i64> =
+            sqlx::query_scalar("SELECT removed_at FROM subscriptions WHERE id=?")
+                .bind(&provided)
+                .fetch_optional(&app.db)
+                .await?;
+        match removed {
+            None => return Err(Error::missing()),
+            Some(at) if at > 0 => return Err(Error::bad("订阅已移除，请重新导入为新订阅")),
+            _ => {}
         }
         provided
     };
@@ -294,7 +300,7 @@ pub async fn import(app: &App, v: &Value) -> Result<String> {
 pub async fn refresh(app: &App, id: &str) -> Result<()> {
     let _guard = app.refresh_lock.lock().await;
     let (name, url): (String, String) =
-        sqlx::query_as("SELECT name,url FROM subscriptions WHERE id=?")
+        sqlx::query_as("SELECT name,url FROM subscriptions WHERE id=? AND removed_at=0")
             .bind(id)
             .fetch_optional(&app.db)
             .await?
@@ -317,6 +323,29 @@ pub async fn refresh(app: &App, id: &str) -> Result<()> {
             .await?;
     }
     result
+}
+pub async fn remove_subscription(app: &App, id: &str) -> Result<()> {
+    let _guard = app.refresh_lock.lock().await;
+    let mut tx = app.db.begin().await?;
+    let changed = sqlx::query(
+        "UPDATE subscriptions SET removed_at=CASE WHEN removed_at=0 THEN ? ELSE removed_at END,url='',error='' WHERE id=?",
+    )
+    .bind(now())
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() == 0 {
+        return Err(Error::missing());
+    }
+    sqlx::query("UPDATE sources SET present=0 WHERE subscription_id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM cache WHERE key LIKE 'search:%'")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 pub async fn sources(app: &App) -> Result<Vec<Source>> {
     Ok(sqlx::query_as("SELECT * FROM sources ORDER BY name,id")
@@ -403,6 +432,84 @@ fn clean(s: String) -> String {
         .take(10000)
         .collect()
 }
+fn search_text(input: &str) -> String {
+    clean(input.to_owned())
+        .chars()
+        .map(|c| {
+            if ('\u{ff01}'..='\u{ff5e}').contains(&c) {
+                char::from_u32(c as u32 - 0xfee0).unwrap()
+            } else {
+                c
+            }
+        })
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+fn search_rank(title: &str, query: &str) -> Option<u8> {
+    let title = search_text(title);
+    let term = search_text(query);
+    if term.is_empty() {
+        return None;
+    }
+    if title == term {
+        return Some(0);
+    }
+    if title.contains(&term) {
+        return Some(1);
+    }
+    let words: Vec<String> = query
+        .split(|c: char| c.is_whitespace() || ",，、/／|｜;；".contains(c))
+        .map(search_text)
+        .filter(|s| !s.is_empty())
+        .collect();
+    (words.len() > 1 && words.iter().all(|s| title.contains(s))).then_some(2)
+}
+pub fn compare_search_items(a: &Value, b: &Value) -> std::cmp::Ordering {
+    a["search_rank"]
+        .as_u64()
+        .unwrap_or(u64::MAX)
+        .cmp(&b["search_rank"].as_u64().unwrap_or(u64::MAX))
+        .then(text(a, "search_title").cmp(&text(b, "search_title")))
+        .then(text(a, "year").cmp(&text(b, "year")))
+        .then(text(a, "source_name").cmp(&text(b, "source_name")))
+        .then(text(a, "id").cmp(&text(b, "id")))
+}
+fn poster_address(source: &Source, input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() || input.len() > 8192 {
+        return String::new();
+    }
+    if net::valid_url(input).is_ok() {
+        return input.to_owned();
+    }
+    // 相对图片地址属于视频源，不属于本应用；优先使用配置中的网站地址。
+    let base = if source.detail.is_empty() {
+        &source.api
+    } else {
+        &source.detail
+    };
+    net::valid_url(base)
+        .map(|mut base| {
+            if source.detail.is_empty() {
+                for _ in 0..6 {
+                    let inner = base
+                        .query_pairs()
+                        .find(|(key, _)| key == "url")
+                        .and_then(|(_, value)| net::valid_url(&value).ok());
+                    match inner {
+                        Some(url) => base = url,
+                        None => break,
+                    }
+                }
+            }
+            base
+        })
+        .and_then(|base| base.join(input).map_err(|_| Error::bad("封面地址无效")))
+        .and_then(|url| net::valid_url(url.as_str()))
+        .map(|url| url.to_string())
+        .unwrap_or_default()
+}
 pub fn playlist(v: &Value) -> Vec<(String, i64, String, i64, String)> {
     let names = text(v, "vod_play_from");
     let names = names.split("$$$").collect::<Vec<_>>();
@@ -466,12 +573,7 @@ pub async fn ingest(app: &App, source: &Source, v: &Value, detailed: bool) -> Re
     } else {
         0
     };
-    let poster = text(v, "vod_pic");
-    let poster = if net::valid_url(&poster).is_ok() {
-        poster
-    } else {
-        String::new()
-    };
+    let poster = poster_address(source, &text(v, "vod_pic"));
     let mut tx = app.db.begin().await?;
     sqlx::query("INSERT INTO films(id,source_id,vod_id,title,year,kind,category,poster,overview,remarks,actor,director,updated_at,detailed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,year=excluded.year,kind=CASE WHEN excluded.detailed_at>0 THEN excluded.kind ELSE films.kind END,category=excluded.category,poster=CASE WHEN excluded.poster<>'' THEN excluded.poster ELSE films.poster END,overview=CASE WHEN excluded.overview<>'' THEN excluded.overview ELSE films.overview END,remarks=excluded.remarks,actor=excluded.actor,director=excluded.director,updated_at=excluded.updated_at,detailed_at=MAX(films.detailed_at,excluded.detailed_at)")
         .bind(&id).bind(&source.id).bind(&vod_id).bind(&title).bind(text(v,"vod_year")).bind(kind).bind(&category).bind(poster)
@@ -523,7 +625,7 @@ pub async fn search(
     source_filter: Option<&str>,
 ) -> Result<Value> {
     let query = query.trim();
-    if query.is_empty() || query.chars().count() > 100 || !(1..=500).contains(&page) {
+    if search_text(query).is_empty() || query.chars().count() > 100 || !(1..=500).contains(&page) {
         return Err(Error::bad("关键词或页码无效"));
     }
     let enabled = sources(app)
@@ -532,7 +634,7 @@ pub async fn search(
         .filter(|s| s.active() && source_filter.is_none_or(|id| s.id == id))
         .collect::<Vec<_>>();
     let key = format!(
-        "search:{}",
+        "search:v2:{}",
         hash(format!(
             "{query}|{page}|{}",
             enabled
@@ -560,12 +662,26 @@ pub async fn search(
                 .as_array()
                 .ok_or_else(|| Error::bad("搜索响应缺少影片列表"))?;
             let mut films = Vec::new();
+            let mut seen = HashSet::new();
+            let mut filtered = 0;
             for row in rows.iter().take(100) {
+                // 某些上游会夹带最新条目；先匹配片名，避免无关内容入库。
+                if search_rank(&text(row, "vod_name"), query).is_none() {
+                    filtered += 1;
+                    continue;
+                }
+                if !seen.insert(text(row, "vod_id")) {
+                    continue;
+                }
                 if let Some(f) = ingest(app, &s, row, false).await? {
                     films.push(f);
                 }
             }
-            Ok::<_, Error>((films, text(&v, "pagecount").parse::<i64>().unwrap_or(1)))
+            Ok::<_, Error>((
+                films,
+                text(&v, "pagecount").parse::<i64>().unwrap_or(1),
+                filtered,
+            ))
         }
         .await;
         (s, result)
@@ -576,16 +692,30 @@ pub async fn search(
     let mut items = Vec::new();
     let mut status = Vec::new();
     let mut more = false;
+    let active: HashSet<String> = sources(app)
+        .await?
+        .into_iter()
+        .filter(Source::active)
+        .map(|s| s.id)
+        .collect();
     for (s, r) in results {
+        if !active.contains(&s.id) {
+            status.push(
+                json!({"id":s.id,"name":s.name,"count":0,"ok":false,"error":"来源已停用或移除"}),
+            );
+            continue;
+        }
         match r {
-            Ok((films, pages)) => {
-                more |= pages > page;
-                status.push(json!({"id":s.id,"name":s.name,"count":films.len(),"ok":true}));
+            Ok((films, pages, filtered)) => {
+                more |= pages > page && page < 500;
+                status.push(json!({"id":s.id,"name":s.name,"count":films.len(),"ok":true,"filtered_count":filtered}));
                 items.extend(films.into_iter().map(|f| {
                     let key = group_key(&f);
                     let mut v = serde_json::to_value(f).unwrap();
                     v["source_name"] = json!(s.name);
                     v["group_key"] = json!(key);
+                    v["search_rank"] = json!(search_rank(&text(&v, "title"), query));
+                    v["search_title"] = json!(search_text(&text(&v, "title")));
                     v
                 }));
             }
@@ -594,11 +724,7 @@ pub async fn search(
             }
         }
     }
-    items.sort_by(|a, b| {
-        text(a, "title")
-            .cmp(&text(b, "title"))
-            .then(text(a, "source_name").cmp(&text(b, "source_name")))
-    });
+    items.sort_by(compare_search_items);
     let result = json!({"items":items,"sources":status,"page":page,"has_more":more});
     app.cache_put(&key, &result, 180).await?;
     Ok(result)
@@ -664,14 +790,15 @@ pub async fn favorite(app: &App, user: &str, id: &str, on: bool) -> Result<()> {
     Ok(())
 }
 pub async fn subscription_list(app: &App) -> Result<Value> {
-    let rows:Vec<(String,String,String,i64,i64,i64,String)>=sqlx::query_as("SELECT id,name,url,interval_seconds,updated_at,checked_at,error FROM subscriptions ORDER BY name").fetch_all(&app.db).await?;
+    let rows:Vec<(String,String,String,i64,i64,i64,String)>=sqlx::query_as("SELECT id,name,url,interval_seconds,updated_at,checked_at,error FROM subscriptions WHERE removed_at=0 ORDER BY name,id").fetch_all(&app.db).await?;
+    let current: Vec<Source> = sqlx::query_as("SELECT s.* FROM sources s JOIN subscriptions sub ON sub.id=s.subscription_id WHERE sub.removed_at=0 AND s.present=1 ORDER BY s.name,s.id").fetch_all(&app.db).await?;
     Ok(
-        json!({"subscriptions":rows.into_iter().map(|(id,name,url,interval_seconds,updated_at,checked_at,error)|json!({"id":id,"name":name,"url":url,"interval_seconds":interval_seconds,"updated_at":updated_at,"checked_at":checked_at,"error":error})).collect::<Vec<_>>(),"sources":sources(app).await?}),
+        json!({"subscriptions":rows.into_iter().map(|(id,name,url,interval_seconds,updated_at,checked_at,error)|json!({"id":id,"name":name,"url":url,"interval_seconds":interval_seconds,"updated_at":updated_at,"checked_at":checked_at,"error":error})).collect::<Vec<_>>(),"sources":current}),
     )
 }
 pub async fn recommendations(app: &App, kind: &str) -> Result<Value> {
     let kind = if kind == "tv" { "tv" } else { "movie" };
-    let key = format!("recommend:{kind}");
+    let key = format!("recommend:v2:{kind}");
     if let Some(v) = app.cache_get(&key).await? {
         return Ok(v);
     }
@@ -682,15 +809,114 @@ pub async fn recommendations(app: &App, kind: &str) -> Result<Value> {
     let list = v["subjects"]
         .as_array()
         .ok_or_else(|| Error::bad("推荐服务暂不可用，仍可使用搜索和收藏"))?;
-    let result = json!({"items":list.iter().map(|v|json!({"id":text(v,"id"),"title":text(v,"title"),"cover":text(v,"cover"),"rate":text(v,"rate")})).collect::<Vec<_>>()});
+    let result = json!({"items":list.iter().map(|v|json!({"id":text(v,"id"),"title":text(v,"title"),"cover":text(v,"cover"),"rate":text(v,"rate"),"recommendation_kind":kind})).collect::<Vec<_>>()});
     app.cache_put(&key, &result, 21600).await?;
     Ok(result)
+}
+fn known_year(year: &str) -> bool {
+    year.len() == 4
+        && year
+            .parse::<u16>()
+            .is_ok_and(|n| (1800..=2199).contains(&n))
+}
+async fn matching_posters(
+    app: &App,
+    title: &str,
+    year: &str,
+    kind: &str,
+    markers: &[&str],
+) -> Result<Vec<String>> {
+    if !known_year(year.trim()) {
+        return Ok(Vec::new());
+    }
+    let films: Vec<Film> = sqlx::query_as(
+        "SELECT f.* FROM films f JOIN sources s ON s.id=f.source_id \
+         JOIN subscriptions sub ON sub.id=s.subscription_id \
+         WHERE lower(trim(f.title))=? AND trim(f.year)=? AND f.kind=? AND f.poster<>'' \
+         AND s.present=1 AND s.enabled=1 AND s.upstream_enabled=1 AND sub.removed_at=0 \
+         ORDER BY f.updated_at DESC,f.id",
+    )
+    .bind(title.trim().to_lowercase())
+    .bind(year.trim())
+    .bind(kind)
+    .fetch_all(&app.db)
+    .await?;
+    let mut seen = HashSet::new();
+    Ok(films
+        .into_iter()
+        .filter(|f| version_markers(f) == markers && net::valid_url(&f.poster).is_ok())
+        .map(|f| f.poster)
+        .filter(|url| seen.insert(url.clone()))
+        .take(8)
+        .collect())
+}
+pub async fn film_posters(app: &App, id: &str) -> Result<Value> {
+    let f = film(app, id).await?;
+    let urls = matching_posters(app, &f.title, &f.year, &f.kind, &version_markers(&f)).await?;
+    Ok(json!({"urls":urls}))
+}
+pub async fn recommendation_posters(app: &App, id: &str, kind: &str) -> Result<Value> {
+    if id.is_empty() || id.len() > 20 || !id.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(Error::missing());
+    }
+    let kind = if kind == "tv" { "tv" } else { "movie" };
+    let list = recommendations(app, kind).await?;
+    let subject = list["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|v| text(v, "id") == id))
+        .ok_or_else(Error::missing)?;
+    let title = text(subject, "title");
+    // 仅为已有同名候选补元数据，不为每张失效推荐图发起全源搜索。
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM films f JOIN sources s ON s.id=f.source_id \
+         JOIN subscriptions sub ON sub.id=s.subscription_id \
+         WHERE lower(trim(f.title))=? AND f.poster<>'' AND f.year<>'' \
+         AND s.present=1 AND s.enabled=1 AND s.upstream_enabled=1 AND sub.removed_at=0",
+    )
+    .bind(title.trim().to_lowercase())
+    .fetch_one(&app.db)
+    .await?;
+    if existing == 0 {
+        return Ok(json!({"urls":[]}));
+    }
+    let key = format!("recommendation-meta:v1:{id}");
+    let _permit = app.recommendation_slots.acquire().await.unwrap();
+    let metadata = match app.cache_get(&key).await? {
+        Some(v) => v,
+        None => {
+            let url = format!("https://movie.douban.com/j/subject_abstract?subject_id={id}");
+            let value = net::json(app, &url).await?;
+            let subject = &value["subject"];
+            let year = text(subject, "release_year");
+            let category = match subject["is_tv"].as_bool() {
+                Some(true) => "TV",
+                Some(false) => "Movie",
+                None => "",
+            };
+            let metadata = json!({"year":year,"kind":category});
+            app.cache_put(&key, &metadata, 21600).await?;
+            metadata
+        }
+    };
+    let category = if kind == "tv" { "TV" } else { "Movie" };
+    if text(&metadata, "kind") != category {
+        return Ok(json!({"urls":[]}));
+    }
+    let urls = matching_posters(
+        app,
+        &title,
+        &text(&metadata, "year"),
+        category,
+        &work_markers(&title),
+    )
+    .await?;
+    Ok(json!({"urls":urls}))
 }
 pub async fn maintenance(app: App) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let due: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM subscriptions WHERE url<>'' AND checked_at+interval_seconds<?",
+            "SELECT id FROM subscriptions WHERE removed_at=0 AND url<>'' AND checked_at+interval_seconds<?",
         )
         .bind(now())
         .fetch_all(&app.db)

@@ -58,6 +58,14 @@ async fn harness() -> Harness {
                 yield Ok::<_,std::io::Error>(bytes::Bytes::from_static(b"later-chunk"));
             })).unwrap(),
             "/api"=>axum::Json(json!({"list":[{"vod_id":99,"vod_name":"原生搜索结果","vod_year":"2026","vod_play_url":""}],"page":"1","pagecount":1})).into_response(),
+            "/noisy-api"=>axum::Json(json!({"list":[
+                {"vod_id":991,"vod_name":"11月19日 26-27赛季NBA常规赛","vod_year":"2026"},
+                {"vod_id":992,"vod_name":"乔安你好","vod_year":"2019"},
+                {"vod_id":993,"vod_name":"你好","vod_year":"2021"},
+                {"vod_id":994,"vod_name":"<b>你好</b>，世界","vod_year":"2023"},
+                {"vod_id":993,"vod_name":"你好","vod_year":"2021"}
+            ],"page":"1","pagecount":6303})).into_response(),
+            "/config"=>axum::Json(json!({"api_site":{"same.key":{"name":"更新源","api":"https://example.com/api"}}})).into_response(),
             _=>{
                 if req.headers().get("range").is_some(){Response::builder().status(206).header("content-range","bytes 2-5/8").header("accept-ranges","bytes").body(Body::from("2345")).unwrap()}
                 else{Response::builder().header("content-type","video/mp4").body(Body::from("01234567")).unwrap()}
@@ -151,6 +159,405 @@ async fn request(
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+#[tokio::test]
+async fn removing_a_subscription_is_idempotent_and_preserves_personal_records() {
+    let h = harness().await;
+    let original = catalog::sources(&h.app).await.unwrap().remove(0);
+    let second = catalog::import(&h.app, &json!({"name":"其他订阅","content":json!({"api_site":{"other":{"name":"其他源","api":original.api}}}).to_string()})).await.unwrap();
+    catalog::favorite(&h.app, &h.who.user.id, &h.film, true)
+        .await
+        .unwrap();
+    let start = playback::start(&h.app, &h.who, &h.episode).await.unwrap();
+    let play = playback::get(&h.app, &text(&start, "id")).await.unwrap();
+    playback::record(&h.app, &play, 42.0, 120.0, None)
+        .await
+        .unwrap();
+    let (member, _) = auth::login(&h.app, "member", "password-456", false)
+        .await
+        .unwrap();
+    let path = format!("/api/subscriptions/{}", original.subscription_id);
+    assert_eq!(
+        request(&h, "DELETE", &path, json!({}), Some(&member))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(request(&h, "DELETE", &path, json!({}), None).await.0, 401);
+    assert_eq!(
+        request(&h, "DELETE", &path, json!({}), Some(&h.raw))
+            .await
+            .0,
+        200
+    );
+    let removed: (String, i64) =
+        sqlx::query_as("SELECT name,removed_at FROM subscriptions WHERE id=?")
+            .bind(&original.subscription_id)
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap();
+    assert_eq!(removed.0, "订阅一");
+    assert!(removed.1 > 0);
+    assert_eq!(
+        request(&h, "DELETE", &path, json!({}), Some(&h.raw))
+            .await
+            .0,
+        200
+    );
+    let repeated: (String, i64) =
+        sqlx::query_as("SELECT name,removed_at FROM subscriptions WHERE id=?")
+            .bind(&original.subscription_id)
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap();
+    assert_eq!(repeated, removed);
+    assert_eq!(
+        request(
+            &h,
+            "DELETE",
+            "/api/subscriptions/missing",
+            json!({}),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        404
+    );
+    let listing = catalog::subscription_list(&h.app).await.unwrap();
+    assert_eq!(listing["subscriptions"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["subscriptions"][0]["id"], second);
+    assert_eq!(listing["sources"].as_array().unwrap().len(), 1);
+    assert!(
+        !catalog::source(&h.app, &original.id)
+            .await
+            .unwrap()
+            .active()
+    );
+    for kind in ["favorites", "history"] {
+        let items = catalog::personal(&h.app, &h.who.user.id, kind)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["available"], false);
+        assert_eq!(items[0]["progress"]["position"], 42.0);
+    }
+    assert!(
+        !playback::logs(&h.app, &h.who, 0).await.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(playback::start(&h.app, &h.who, &h.episode).await.is_err());
+    assert!(
+        catalog::refresh(&h.app, &original.subscription_id)
+            .await
+            .is_err()
+    );
+    let config =
+        json!({"api_site":{"same.key":{"name":"重新导入","api":original.api}}}).to_string();
+    assert!(
+        catalog::import(
+            &h.app,
+            &json!({"id":original.subscription_id,"name":"订阅一","content":config})
+        )
+        .await
+        .is_err()
+    );
+    let imported = catalog::import(&h.app, &json!({"name":"订阅一","content":config}))
+        .await
+        .unwrap();
+    assert_ne!(imported, original.subscription_id);
+    assert!(!catalog::source(&h.app, &original.id).await.unwrap().present);
+}
+
+#[tokio::test]
+async fn subscription_removal_rolls_back_and_cannot_be_undone_by_refresh() {
+    let h = harness().await;
+    let original = catalog::sources(&h.app).await.unwrap().remove(0);
+    sqlx::raw_sql("CREATE TRIGGER reject_removal BEFORE UPDATE OF present ON sources WHEN NEW.present=0 BEGIN SELECT RAISE(ABORT,'controlled failure'); END;")
+        .execute(&h.app.db).await.unwrap();
+    assert!(
+        catalog::remove_subscription(&h.app, &original.subscription_id)
+            .await
+            .is_err()
+    );
+    let removed: i64 = sqlx::query_scalar("SELECT removed_at FROM subscriptions WHERE id=?")
+        .bind(&original.subscription_id)
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap();
+    assert_eq!(removed, 0);
+    assert!(
+        catalog::source(&h.app, &original.id)
+            .await
+            .unwrap()
+            .active()
+    );
+    sqlx::query("DROP TRIGGER reject_removal")
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE subscriptions SET url=? WHERE id=?")
+        .bind(original.api.replace("/api", "/config"))
+        .bind(&original.subscription_id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let (refresh, removal) = tokio::join!(
+        catalog::refresh(&h.app, &original.subscription_id),
+        catalog::remove_subscription(&h.app, &original.subscription_id),
+    );
+    assert!(refresh.is_ok());
+    assert!(removal.is_ok());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT url FROM subscriptions WHERE id=?")
+            .bind(&original.subscription_id)
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap(),
+        ""
+    );
+    assert!(
+        !catalog::source(&h.app, &original.id)
+            .await
+            .unwrap()
+            .active()
+    );
+    let hits = h.hits.load(Ordering::Relaxed);
+    assert!(
+        catalog::refresh(&h.app, &original.subscription_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(h.hits.load(Ordering::Relaxed), hits);
+}
+
+#[tokio::test]
+async fn legacy_removals_are_migrated_once_without_losing_favorites() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.path().join("tv.sqlite"))
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0001.sql"))
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::raw_sql("INSERT INTO subscriptions VALUES('old','lunatv（已移除）（已移除）（已移除）','','{}',7200,1,1,'旧错误');
+        INSERT INTO subscriptions VALUES('text','正常（已移除）','','{}',7200,1,1,'');
+        INSERT INTO subscriptions VALUES('empty','空配置（已移除）','','{}',7200,1,1,'');
+        INSERT INTO sources(id,subscription_id,source_key,name,api,present) VALUES('old-source','old','key','旧源','https://example.com/api',0);
+        INSERT INTO sources(id,subscription_id,source_key,name,api,present) VALUES('text-source','text','key','正常文本源','https://example.com/api',1);
+        INSERT INTO users VALUES('user','admin','unused',1,0,1);
+        INSERT INTO films(id,source_id,vod_id,title,updated_at) VALUES('film','old-source','1','旧收藏',1);
+        INSERT INTO favorites VALUES('user','film',1);")
+        .execute(&db).await.unwrap();
+    db.close().await;
+    let app = App::new(dir.path().into(), true, String::new())
+        .await
+        .unwrap();
+    let legacy: (String, i64, String) =
+        sqlx::query_as("SELECT name,removed_at,error FROM subscriptions WHERE id='old'")
+            .fetch_one(&app.db)
+            .await
+            .unwrap();
+    assert_eq!(legacy.0, "lunatv");
+    assert!(legacy.1 > 0);
+    assert!(legacy.2.is_empty());
+    let listing = catalog::subscription_list(&app).await.unwrap();
+    assert_eq!(listing["subscriptions"].as_array().unwrap().len(), 2);
+    assert_eq!(listing["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        catalog::personal(&app, "user", "favorites").await.unwrap()[0]["available"],
+        false
+    );
+    app.db.close().await;
+    let again = App::new(dir.path().into(), true, String::new())
+        .await
+        .unwrap();
+    let repeated: (String, i64, String) =
+        sqlx::query_as("SELECT name,removed_at,error FROM subscriptions WHERE id='old'")
+            .fetch_one(&again.db)
+            .await
+            .unwrap();
+    assert_eq!(repeated, legacy);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&again.db)
+            .await
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn search_filters_unrelated_rows_before_ingest_and_ranks_titles_for_both_clients() {
+    let h = harness().await;
+    let original = catalog::sources(&h.app).await.unwrap().remove(0);
+    let config = json!({"api_site":{"same.key":{"name":"测试源","api":original.api.replace("/api", "/noisy-api")}}}).to_string();
+    catalog::import(
+        &h.app,
+        &json!({"id":original.subscription_id,"name":"订阅一","content":config}),
+    )
+    .await
+    .unwrap();
+    let result = catalog::search(&h.app, "你好", 1, None).await.unwrap();
+    let items = result["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["title"], "你好");
+    assert_eq!(items[0]["search_rank"], 0);
+    assert_eq!(result["sources"][0]["filtered_count"], 1);
+    assert!(items.iter().all(|v| !text(v, "title").contains("NBA")));
+    let noise = guid(&["film", &original.id, "991"]);
+    assert!(catalog::film(&h.app, &noise).await.is_err());
+    let hits = h.hits.load(Ordering::Relaxed);
+    assert_eq!(
+        catalog::search(&h.app, "你好", 1, None).await.unwrap(),
+        result
+    );
+    assert_eq!(h.hits.load(Ordering::Relaxed), hits);
+    let nba = catalog::search(&h.app, "ＮＢＡ", 1, None).await.unwrap();
+    assert_eq!(nba["items"].as_array().unwrap().len(), 1);
+    assert!(text(&nba["items"][0], "title").contains("NBA"));
+    let words = catalog::search(&h.app, "你好 乔安", 1, None).await.unwrap();
+    assert_eq!(words["items"].as_array().unwrap().len(), 1);
+    assert_eq!(words["items"][0]["search_rank"], 2);
+    let empty = catalog::search(&h.app, "完全不相关", 1, None)
+        .await
+        .unwrap();
+    assert!(empty["items"].as_array().unwrap().is_empty());
+    assert_eq!(empty["has_more"], true);
+    assert_eq!(
+        catalog::search(&h.app, "完全不相关", 500, None)
+            .await
+            .unwrap()["has_more"],
+        false
+    );
+    assert!(catalog::search(&h.app, "!!!", 1, None).await.is_err());
+    let (status, native) = request(
+        &h,
+        "POST",
+        "/v/api/v1/item/list",
+        json!({"q":"你好","page":1,"page_size":50}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(native["data"]["list"][0]["title"], "你好 · 测试源");
+    assert!(
+        native["data"]["list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| !text(v, "title").contains("NBA"))
+    );
+}
+
+#[tokio::test]
+async fn poster_urls_are_resolved_and_backups_only_use_the_same_known_work() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let base = source.api.strip_suffix("/api").unwrap();
+    let primary = catalog::ingest(&h.app, &source, &json!({"vod_id":1,"vod_name":"测试电影","vod_year":"2026","vod_pic":"/posters/original.jpg"}), false).await.unwrap().unwrap();
+    assert_eq!(primary.poster, format!("{base}/posters/original.jpg"));
+    let mut wrapped = source.clone();
+    wrapped.api = "https://wrapper.example/?url=https%3A%2F%2Forigin.example%2Fapi%2Fvod".into();
+    let resolved = catalog::ingest(
+        &h.app,
+        &wrapped,
+        &json!({"vod_id":8,"vod_name":"封装接口图片","vod_pic":"/covers/a.jpg"}),
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resolved.poster, "https://origin.example/covers/a.jpg");
+    for (id, year, category, remarks, path) in [
+        (2, "2026", "电影", "", "//images.example/backup.jpg"),
+        (3, "2025", "电影", "", "/wrong-year.jpg"),
+        (4, "", "电影", "", "/unknown-year.jpg"),
+        (5, "2026", "电视剧", "", "/wrong-kind.jpg"),
+        (6, "2026", "电影", "导演剪辑", "/wrong-version.jpg"),
+    ] {
+        catalog::ingest(&h.app, &source, &json!({"vod_id":id,"vod_name":"测试电影","vod_year":year,"type_name":category,"vod_remarks":remarks,"vod_pic":path}), false).await.unwrap();
+    }
+    let unsafe_url = catalog::ingest(
+        &h.app,
+        &source,
+        &json!({"vod_id":7,"vod_name":"无效图片","vod_pic":"javascript:alert(1)"}),
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(unsafe_url.poster.is_empty());
+    let hits = h.hits.load(Ordering::Relaxed);
+    let candidates = catalog::film_posters(&h.app, &primary.id).await.unwrap();
+    let urls = candidates["urls"].as_array().unwrap();
+    assert_eq!(urls.len(), 2);
+    assert!(urls.contains(&json!(primary.poster)));
+    assert!(urls.contains(&json!("http://images.example/backup.jpg")));
+    assert_eq!(h.hits.load(Ordering::Relaxed), hits);
+    app_seed_recommendation(&h.app, "123", "测试电影").await;
+    h.app
+        .cache_put(
+            "recommendation-meta:v1:123",
+            &json!({"year":"2026","kind":"Movie"}),
+            3600,
+        )
+        .await
+        .unwrap();
+    let (status, rec) = request(
+        &h,
+        "GET",
+        "/api/recommendations/123/posters?kind=movie",
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(rec, candidates);
+    assert_eq!(
+        request(
+            &h,
+            "GET",
+            "/api/recommendations/123/posters",
+            json!({}),
+            None
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        request(
+            &h,
+            "GET",
+            "/api/recommendations/456/posters",
+            json!({}),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        404
+    );
+    catalog::remove_subscription(&h.app, &source.subscription_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog::film_posters(&h.app, &primary.id).await.unwrap(),
+        json!({"urls":[]})
+    );
+}
+
+async fn app_seed_recommendation(app: &App, id: &str, title: &str) {
+    app.cache_put("recommend:v2:movie", &json!({"items":[{"id":id,"title":title,"recommendation_kind":"movie","cover":"https://images.example/original.jpg"}]}), 3600).await.unwrap();
 }
 
 #[test]
@@ -879,7 +1286,7 @@ async fn fntv_search_and_strm_contract_avoid_redirecting_login_headers() {
     let (status, v) = request(
         &h,
         "GET",
-        "/v/api/v1/search/list?q=test",
+        "/v/api/v1/search/list?q=%E5%8E%9F%E7%94%9F",
         json!({}),
         Some(&token),
     )

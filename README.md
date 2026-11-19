@@ -6,6 +6,8 @@ Rust 影视聚合服务与中文 React/TypeScript 网页，兼容 LunaTV 配置�
 
 支持 JSON、Base58 文本、订阅 URL、手动及定时刷新、多订阅源归属和按源启停；首次启动的视频源为空，由管理员导入。电影、剧集可聚合搜索、查看详情、选集、播放 MP4/HLS、换源与续播。豆瓣推荐不可用时仍可使用搜索与个人数据。
 
+移除订阅会同步移出当前源管理列表，保留个人收藏与观看记录。搜索按片名相关性排序并过滤上游夹带的无关条目。网页封面由浏览器直接获取，支持有限重试及同作品备用封面；原站拒绝直取且没有可靠候选时显示片名占位。最近的修改与回归范围见 [订阅、封面与搜索回归](docs/verification-20261119.md)。
+
 ## Docker 部署
 
 默认使用 GitHub Actions 构建并发布的 `ghcr.io/lengyuesky/tv-rust:latest` 镜像。如需固定版本，修改 `compose.yaml` 中的 `image` 标签。
@@ -123,6 +125,7 @@ cargo run --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+npm --prefix web test
 npm --prefix web run build
 ```
 
