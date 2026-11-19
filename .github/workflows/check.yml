@@ -37,21 +37,26 @@ jobs:
           nproc
           free -h
           for tool in cc c++ cmake pkg-config; do command -v "$tool"; done
-      - name: 准备独立 FFprobe
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffprobe
+          key: ffprobe-linux-x64-6.1-cb690c360042
+      - name: 准备固定版本 FFprobe
         timeout-minutes: 2
         run: |
-          if ! command -v ffprobe >/dev/null; then
-            npm install --prefix "$RUNNER_TEMP/ffprobe" --ignore-scripts --no-audit --no-fund \
-              --package-lock=false --fetch-retries=2 --fetch-timeout=30000 \
-              --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000 \
-              @ffprobe-installer/linux-x64@5.2.0
-            binary="$RUNNER_TEMP/ffprobe/node_modules/@ffprobe-installer/linux-x64/ffprobe"
+          binary="$RUNNER_TEMP/ffprobe/ffprobe"
+          if [ ! -x "$binary" ]; then
+            archive="$RUNNER_TEMP/ffprobe.zip"
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+              --retry-max-time 60 --connect-timeout 5 --max-time 30 \
+              --output "$archive" \
+              https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffprobe-6.1-linux-64.zip
+            echo "cb690c360042b51d9e901db2b0185c585330c1067b5c5edf0b6a5e26e0375e2a  $archive" | sha256sum --check
+            unzip -q "$archive" -d "$RUNNER_TEMP/ffprobe"
             chmod +x "$binary"
-            "$binary" -version
-            dirname "$binary" >> "$GITHUB_PATH"
-          else
-            ffprobe -version
           fi
+          "$binary" -version
+          dirname "$binary" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
