@@ -8,6 +8,8 @@ Rust 影视聚合服务与中文 React/TypeScript 网页，兼容 LunaTV 配置�
 
 ## Docker 部署
 
+默认使用 GitHub Actions 构建并发布的 `ghcr.io/lengyuesky/tv-rust:latest` 镜像。如需固定版本，修改 `compose.yaml` 中的 `image` 标签。
+
 ```sh
 cp .env.example .env
 docker compose pull
@@ -21,7 +23,6 @@ docker compose up -d
 | 变量 | 用途 |
 | --- | --- |
 | `TV_PORT` | 对外端口，默认 `3000` |
-| `TV_IMAGE` | 镜像地址，默认 `ghcr.io/lengyuesky/tv-rust:latest`；可固定为 `ghcr.io/lengyuesky/tv-rust:0.1.0` |
 | `TV_PUBLIC_URL` | 其他设备或反向代理使用的完整服务根地址，例如 `https://tv.example.com`；留空使用当前访问地址 |
 | `TV_ALLOW_PRIVATE_UPSTREAM` | 连接局域网订阅或视频源时设为 `1`；默认 `0` |
 
@@ -32,7 +33,7 @@ docker buildx build --platform linux/amd64 --load -t tv-rust:amd64 .
 docker buildx build --platform linux/arm64 --load -t tv-rust:arm64 .
 ```
 
-需要从源码构建时，可执行 `TV_IMAGE=tv-rust:local docker compose up -d --build`。当前本机运行情况和实际播放范围见 [验收记录](docs/verification-20261112.md)。
+本地构建后，将 `compose.yaml` 中的 `image` 改为对应的本地镜像标签，再执行 `docker compose up -d`。当前本机运行情况和实际播放范围见 [验收记录](docs/verification-20261112.md)。
 
 ## GitHub Actions 镜像发布
 

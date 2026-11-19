@@ -1,7 +1,6 @@
 services:
   tv-rust:
-    image: "${TV_IMAGE:-ghcr.io/lengyuesky/tv-rust:latest}"
-    build: .
+    image: ghcr.io/lengyuesky/tv-rust:latest
     ports:
       - "${TV_PORT:-3000}:3000"
     environment:
