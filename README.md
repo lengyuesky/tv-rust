@@ -39,9 +39,11 @@ docker buildx build --platform linux/arm64 --load -t tv-rust:arm64 .
 
 ## GitHub Actions 镜像发布
 
-[检查与镜像发布工作流](.github/workflows/check.yml) 先运行格式、Clippy、Rust 测试和网页构建，再让 AMD64 与 ARM64 各使用一台原生 Ubuntu runner 并行构建。公开仓库的 `ubuntu-24.04` 和 `ubuntu-24.04-arm` 均为 [4 核、16 GB 内存的标准 runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories)。Rust 编译使用全部可用 CPU，依赖单独分层并按架构保存 GitHub Actions 构建缓存。
+[检查与镜像发布工作流](.github/workflows/check.yml) 先运行格式、Clippy、Rust 测试和网页构建，再让 AMD64 与 ARM64 各使用一台原生 Ubuntu runner 并行构建。公开仓库的 `ubuntu-24.04` 和 `ubuntu-24.04-arm` 均为 [4 核、16 GB 内存的免费标准 runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories)，并行构建阶段合计可用 8 核、32 GB。Rust 使用每台 runner 的全部可用 CPU，依赖单独分层并按架构保存构建缓存，保留 release 优化。
 
-每个架构都会验证容器架构、普通用户及只读文件系统下的空启动、健康接口、网页和 FFprobe，再推送摘要并合并双架构清单。工作流使用 `GITHUB_TOKEN` 授权 GHCR。
+检查使用 runner 现有编译工具，只在缺少 FFprobe 时获取固定版本的独立测试二进制，避免重复运行 Ubuntu 系统包安装。网页只构建一次，再将同一产物交给两种架构。每个架构只执行一次 Docker 构建，同时导出本地镜像和 GHCR 摘要；本地镜像通过普通用户、只读文件系统下的空启动、健康接口、网页和 FFprobe 检查后，才合并清单并更新发布标签。缓存上传失败不阻断镜像发布。普通本地 `docker build` 仍可直接从源码构建完整镜像。
+
+工作流使用 `GITHUB_TOKEN` 授权 GHCR。构建故障原因和本轮验证见 [构建优化记录](docs/build-20261119.md)。
 
 | 触发方式 | 发布标签 |
 | --- | --- |

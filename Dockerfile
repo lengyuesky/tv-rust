@@ -5,6 +5,9 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
+FROM scratch AS web-output
+COPY --from=web /web/dist/ /
+
 FROM rust:1.99-slim-bookworm AS build
 ARG TARGETARCH
 RUN test "$(dpkg --print-architecture)" = "$TARGETARCH" \
@@ -30,7 +33,7 @@ RUN test "$(dpkg --print-architecture)" = "$TARGETARCH" \
     && groupadd --gid 10001 tv && useradd --uid 10001 --gid tv --no-create-home tv \
     && mkdir -p /data /app/web && chown tv:tv /data
 COPY --from=build /usr/local/bin/tv-rust /usr/local/bin/tv-rust
-COPY --from=web /web/dist/ /app/web/
+COPY --from=web-output / /app/web/
 COPY LICENSE /usr/share/doc/tv-rust/LICENSE
 USER tv
 WORKDIR /app
