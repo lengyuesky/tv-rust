@@ -40,23 +40,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/ffprobe
-          key: ffprobe-linux-x64-6.1-cb690c360042
+          key: ffprobe-linux-x64-btbn-8.1.3-493e89a48da0
       - name: 准备固定版本 FFprobe
         timeout-minutes: 2
-        run: |
-          binary="$RUNNER_TEMP/ffprobe/ffprobe"
-          if [ ! -x "$binary" ]; then
-            archive="$RUNNER_TEMP/ffprobe.zip"
-            curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
-              --retry-max-time 60 --connect-timeout 5 --max-time 30 \
-              --output "$archive" \
-              https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffprobe-6.1-linux-64.zip
-            echo "cb690c360042b51d9e901db2b0185c585330c1067b5c5edf0b6a5e26e0375e2a  $archive" | sha256sum --check
-            unzip -q "$archive" -d "$RUNNER_TEMP/ffprobe"
-            chmod +x "$binary"
-          fi
-          "$binary" -version
-          dirname "$binary" >> "$GITHUB_PATH"
+        run: bash scripts/prepare-ci-ffprobe.sh
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
