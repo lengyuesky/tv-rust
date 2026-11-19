@@ -1443,7 +1443,10 @@ function Logs() {
     </>
   );
 }
-type SubscriptionUsage = { mode: "all" | "selected"; user_ids: string[] };
+type SubscriptionUsage = {
+  mode: "all" | "selected" | "admins";
+  user_ids: string[];
+};
 const allUsers = (): SubscriptionUsage => ({ mode: "all", user_ids: [] });
 
 function UsageSelector({
@@ -1480,10 +1483,23 @@ function UsageSelector({
         >
           指定用户
         </button>
+        <button
+          type="button"
+          aria-pressed={usage.mode === "admins"}
+          className={usage.mode === "admins" ? "active" : ""}
+          onClick={() => onChange({ mode: "admins", user_ids: [] })}
+        >
+          仅管理员
+        </button>
       </div>
       <p className="small muted">
         管理员始终可用。所有用户包含以后创建的账号。
       </p>
+      {usage.mode === "admins" && (
+        <p className="small muted">
+          仅管理员账号可以使用，所有普通成员均不可用，无需选择成员。
+        </p>
+      )}
       {usage.mode === "selected" && (
         <>
           <div className="usage-members">
@@ -1682,8 +1698,10 @@ function SettingsPage({
                     <small className="subscription-usage">
                       {s.usage.mode === "all"
                         ? "所有用户可用"
-                        : `指定 ${s.usage.user_ids.length} 位成员 · ${s.usage.user_ids.map((id: string) => users.find((user) => user.id === id)?.username || "已移除账号").join("、")}`}{" "}
-                      · 管理员始终可用
+                        : s.usage.mode === "admins"
+                          ? "仅管理员可用"
+                          : `指定 ${s.usage.user_ids.length} 位成员 · ${s.usage.user_ids.map((id: string) => users.find((user) => user.id === id)?.username || "已移除账号").join("、")}`}{" "}
+                      {s.usage.mode !== "admins" && "· 管理员始终可用"}
                     </small>
                     {s.error && (
                       <p className="text-error">

@@ -865,7 +865,10 @@ pub async fn subscription_list(app: &App) -> Result<Value> {
     let current: Vec<Source> = sqlx::query_as("SELECT s.* FROM sources s JOIN subscriptions sub ON sub.id=s.subscription_id WHERE sub.removed_at=0 AND s.present=1 ORDER BY s.name,s.id").fetch_all(&app.db).await?;
     Ok(
         json!({"subscriptions":rows.into_iter().map(|Subscription{id,name,url,interval_seconds,updated_at,checked_at,error,all_users}| {
-            let usage = access::Usage { mode: if all_users {access::UsageMode::All} else {access::UsageMode::Selected}, user_ids: members.iter().filter(|(sub,_)|sub==&id).map(|(_,user)|user.clone()).collect() };
+            let user_ids: Vec<String> = members.iter().filter(|(sub,_)|sub==&id).map(|(_,user)|user.clone()).collect();
+            // 仅管理员复用现有授权结构：非全员且未分配任何普通成员。
+            let mode = if all_users {access::UsageMode::All} else if user_ids.is_empty() {access::UsageMode::Admins} else {access::UsageMode::Selected};
+            let usage = access::Usage { mode, user_ids };
             json!({"id":id,"name":name,"url":url,"interval_seconds":interval_seconds,"updated_at":updated_at,"checked_at":checked_at,"error":error,"usage":usage})
         }).collect::<Vec<_>>(),"sources":current}),
     )

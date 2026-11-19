@@ -9,6 +9,7 @@ pub enum UsageMode {
     #[default]
     All,
     Selected,
+    Admins,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -29,9 +30,11 @@ impl Usage {
                 .iter()
                 .any(|id| id.is_empty() || id.len() > 128)
             || (usage.mode == UsageMode::Selected && usage.user_ids.is_empty())
-            || (usage.mode == UsageMode::All && !usage.user_ids.is_empty())
+            || (usage.mode != UsageMode::Selected && !usage.user_ids.is_empty())
         {
-            return Err(Error::bad("指定用户至少选择一位成员，所有用户模式无需名单"));
+            return Err(Error::bad(
+                "指定用户至少选择一位成员；所有用户和仅管理员模式无需名单",
+            ));
         }
         Ok(usage)
     }

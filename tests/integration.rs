@@ -262,6 +262,7 @@ async fn subscription_usage_is_atomic_admin_only_and_preserved_by_updates() {
         json!({"mode":"selected","user_ids":[]}),
         json!({"mode":"selected","user_ids":["missing"]}),
         json!({"mode":"all","user_ids":[h.other.user.id]}),
+        json!({"mode":"admins","user_ids":[h.other.user.id]}),
         json!({"mode":"selected","user_ids":[h.who.user.id]}),
     ] {
         assert_eq!(
@@ -381,10 +382,184 @@ async fn subscription_usage_is_atomic_admin_only_and_preserved_by_updates() {
 }
 
 #[tokio::test]
+async fn admins_only_subscriptions_support_import_edit_refresh_and_restart() {
+    let h = harness().await;
+    let original = catalog::sources(&h.app).await.unwrap().remove(0);
+    let config =
+        json!({"api_site":{"same.key":{"name":"管理员专用源","api":original.api}}}).to_string();
+    let admins = json!({"mode":"admins","user_ids":[]});
+    let (status, imported) = request(
+        &h,
+        "POST",
+        "/api/subscriptions",
+        json!({"name":"管理员订阅","content":config,"usage":admins}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let id = text(&imported, "id");
+    let source = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|source| source.subscription_id == id)
+        .unwrap();
+    let listing = catalog::subscription_list(&h.app).await.unwrap();
+    assert_eq!(
+        listing["subscriptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|sub| sub["id"] == id)
+            .unwrap()["usage"],
+        admins
+    );
+    assert!(
+        access::source_allowed(&h.app, &h.who.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !access::source_allowed(&h.app, &h.other.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !access::sources(&h.app, &h.other.user.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.id == source.id)
+    );
+    auth::create_user(
+        &h.app,
+        &h.who,
+        &json!({"username":"admin-two","password":"second-admin-password","admin":true}),
+    )
+    .await
+    .unwrap();
+    let second_admin: String =
+        sqlx::query_scalar("SELECT id FROM users WHERE username='admin-two'")
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap();
+    assert!(
+        access::source_allowed(&h.app, &second_admin, &source.id)
+            .await
+            .unwrap(),
+        "仅管理员允许其他管理员账号使用"
+    );
+    let later = extra_member(&h).await;
+    assert!(
+        !access::source_allowed(&h.app, &later.id, &source.id)
+            .await
+            .unwrap(),
+        "新建普通成员不获得仅管理员订阅"
+    );
+    let path = format!("/api/subscriptions/{id}");
+    assert_eq!(
+        request(
+            &h,
+            "PATCH",
+            &path,
+            json!({"usage":admins}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        403
+    );
+    access::save_usage(
+        &h.app,
+        &id,
+        &json!({"mode":"selected","user_ids":[h.other.user.id]}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        access::source_allowed(&h.app, &h.other.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    let hits = h.hits.load(Ordering::Relaxed);
+    assert_eq!(
+        request(&h, "PATCH", &path, json!({"usage":admins}), Some(&h.raw))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "改为仅管理员无需下载订阅"
+    );
+    let grants: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM subscription_users WHERE subscription_id=?")
+            .bind(&id)
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap();
+    assert_eq!(grants, 0, "切换到仅管理员清除旧成员授权");
+    assert!(
+        !access::source_allowed(&h.app, &h.other.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    catalog::import(
+        &h.app,
+        &json!({"id":id,"name":"管理员订阅","content":config}),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE subscriptions SET url=? WHERE id=?")
+        .bind(
+            url::Url::parse(&original.api)
+                .unwrap()
+                .join("/config")
+                .unwrap()
+                .to_string(),
+        )
+        .bind(&id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    catalog::refresh(&h.app, &id).await.unwrap();
+    let restarted = App::new(h._dir.path().into(), true, String::new())
+        .await
+        .unwrap();
+    let listing = catalog::subscription_list(&restarted).await.unwrap();
+    assert_eq!(
+        listing["subscriptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|sub| sub["id"] == id)
+            .unwrap()["usage"],
+        admins
+    );
+    assert!(
+        !access::source_allowed(&restarted, &h.other.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        access::source_allowed(&restarted, &second_admin, &source.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&restarted.db)
+            .await
+            .unwrap(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn revoked_subscription_blocks_web_native_caches_posters_and_media() {
     let h = harness().await;
     let source = catalog::sources(&h.app).await.unwrap().remove(0);
-    let extra = extra_member(&h).await;
     sqlx::query("UPDATE films SET poster=? WHERE id=?")
         .bind("https://images.example/private-cover.jpg")
         .bind(&h.film)
@@ -432,7 +607,7 @@ async fn revoked_subscription_blocks_web_native_caches_posters_and_media() {
     access::save_usage(
         &h.app,
         &source.subscription_id,
-        &json!({"mode":"selected","user_ids":[extra.id]}),
+        &json!({"mode":"admins","user_ids":[]}),
     )
     .await
     .unwrap();
@@ -624,7 +799,7 @@ async fn revoked_subscription_blocks_web_native_caches_posters_and_media() {
     access::save_usage(
         &h.app,
         &source.subscription_id,
-        &json!({"mode":"selected","user_ids":[extra.id]}),
+        &json!({"mode":"admins","user_ids":[]}),
     )
     .await
     .unwrap();
@@ -663,7 +838,6 @@ async fn revoked_subscription_blocks_web_native_caches_posters_and_media() {
 #[tokio::test]
 async fn revoking_access_interrupts_a_waiting_stream_without_affecting_admin() {
     let h = harness().await;
-    let extra = extra_member(&h).await;
     let source = catalog::sources(&h.app).await.unwrap().remove(0);
     let e = catalog::episode(&h.app, &h.episode).await.unwrap();
     sqlx::query("UPDATE episodes SET url=? WHERE id=?")
@@ -695,7 +869,7 @@ async fn revoking_access_interrupts_a_waiting_stream_without_affecting_admin() {
     access::save_usage(
         &h.app,
         &source.subscription_id,
-        &json!({"mode":"selected","user_ids":[extra.id]}),
+        &json!({"mode":"admins","user_ids":[]}),
     )
     .await
     .unwrap();
