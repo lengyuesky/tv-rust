@@ -26,7 +26,7 @@ docker compose up -d
 | `TV_PUBLIC_URL` | 其他设备或反向代理使用的完整服务根地址，例如 `https://tv.example.com`；留空使用当前访问地址 |
 | `TV_ALLOW_PRIVATE_UPSTREAM` | 连接局域网订阅或视频源时设为 `1`；默认 `0` |
 
-单容器包含 Rust、网页与媒体元数据探测工具，使用 SQLite 命名卷 `tv-data` 持久化。容器以普通用户运行，根文件系统只读，临时探测使用 `/tmp`。支持 `linux/amd64` 和 `linux/arm64` 构建：
+单容器包含 Rust、网页与媒体元数据探测工具，使用 SQLite 命名卷 `tv-data` 持久化。容器以普通用户运行，临时探测使用 `/tmp`。支持 `linux/amd64` 和 `linux/arm64` 构建：
 
 ```sh
 docker buildx build --platform linux/amd64 --load -t tv-rust:amd64 .
