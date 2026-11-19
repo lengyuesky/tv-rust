@@ -39,6 +39,12 @@ import "./style.css";
 import { api } from "./api";
 import { Poster } from "./poster";
 import { mergeSearchItems } from "./search";
+import {
+  defaultPreferences,
+  imageSources,
+  type UserPreferences,
+} from "./image-source";
+import { PreferencesContext } from "./preferences";
 
 type Obj = Record<string, any>;
 const time = (s: number) =>
@@ -222,7 +228,17 @@ function Login({ setup, onLogin }: { setup: boolean; onLogin: () => void }) {
     </main>
   );
 }
-function Cards({ items, onOpen }: { items: Obj[]; onOpen?: (f: Obj) => void }) {
+function Cards({
+  items,
+  onOpen,
+  onRemove,
+  removing,
+}: {
+  items: Obj[];
+  onOpen?: (f: Obj) => void;
+  onRemove?: (f: Obj) => void;
+  removing?: string;
+}) {
   return (
     <div className="cards">
       {items.map((f) => (
@@ -231,8 +247,26 @@ function Cards({ items, onOpen }: { items: Obj[]; onOpen?: (f: Obj) => void }) {
           <button
             className="card-open"
             aria-label={`打开${f.title}`}
-            onClick={() => (onOpen ? onOpen(f) : go("/film/" + f.id))}
+            onClick={() =>
+              onOpen
+                ? onOpen(f)
+                : go(
+                    f.authorized === false
+                      ? "/search?q=" + encodeURIComponent(f.title)
+                      : "/film/" + f.id,
+                  )
+            }
           />
+          {onRemove && (
+            <button
+              className="card-remove"
+              aria-label={`移除${f.title}的记录`}
+              disabled={!!removing}
+              onClick={() => onRemove(f)}
+            >
+              <Trash2 size={15} />
+            </button>
+          )}
           <strong>{f.title}</strong>
           <div className="card-meta">
             <span>{f.year || f.remarks || "等待探索"}</span>
@@ -359,7 +393,7 @@ function Home({ me }: { me: Obj }) {
             <p>
               {me.user.admin
                 ? "导入一份订阅，即可聚合搜索其中的视频源。"
-                : "请管理员导入订阅，之后即可开始搜索和观看。"}
+                : "当前账号没有可用源，请管理员导入或分配订阅。"}
             </p>
           </div>
           {me.user.admin && (
@@ -1167,7 +1201,8 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
       {film.warning && <Notice>{film.warning}</Notice>}
       {film.available === false && (
         <Notice kind="error">
-          来源已被移除或禁用，收藏和观看记录仍会保留。请搜索其他视频源。
+          {film.unavailable_reason || "来源已被移除或禁用"}
+          ，收藏和观看记录仍会保留。请搜索其他视频源。
         </Notice>
       )}
       <section>
@@ -1220,7 +1255,27 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
 }
 function Collection({ kind }: { kind: "favorites" | "history" }) {
   const [items, setItems] = useState<Obj[] | null>(null),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [removing, setRemoving] = useState("");
+  const remove = async (film: Obj) => {
+    if (removing) return;
+    setRemoving(film.id);
+    setError("");
+    try {
+      await api(
+        `/films/${film.id}/${kind === "favorites" ? "favorite" : "history"}`,
+        "DELETE",
+        {},
+      );
+      setItems(
+        (current) => current?.filter((item) => item.id !== film.id) || [],
+      );
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setRemoving("");
+    }
+  };
   useEffect(() => {
     setItems(null);
     api("/" + kind)
@@ -1248,7 +1303,7 @@ function Collection({ kind }: { kind: "favorites" | "history" }) {
       {items === null ? (
         <Busy />
       ) : items.length ? (
-        <Cards items={items} />
+        <Cards items={items} onRemove={remove} removing={removing} />
       ) : (
         <Empty
           title={kind === "favorites" ? "收藏夹还很安静" : "还没有观看记录"}
@@ -1282,6 +1337,7 @@ function Logs() {
     transferring: "正在转发",
     fallback: "已选择转发",
     ended: "已结束",
+    access_revoked: "使用权限已撤回",
   };
   const retry = async (id: string) => {
     try {
@@ -1347,6 +1403,9 @@ function Logs() {
                 </span>
               </div>
               {p.reason && <p className="small">{p.reason}</p>}
+              {p.authorized === false && (
+                <p className="text-error">{p.unavailable_reason}</p>
+              )}
               <details>
                 <summary>
                   查看过程 <ChevronDown size={14} />
@@ -1384,7 +1443,90 @@ function Logs() {
     </>
   );
 }
-function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
+type SubscriptionUsage = { mode: "all" | "selected"; user_ids: string[] };
+const allUsers = (): SubscriptionUsage => ({ mode: "all", user_ids: [] });
+
+function UsageSelector({
+  usage,
+  onChange,
+  users,
+  disabled,
+}: {
+  usage: SubscriptionUsage;
+  onChange: (usage: SubscriptionUsage) => void;
+  users: Obj[];
+  disabled: boolean;
+}) {
+  const members = users.filter((user) => !user.admin);
+  return (
+    <fieldset className="usage-selector" disabled={disabled}>
+      <legend>使用用户</legend>
+      <div className="segmented">
+        <button
+          type="button"
+          aria-pressed={usage.mode === "all"}
+          className={usage.mode === "all" ? "active" : ""}
+          onClick={() => onChange(allUsers())}
+        >
+          所有用户
+        </button>
+        <button
+          type="button"
+          aria-pressed={usage.mode === "selected"}
+          className={usage.mode === "selected" ? "active" : ""}
+          onClick={() =>
+            onChange({ mode: "selected", user_ids: usage.user_ids })
+          }
+        >
+          指定用户
+        </button>
+      </div>
+      <p className="small muted">
+        管理员始终可用。所有用户包含以后创建的账号。
+      </p>
+      {usage.mode === "selected" && (
+        <>
+          <div className="usage-members">
+            {members.map((user) => (
+              <label key={user.id}>
+                <input
+                  type="checkbox"
+                  checked={usage.user_ids.includes(user.id)}
+                  onChange={(event) =>
+                    onChange({
+                      mode: "selected",
+                      user_ids: event.target.checked
+                        ? [...usage.user_ids, user.id]
+                        : usage.user_ids.filter((id) => id !== user.id),
+                    })
+                  }
+                />
+                <span>
+                  {user.username}
+                  {user.disabled && <small>已停用 · 启用后恢复授权</small>}
+                </span>
+              </label>
+            ))}
+          </div>
+          {!members.length && <Notice>请先在“家庭账号”中创建普通成员。</Notice>}
+          <p className="small muted">
+            至少选择一位成员。修改使用范围会停止已失去授权的本站转发。
+          </p>
+        </>
+      )}
+    </fieldset>
+  );
+}
+
+function SettingsPage({
+  me,
+  refreshMe,
+  updatePreferences,
+}: {
+  me: Obj;
+  refreshMe: () => void;
+  updatePreferences: (value: UserPreferences) => void;
+}) {
   const [tab, setTab] = useState(me.user.admin ? "sources" : "playback"),
     [data, setData] = useState<Obj | null>(null),
     [users, setUsers] = useState<Obj[]>([]),
@@ -1393,6 +1535,20 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
     [busy, setBusy] = useState(false),
     [importing, setImporting] = useState(false),
     [mode, setMode] = useState("url");
+  const [usage, setUsage] = useState<SubscriptionUsage>(allUsers),
+    [editingUsage, setEditingUsage] = useState<Obj | null>(null),
+    [imagePreferences, setImagePreferences] = useState<UserPreferences>(
+      me.preferences || defaultPreferences,
+    );
+  const savedPreferences = JSON.stringify(me.preferences || defaultPreferences);
+  useEffect(() => {
+    setImagePreferences(JSON.parse(savedPreferences));
+  }, [savedPreferences]);
+  const openImport = () => {
+    setUsage(allUsers());
+    setError("");
+    setImporting(true);
+  };
   const [name, setName] = useState(""),
     [url, setUrl] = useState(""),
     [content, setContent] = useState(""),
@@ -1449,12 +1605,14 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
         {(me.user.admin
           ? [
               ["sources", "订阅与视频源"],
+              ["images", "封面设置"],
               ["playback", "播放设置"],
               ["users", "家庭账号"],
               ["connection", "飞牛与数据"],
               ["account", "我的账号"],
             ]
           : [
+              ["images", "封面设置"],
               ["playback", "播放设置"],
               ["connection", "飞牛连接"],
               ["account", "我的账号"],
@@ -1466,6 +1624,9 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
               setTab(id);
               setError("");
               setMessage("");
+              if (me.user.admin && (id === "sources" || id === "users")) {
+                void load().catch((error) => setError(error.message));
+              }
             }}
             className={tab === id ? "active" : ""}
           >
@@ -1484,7 +1645,7 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
         <>
           <div className="section-title">
             <h2>配置订阅</h2>
-            <button className="primary" onClick={() => setImporting(true)}>
+            <button className="primary" onClick={openImport}>
               <Plus size={16} />
               导入订阅
             </button>
@@ -1495,7 +1656,7 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
             <Empty
               title="从你的第一份订阅开始"
               action={
-                <button className="outline" onClick={() => setImporting(true)}>
+                <button className="outline" onClick={openImport}>
                   <Plus size={16} />
                   添加订阅
                 </button>
@@ -1518,12 +1679,29 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
                       上次成功 {date(s.updated_at)} · 刷新间隔{" "}
                       {Math.round(s.interval_seconds / 60)} 分钟
                     </small>
+                    <small className="subscription-usage">
+                      {s.usage.mode === "all"
+                        ? "所有用户可用"
+                        : `指定 ${s.usage.user_ids.length} 位成员 · ${s.usage.user_ids.map((id: string) => users.find((user) => user.id === id)?.username || "已移除账号").join("、")}`}{" "}
+                      · 管理员始终可用
+                    </small>
                     {s.error && (
                       <p className="text-error">
                         {s.error} · 继续使用上次有效配置
                       </p>
                     )}
                   </div>
+                  <button
+                    className="ghost"
+                    disabled={busy}
+                    onClick={() => {
+                      setEditingUsage(s);
+                      setUsage(s.usage);
+                      setError("");
+                    }}
+                  >
+                    使用用户
+                  </button>
                   <button
                     className="icon-button"
                     title="刷新订阅"
@@ -1610,6 +1788,84 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
             </>
           )}
         </>
+      )}
+      {tab === "images" && (
+        <form
+          className="settings-panel narrow"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void action(async () => {
+              const result = await api(
+                "/me/preferences",
+                "PATCH",
+                imagePreferences,
+              );
+              updatePreferences(result.preferences);
+            }, "封面设置已保存到当前账号");
+          }}
+        >
+          <h3>豆瓣图片源</h3>
+          <p>选择封面加载服务，保存到你的账号，在不同设备间同步。</p>
+          <label>
+            图片源
+            <select
+              aria-label="图片源"
+              value={imagePreferences.douban_image_source}
+              disabled={busy}
+              onChange={(event) =>
+                setImagePreferences({
+                  ...imagePreferences,
+                  douban_image_source: event.target
+                    .value as UserPreferences["douban_image_source"],
+                })
+              }
+            >
+              {imageSources.map((source) => (
+                <option key={source.value} value={source.value}>
+                  {source.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          {imagePreferences.douban_image_source === "custom" && (
+            <label>
+              自定义图片源前缀
+              <input
+                aria-label="自定义图片源前缀"
+                required
+                type="url"
+                maxLength={2048}
+                value={imagePreferences.douban_image_custom_url}
+                disabled={busy}
+                onChange={(event) =>
+                  setImagePreferences({
+                    ...imagePreferences,
+                    douban_image_custom_url: event.target.value,
+                  })
+                }
+                placeholder="https://proxy.example.com/fetch?url="
+              />
+              <small>
+                与 LunaTV 格式一致，在此前缀后追加编码后的原始图片地址。
+              </small>
+            </label>
+          )}
+          <p className="small muted">
+            封面由浏览器直接获取。选中服务失败后自动尝试其他内置
+            CDN，再查找同作品备用封面。
+          </p>
+          <p className="small muted">
+            保存后立即生效；其他设备打开页面或切回前台时同步。
+          </p>
+          <button className="primary" disabled={busy}>
+            {busy ? (
+              <Loader2 className="spin" size={16} />
+            ) : (
+              <Check size={16} />
+            )}
+            保存封面设置
+          </button>
+        </form>
       )}
       {tab === "playback" && (
         <div className="settings-panel">
@@ -1847,6 +2103,7 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
                   name,
                   url: mode === "url" ? url : "",
                   content: mode === "text" ? content : "",
+                  usage,
                 });
                 setImporting(false);
                 setName("");
@@ -1925,14 +2182,77 @@ function SettingsPage({ me, refreshMe }: { me: Obj; refreshMe: () => void }) {
                 />
               </label>
             )}
+            <UsageSelector
+              usage={usage}
+              onChange={setUsage}
+              users={users}
+              disabled={busy}
+            />
             {error && <Notice kind="error">{error}</Notice>}
-            <button className="primary wide" disabled={busy}>
+            <button
+              className="primary wide"
+              disabled={
+                busy || (usage.mode === "selected" && !usage.user_ids.length)
+              }
+            >
               {busy ? (
                 <Loader2 className="spin" size={16} />
               ) : (
                 <Plus size={16} />
               )}
               导入配置
+            </button>
+          </form>
+        </div>
+      )}
+      {editingUsage && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !busy && setEditingUsage(null)}
+        >
+          <form
+            className="modal"
+            onClick={(event) => event.stopPropagation()}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void action(async () => {
+                await api("/subscriptions/" + editingUsage.id, "PATCH", {
+                  usage,
+                });
+                setEditingUsage(null);
+              }, "订阅使用范围已保存");
+            }}
+          >
+            <button
+              className="close"
+              type="button"
+              aria-label="关闭"
+              disabled={busy}
+              onClick={() => setEditingUsage(null)}
+            >
+              <X />
+            </button>
+            <h2>修改订阅使用用户</h2>
+            <p>{editingUsage.name}</p>
+            <UsageSelector
+              usage={usage}
+              onChange={setUsage}
+              users={users}
+              disabled={busy}
+            />
+            {error && <Notice kind="error">{error}</Notice>}
+            <button
+              className="primary wide"
+              disabled={
+                busy || (usage.mode === "selected" && !usage.user_ids.length)
+              }
+            >
+              {busy ? (
+                <Loader2 className="spin" size={16} />
+              ) : (
+                <Check size={16} />
+              )}
+              保存使用用户
             </button>
           </form>
         </div>
@@ -1946,10 +2266,16 @@ function App() {
     [me, setMe] = useState<Obj | null>(null),
     [ready, setReady] = useState(false),
     [error, setError] = useState("");
+  const meRequest = useRef(0);
   const refreshMe = useCallback(() => {
+    const request = ++meRequest.current;
     api("/me")
-      .then(setMe)
-      .catch(() => setMe(null))
+      .then((value) => {
+        if (meRequest.current === request) setMe(value);
+      })
+      .catch(() => {
+        if (meRequest.current === request) setMe(null);
+      })
       .finally(() => setReady(true));
   }, []);
   useEffect(() => {
@@ -1958,6 +2284,29 @@ function App() {
       .catch((e) => setError(e.message));
     refreshMe();
   }, [refreshMe]);
+  const userId = me?.user.id;
+  useEffect(() => {
+    if (!userId) return;
+    const sync = () => {
+      if (document.visibilityState === "hidden") return;
+      const request = ++meRequest.current;
+      api("/me")
+        .then((value) => {
+          if (request === meRequest.current)
+            setMe((current) => (current?.user.id === userId ? value : current));
+        })
+        .catch((error) => {
+          if (error.status === 401 && request === meRequest.current)
+            setMe(null);
+        });
+    };
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("pageshow", sync);
+    return () => {
+      document.removeEventListener("visibilitychange", sync);
+      window.removeEventListener("pageshow", sync);
+    };
+  }, [userId]);
   if (error)
     return (
       <main className="page">
@@ -1997,10 +2346,24 @@ function App() {
     page = <Collection kind={route.slice(1) as "favorites" | "history"} />;
   else if (route === "/logs") page = <Logs />;
   else if (route === "/settings")
-    page = <SettingsPage me={me} refreshMe={refreshMe} />;
+    page = (
+      <SettingsPage
+        key={me.user.id}
+        me={me}
+        refreshMe={refreshMe}
+        updatePreferences={(preferences) => {
+          ++meRequest.current;
+          setMe((current) =>
+            current?.user.id === me.user.id
+              ? { ...current, preferences }
+              : current,
+          );
+        }}
+      />
+    );
   else page = <Home me={me} />;
   return (
-    <>
+    <PreferencesContext.Provider value={me.preferences || defaultPreferences}>
       <header>
         <div className="header-inner">
           <Brand />
@@ -2029,7 +2392,10 @@ function App() {
               onClick={() => {
                 void Promise.resolve(finishActivePlayback?.())
                   .then(() => api("/logout", "POST", {}))
-                  .then(() => setMe(null))
+                  .then(() => {
+                    ++meRequest.current;
+                    setMe(null);
+                  })
                   .catch(() => {});
               }}
             >
@@ -2044,7 +2410,7 @@ function App() {
         <span>好故事，总有下一幕。</span>
         <small>TV RUST · {me.version}</small>
       </footer>
-    </>
+    </PreferencesContext.Provider>
   );
 }
 class Boundary extends React.Component<

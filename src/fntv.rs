@@ -1,6 +1,6 @@
 //! 飞牛播放器协议适配。兼容版本字段仅用于协商，不表示本项目是 fnOS。
 use crate::{
-    auth,
+    access, auth,
     catalog::{self, Episode, Film},
     core::*,
     net, playback, probe,
@@ -15,7 +15,11 @@ use axum::{
 use serde_json::{Value, json};
 
 fn ok(v: Value) -> Response {
-    Json(json!({"code":0,"msg":"","data":v})).into_response()
+    let mut response = Json(json!({"code":0,"msg":"","data":v})).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
 }
 pub fn library(kind: &str) -> String {
     guid(&["library", kind])
@@ -49,17 +53,23 @@ async fn resolve_film(app: &App, id: &str) -> Result<Film> {
         .find(|f| season(&f.id) == id)
         .ok_or_else(Error::missing)
 }
-async fn resolve_episode(app: &App, id: &str) -> Result<Episode> {
-    if let Ok(e) = catalog::episode(app, id).await {
-        return Ok(e);
-    }
+async fn authorized_film(app: &App, who: &Identity, id: &str) -> Result<Film> {
     let f = resolve_film(app, id).await?;
-    let f = catalog::detail(app, &f.id, false).await?;
-    catalog::episodes(app, &f.id)
+    access::require_source(app, &who.user.id, &f.source_id).await?;
+    Ok(f)
+}
+async fn resolve_episode(app: &App, who: &Identity, id: &str) -> Result<Episode> {
+    if let Ok(e) = catalog::episode(app, id).await {
+        return Ok(catalog::available(app, &who.user.id, &e.id).await?.0);
+    }
+    let f = authorized_film(app, who, id).await?;
+    let f = catalog::detail(app, &who.user.id, &f.id, false).await?;
+    let e = catalog::episodes(app, &f.id)
         .await?
         .into_iter()
         .next()
-        .ok_or_else(|| Error::bad("该影片没有可识别的播放地址"))
+        .ok_or_else(|| Error::bad("该影片没有可识别的播放地址"))?;
+    Ok(catalog::available(app, &who.user.id, &e.id).await?.0)
 }
 async fn row(
     app: &App,
@@ -69,13 +79,18 @@ async fn row(
     is_season: bool,
 ) -> Result<Value> {
     let view = catalog::view(app, &who.user.id, &f.id, false).await?;
-    let eps = catalog::episodes(app, &f.id).await?;
+    let authorized = view["authorized"] == true;
+    let eps = if authorized {
+        catalog::episodes(app, &f.id).await?
+    } else {
+        Vec::new()
+    };
     let first = eps.first();
     let count = eps
         .iter()
         .filter(|e| e.line_order == first.map(|e| e.line_order).unwrap_or(0))
         .count();
-    let ep = episode.or(first);
+    let ep = if authorized { episode.or(first) } else { None };
     let info = ep
         .and_then(|e| serde_json::from_str::<probe::MediaInfo>(&e.probe).ok())
         .unwrap_or_default();
@@ -105,25 +120,26 @@ async fn row(
     } else {
         format!("{} · {}", f.title, text(&view, "source_name"))
     };
-    let poster = if f.poster.is_empty() {
+    let poster = if !authorized || f.poster.is_empty() {
         String::new()
     } else {
         format!("/tv-poster/{}", f.id)
     };
-    let position = if view["progress"]["episode_id"].as_str() == ep.map(|e| e.id.as_str()) {
-        view["progress"]["position"].as_f64().unwrap_or(0.0)
-    } else {
-        0.0
-    };
+    let position =
+        if !authorized || view["progress"]["episode_id"].as_str() == ep.map(|e| e.id.as_str()) {
+            view["progress"]["position"].as_f64().unwrap_or(0.0)
+        } else {
+            0.0
+        };
     let video = probe::video(&info);
     let height = video["height"].as_u64().unwrap_or(0);
     Ok(
         json!({"guid":id,"title":title,"type":kind,"lan":"zh-CN","tv_title":f.title,"parent_title":text(&view,"source_name"),
         "original_title":f.title,"imdb_id":"","trim_id":"","poster":poster,"posters":poster,"backdrops":"","vote_average":"0","genres":[],
-        "release_date":f.year,"overview":format!("来源：{}\n{}",text(&view,"source_name"),f.overview),"is_favorite":u8::from(view["favorite"]==true),
+        "release_date":f.year,"overview":format!("来源：{}\n{}",text(&view,"source_name"),text(&view,"overview")),"is_favorite":u8::from(view["favorite"]==true),
         "is_watched":0,"watched":0,"watched_ts":position as u64,"season_number":1,"episode_number":episode.map(|e|e.number).unwrap_or(0),
         "number_of_seasons":if f.kind=="TV"{1}else{0},"number_of_episodes":count,"local_number_of_episodes":count,"local_number_of_seasons":if f.kind=="TV"{1}else{0},
-        "can_play":u8::from(view["available"]==true && !matches!(kind,"TV"|"Season")),"play_error":if view["available"]==true{""}else{"来源失效或被禁用"},
+        "can_play":u8::from(view["available"]==true && !matches!(kind,"TV"|"Season")),"play_error":text(&view,"unavailable_reason"),
         "parent_guid":parent,"grand_guid":if f.kind=="TV"{f.id.as_str()}else{""},"ancestor_guid":library(&f.kind),"ancestor_name":if f.kind=="TV"{"剧集"}else{"电影"},
         "ancestor_category":f.kind,"play_item_guid":ep.map(|e|e.id.as_str()).unwrap_or(""),"media_guid":ep.map(|e|e.id.as_str()).unwrap_or(""),
         "duration":info.duration as u64,"logic_type":0,"single_child_guid":"","file_name":ep.map(|e|format!("{}.{}",e.title,if info.kind=="hls"{"m3u8"}else{"mp4"})).unwrap_or_default(),
@@ -207,14 +223,14 @@ async fn list(app: &App, who: &Identity, v: &Value, favorites: bool) -> Result<V
     let mut rows = Vec::new();
     let remote_search = !query.trim().is_empty() && !favorites;
     if remote_search {
-        let result = catalog::search(app, &query, page, None).await?;
+        let result = catalog::search(app, &who.user.id, &query, page, None).await?;
         for v in result["items"].as_array().into_iter().flatten() {
             let f = catalog::film(app, &text(v, "id")).await?;
             rows.push(row(app, who, &f, None, false).await?);
         }
     } else if !ancestor.is_empty() && ancestor != library("Movie") && ancestor != library("TV") {
-        let f = resolve_film(app, &ancestor).await?;
-        let f = catalog::detail(app, &f.id, false).await?;
+        let f = authorized_film(app, who, &ancestor).await?;
+        let f = catalog::detail(app, &who.user.id, &f.id, false).await?;
         if ancestor == f.id {
             rows.push(row(app, who, &f, None, true).await?);
         } else {
@@ -299,7 +315,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 if q.trim().is_empty() {
                     return Ok(ok(json!([])));
                 }
-                let result = catalog::search(app, q, 1, None).await?;
+                let result = catalog::search(app, &who.user.id, q, 1, None).await?;
                 let mut rows = Vec::new();
                 for v in result["items"].as_array().into_iter().flatten() {
                     let f = catalog::film(app, &text(v, "id")).await?;
@@ -361,19 +377,34 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                     ));
                 }
             }
-            let f = resolve_film(app, id).await?;
-            let f = catalog::detail(app, &f.id, false).await.unwrap_or(f);
+            let f = authorized_film(app, &who, id).await?;
+            let f = catalog::detail(app, &who.user.id, &f.id, false)
+                .await
+                .unwrap_or(f);
+            access::require_source(app, &who.user.id, &f.source_id).await?;
             let e = catalog::episode(app, id).await.ok();
             return Ok(ok(
                 row(app, &who, &f, e.as_ref(), id == season(&f.id)).await?
             ));
         }
         if let Some(id) = path.strip_prefix("/v/api/v1/season/list/") {
-            let f = catalog::detail(app, &resolve_film(app, id).await?.id, false).await?;
+            let f = catalog::detail(
+                app,
+                &who.user.id,
+                &authorized_film(app, &who, id).await?.id,
+                false,
+            )
+            .await?;
             return Ok(ok(json!([row(app, &who, &f, None, true).await?])));
         }
         if let Some(id) = path.strip_prefix("/v/api/v1/episode/list/") {
-            let f = catalog::detail(app, &resolve_film(app, id).await?.id, false).await?;
+            let f = catalog::detail(
+                app,
+                &who.user.id,
+                &authorized_film(app, &who, id).await?.id,
+                false,
+            )
+            .await?;
             let eps = catalog::episodes(app, &f.id).await?;
             let line = eps.first().map(|e| e.line_order).unwrap_or(0);
             let mut rows = Vec::new();
@@ -383,16 +414,17 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
             return Ok(ok(json!(rows)));
         }
         if let Some(id) = path.strip_prefix("/v/api/v1/stream/list/") {
-            let e = resolve_episode(app, id).await?;
+            let e = resolve_episode(app, &who, id).await?;
             let info = probe::get(app, &e).await?;
+            catalog::available(app, &who.user.id, &e.id).await?;
             let (video, audio, subtitle) = tracks(&e, &info);
             return Ok(ok(
                 json!({"files":[file(&e,&info)],"video_streams":video,"audio_streams":audio,"subtitle_streams":subtitle}),
             ));
         }
         if let Some(id) = path.strip_prefix("/v/api/v1/media/range/") {
-            let e = resolve_episode(app, id).await?;
-            catalog::available(app, &e.id).await?;
+            let e = resolve_episode(app, &who, id).await?;
+            catalog::available(app, &who.user.id, &e.id).await?;
             let p = playback::latest(app, &who, &e.id).await?;
             if p.mode == "direct" {
                 playback::event(
@@ -413,7 +445,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
             .strip_prefix("/v/api/v1/sys/img/tv-poster/")
             .or_else(|| path.strip_prefix("/tv-poster/"))
         {
-            return crate::api::poster(app, id).await;
+            return crate::api::poster(app, &who.user.id, id).await;
         }
         return Err(Error::missing());
     }
@@ -482,12 +514,14 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         return Ok(ok(json!(true)));
     }
     if path == "/v/api/v1/item/watched" {
+        authorized_film(app, &who, reference).await?;
         return Ok(ok(json!(true)));
     }
-    let e = resolve_episode(app, reference).await?;
-    catalog::available(app, &e.id).await?;
+    let e = resolve_episode(app, &who, reference).await?;
+    catalog::available(app, &who.user.id, &e.id).await?;
     let f = catalog::film(app, &e.film_id).await?;
     let info = probe::get(app, &e).await?;
+    catalog::available(app, &who.user.id, &e.id).await?;
     let (video, audio, subtitle) = tracks(&e, &info);
     match path.as_str() {
         "/v/api/v1/play/info" => {

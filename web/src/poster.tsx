@@ -1,22 +1,83 @@
-import { useEffect, useReducer } from "react";
+import { useContext, useEffect, useReducer, useRef } from "react";
 import { Film, Play, RefreshCw } from "lucide-react";
 import { api } from "./api";
-import { initialPoster, posterKey, posterReducer } from "./poster-state";
+import {
+  directPosterUrls,
+  initialPoster,
+  posterKey,
+  posterReducer,
+} from "./poster-state";
+import { doubanPosterUrls, type UserPreferences } from "./image-source";
+import { PreferencesContext } from "./preferences";
 
 type Item = Record<string, any>;
 
 export function Poster({ film }: { film: Item }) {
-  const urls = [film.cover, film.poster, ...(film.poster_candidates || [])];
+  const preferences = useContext(PreferencesContext);
+  const urls =
+    film.authorized === false
+      ? []
+      : doubanPosterUrls(
+          directPosterUrls([
+            film.cover,
+            film.poster,
+            ...(film.poster_candidates || []),
+          ]),
+          preferences,
+        );
   // 图片地址更新后清除旧的失败状态；进度变化不会重新加载图片。
-  const identity = JSON.stringify([film.id, film.recommendation_kind, urls]);
-  return <PosterImage key={identity} film={film} urls={urls} />;
+  const identity = JSON.stringify([
+    film.id,
+    film.recommendation_kind,
+    urls,
+    preferences,
+    film.authorized,
+  ]);
+  return (
+    <PosterImage
+      key={identity}
+      film={film}
+      urls={urls}
+      preferences={preferences}
+    />
+  );
 }
 
-function PosterImage({ film, urls }: { film: Item; urls: unknown[] }) {
+function PosterImage({
+  film,
+  urls,
+  preferences,
+}: {
+  film: Item;
+  urls: unknown[];
+  preferences: UserPreferences;
+}) {
   const [state, dispatch] = useReducer(posterReducer, urls, initialPoster);
   const key = posterKey(state);
   const src = state.urls[state.index];
+  const image = useRef<HTMLImageElement>(null);
   useEffect(() => {
+    if (!src || state.exhausted || state.loaded) return;
+    // 懒加载图片进入视口后才开始计时，避免离屏封面被误判为失败。
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const target = image.current;
+    if (!target) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting) && !timeout) {
+          timeout = setTimeout(() => dispatch({ type: "error", key }), 8000);
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    observer.observe(target);
+    return () => {
+      observer.disconnect();
+      clearTimeout(timeout);
+    };
+  }, [src, key, state.exhausted, state.loaded]);
+  useEffect(() => {
+    if (film.authorized === false) return;
     if (!state.exhausted || state.lookup !== "idle") return;
     dispatch({ type: "lookup" });
     const controller = new AbortController();
@@ -26,7 +87,13 @@ function PosterImage({ film, urls }: { film: Item; urls: unknown[] }) {
     api(path, "GET", undefined, false, controller.signal)
       .then((value) => {
         if (!controller.signal.aborted)
-          dispatch({ type: "candidates", urls: value.urls || [] });
+          dispatch({
+            type: "candidates",
+            urls: doubanPosterUrls(
+              directPosterUrls(value.urls || []),
+              preferences,
+            ),
+          });
       })
       .catch(() => {
         if (!controller.signal.aborted)
@@ -39,6 +106,7 @@ function PosterImage({ film, urls }: { film: Item; urls: unknown[] }) {
     <div className="poster">
       {src && !state.exhausted ? (
         <img
+          ref={image}
           key={key}
           src={src}
           loading="lazy"
@@ -53,7 +121,11 @@ function PosterImage({ film, urls }: { film: Item; urls: unknown[] }) {
           <Film size={30} />
           <span>{film.title}</span>
           <small>
-            {state.lookup === "done" ? "暂无可用封面" : "正在查找封面…"}
+            {film.authorized === false
+              ? "当前账号未获使用权限"
+              : state.lookup === "done"
+                ? "暂无可用封面"
+                : "正在查找封面…"}
           </small>
           {state.lookup === "done" && (
             <button
@@ -74,7 +146,11 @@ function PosterImage({ film, urls }: { film: Item; urls: unknown[] }) {
         <Play size={23} fill="currentColor" />
       </span>
       {film.rate && <span className="score">{film.rate}</span>}
-      {film.available === false && <span className="tag-off">来源失效</span>}
+      {film.available === false && (
+        <span className="tag-off">
+          {film.authorized === false ? "未获授权" : "来源失效"}
+        </span>
+      )}
       {film.source_count > 1 && (
         <span className="source-count">{film.source_count} 个源</span>
       )}

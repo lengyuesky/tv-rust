@@ -1,4 +1,4 @@
-export function directPosterUrls(values: unknown[]): string[] {
+export function directPosterUrls(values: unknown[], limit = 8): string[] {
   const result = new Set<string>();
   for (const value of values) {
     if (typeof value !== "string" || !value.trim() || value.length > 8192)
@@ -15,7 +15,7 @@ export function directPosterUrls(values: unknown[]): string[] {
       // 地址由服务端按视频源补全；不把无效地址当成本应用的图片路径。
     }
   }
-  return [...result].slice(0, 8);
+  return [...result].slice(0, limit);
 }
 
 export type PosterState = {
@@ -34,7 +34,7 @@ export type PosterAction =
   | { type: "retry" };
 
 export function initialPoster(urls: unknown[]): PosterState {
-  const direct = directPosterUrls(urls);
+  const direct = directPosterUrls(urls, 48);
   return {
     urls: direct,
     index: 0,
@@ -66,7 +66,11 @@ export function posterReducer(
     case "lookup":
       return { ...state, lookup: "loading" };
     case "candidates": {
-      const urls = directPosterUrls([...state.urls, ...action.urls]);
+      // 为后来查询到的同作品封面保留容量，CDN 展开不能占满原来的八条上限。
+      const urls = directPosterUrls(
+        [...state.urls, ...directPosterUrls(action.urls, 24)],
+        48,
+      );
       return urls.length > state.urls.length
         ? {
             ...state,

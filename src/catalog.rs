@@ -1,4 +1,4 @@
-use crate::{core::*, net};
+use crate::{access, core::*, net};
 use axum::http::{HeaderMap, Method};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -147,6 +147,8 @@ pub async fn switch_hint(app: &App, user: &str, target_id: &str, from_id: &str) 
     };
     let from = film(app, from_id).await?;
     let target = film(app, target_id).await?;
+    access::require_source(app, user, &from.source_id).await?;
+    access::require_source(app, user, &target.source_id).await?;
     let original = episode(app, &episode_id).await?;
     let source = source(app, &from.source_id).await?;
     let mut hint = json!({"matched":false,"from_episode":original.title,"from_position":position,"from_source":source.name,
@@ -200,6 +202,18 @@ struct Config {
     api_site: BTreeMap<String, Value>,
 }
 
+#[derive(sqlx::FromRow)]
+struct Subscription {
+    id: String,
+    name: String,
+    url: String,
+    interval_seconds: i64,
+    updated_at: i64,
+    checked_at: i64,
+    error: String,
+    all_users: bool,
+}
+
 pub fn decode(input: &str) -> Result<Value> {
     if input.len() > 4 * 1024 * 1024 {
         return Err(Error::bad("配置超过 4 MiB"));
@@ -238,7 +252,14 @@ async fn download_config(app: &App, url: &str) -> Result<String> {
     String::from_utf8(net::bytes(r, 4 * 1024 * 1024, false).await?)
         .map_err(|_| Error::bad("订阅不是 UTF-8 文本"))
 }
-async fn apply_config(app: &App, id: &str, name: &str, url: &str, config: &Value) -> Result<()> {
+async fn apply_config(
+    app: &App,
+    id: &str,
+    name: &str,
+    url: &str,
+    config: &Value,
+    usage: Option<&access::Usage>,
+) -> Result<()> {
     let parsed: Config =
         serde_json::from_value(config.clone()).map_err(|_| Error::bad("配置无效"))?;
     let ttl = parsed
@@ -258,14 +279,22 @@ async fn apply_config(app: &App, id: &str, name: &str, url: &str, config: &Value
             .bind(guid(&["source",id,&key])).bind(id).bind(key).bind(text(&v,"name")).bind(text(&v,"api"))
             .bind(text(&v,"detail")).bind(!v["disabled"].as_bool().unwrap_or(false)).bind(text(&v,"_comment")).execute(&mut *tx).await?;
     }
+    if let Some(usage) = usage {
+        access::write_usage(&mut tx, id, usage).await?;
+    }
     sqlx::query("DELETE FROM cache WHERE key LIKE 'search:%'")
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    if usage.is_some() {
+        app.access_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
     Ok(())
 }
 pub async fn import(app: &App, v: &Value) -> Result<String> {
     let _guard = app.refresh_lock.lock().await;
+    let usage = v.get("usage").map(access::Usage::parse).transpose()?;
     let name = text(v, "name").trim().to_owned();
     let url = text(v, "url").trim().to_owned();
     if name.is_empty() || name.len() > 128 {
@@ -294,7 +323,7 @@ pub async fn import(app: &App, v: &Value) -> Result<String> {
         }
         provided
     };
-    apply_config(app, &id, &name, &url, &config).await?;
+    apply_config(app, &id, &name, &url, &config, usage.as_ref()).await?;
     Ok(id)
 }
 pub async fn refresh(app: &App, id: &str) -> Result<()> {
@@ -311,7 +340,7 @@ pub async fn refresh(app: &App, id: &str) -> Result<()> {
     let result = async {
         let content = download_config(app, &url).await?;
         let config = decode(&content)?;
-        apply_config(app, id, &name, &url, &config).await
+        apply_config(app, id, &name, &url, &config, None).await
     }
     .await;
     if let Err(ref e) = result {
@@ -381,10 +410,11 @@ pub async fn episodes(app: &App, id: &str) -> Result<Vec<Episode>> {
     .fetch_all(&app.db)
     .await?)
 }
-pub async fn available(app: &App, episode_id: &str) -> Result<(Episode, Film, Source)> {
+pub async fn available(app: &App, user: &str, episode_id: &str) -> Result<(Episode, Film, Source)> {
     let e = episode(app, episode_id).await?;
     let f = film(app, &e.film_id).await?;
     let s = source(app, &f.source_id).await?;
+    access::require_source(app, user, &s.id).await?;
     if !e.active || !s.active() {
         return Err(Error::bad("来源已失效或被禁用，请切换视频源"));
     }
@@ -592,8 +622,9 @@ pub async fn ingest(app: &App, source: &Source, v: &Value, detailed: bool) -> Re
     tx.commit().await?;
     Ok(Some(film(app, &id).await?))
 }
-pub async fn detail(app: &App, id: &str, force: bool) -> Result<Film> {
+pub async fn detail(app: &App, user: &str, id: &str, force: bool) -> Result<Film> {
     let current = film(app, id).await?;
+    access::require_source(app, user, &current.source_id).await?;
     let s = source(app, &current.source_id).await?;
     if !s.active() || (!force && current.detailed_at > now() - 1800) {
         return Ok(current);
@@ -614,12 +645,14 @@ pub async fn detail(app: &App, id: &str, force: bool) -> Result<Film> {
         .and_then(|rows| rows.iter().find(|v| text(v, "vod_id") == current.vod_id))
         && let Some(f) = ingest(app, &s, row, true).await?
     {
+        access::require_source(app, user, &s.id).await?;
         return Ok(f);
     }
     Err(Error::bad("视频源没有返回对应影片详情"))
 }
 pub async fn search(
     app: &App,
+    user: &str,
     query: &str,
     page: i64,
     source_filter: Option<&str>,
@@ -628,13 +661,13 @@ pub async fn search(
     if search_text(query).is_empty() || query.chars().count() > 100 || !(1..=500).contains(&page) {
         return Err(Error::bad("关键词或页码无效"));
     }
-    let enabled = sources(app)
+    let enabled = access::sources(app, user)
         .await?
         .into_iter()
         .filter(|s| s.active() && source_filter.is_none_or(|id| s.id == id))
         .collect::<Vec<_>>();
     let key = format!(
-        "search:v2:{}",
+        "search:v3:{}",
         hash(format!(
             "{query}|{page}|{}",
             enabled
@@ -645,10 +678,11 @@ pub async fn search(
         ))
     );
     if let Some(v) = app.cache_get(&key).await? {
-        return Ok(v);
+        return filter_search(app, user, v).await;
     }
     let results = stream::iter(enabled.into_iter().map(|s| async move {
         let result = async {
+            access::require_source(app, user, &s.id).await?;
             let url = api_url(
                 &s.api,
                 &[
@@ -692,7 +726,7 @@ pub async fn search(
     let mut items = Vec::new();
     let mut status = Vec::new();
     let mut more = false;
-    let active: HashSet<String> = sources(app)
+    let active: HashSet<String> = access::sources(app, user)
         .await?
         .into_iter()
         .filter(Source::active)
@@ -700,15 +734,12 @@ pub async fn search(
         .collect();
     for (s, r) in results {
         if !active.contains(&s.id) {
-            status.push(
-                json!({"id":s.id,"name":s.name,"count":0,"ok":false,"error":"来源已停用或移除"}),
-            );
             continue;
         }
         match r {
             Ok((films, pages, filtered)) => {
                 more |= pages > page && page < 500;
-                status.push(json!({"id":s.id,"name":s.name,"count":films.len(),"ok":true,"filtered_count":filtered}));
+                status.push(json!({"id":s.id,"name":s.name,"count":films.len(),"ok":true,"filtered_count":filtered,"has_more":pages>page && page<500}));
                 items.extend(films.into_iter().map(|f| {
                     let key = group_key(&f);
                     let mut v = serde_json::to_value(f).unwrap();
@@ -727,6 +758,23 @@ pub async fn search(
     items.sort_by(compare_search_items);
     let result = json!({"items":items,"sources":status,"page":page,"has_more":more});
     app.cache_put(&key, &result, 180).await?;
+    filter_search(app, user, result).await
+}
+
+async fn filter_search(app: &App, user: &str, mut result: Value) -> Result<Value> {
+    let allowed: HashSet<String> = access::sources(app, user)
+        .await?
+        .into_iter()
+        .filter(Source::active)
+        .map(|s| s.id)
+        .collect();
+    if let Some(items) = result["items"].as_array_mut() {
+        items.retain(|f| allowed.contains(&text(f, "source_id")));
+    }
+    if let Some(sources) = result["sources"].as_array_mut() {
+        sources.retain(|s| allowed.contains(&text(s, "id")));
+        result["has_more"] = json!(sources.iter().any(|s| s["has_more"] == true));
+    }
     Ok(result)
 }
 pub async fn personal(app: &App, user: &str, kind: &str) -> Result<Vec<Value>> {
@@ -761,9 +809,27 @@ pub async fn view(app: &App, user: &str, id: &str, full: bool) -> Result<Value> 
             .fetch_one(&app.db)
             .await?;
     let progress:Option<(String,f64,f64,i64)>=sqlx::query_as("SELECT episode_id,position,duration,updated_at FROM progress WHERE user_id=? AND film_id=?").bind(user).bind(id).fetch_optional(&app.db).await?;
+    let authorized = access::source_allowed(app, user, &s.id).await?;
+    if !authorized && (full || (fav == 0 && progress.is_none())) {
+        return Err(Error::denied(access::UNAUTHORIZED_SOURCE));
+    }
     let mut value = serde_json::to_value(&f).unwrap();
     value["source_name"] = json!(s.name);
-    value["available"] = json!(s.active());
+    value["authorized"] = json!(authorized);
+    value["available"] = json!(authorized && s.active());
+    value["unavailable_reason"] = json!(if !authorized {
+        access::UNAUTHORIZED_SOURCE
+    } else if !s.active() {
+        "来源已被移除或禁用"
+    } else {
+        ""
+    });
+    if !authorized {
+        // 只保留用户自己的记录摘要，不继续交付未授权订阅的外部图片或详情。
+        for key in ["poster", "overview", "actor", "director"] {
+            value[key] = json!("");
+        }
+    }
     value["favorite"] = json!(fav > 0);
     value["progress"]=progress.map(|(episode_id,position,duration,updated_at)|json!({"episode_id":episode_id,"position":position,"duration":duration,"updated_at":updated_at})).unwrap_or(Value::Null);
     if full {
@@ -772,8 +838,9 @@ pub async fn view(app: &App, user: &str, id: &str, full: bool) -> Result<Value> 
     Ok(value)
 }
 pub async fn favorite(app: &App, user: &str, id: &str, on: bool) -> Result<()> {
-    film(app, id).await?;
+    let film = film(app, id).await?;
     if on {
+        access::require_source(app, user, &film.source_id).await?;
         sqlx::query("INSERT OR IGNORE INTO favorites VALUES(?,?,?)")
             .bind(user)
             .bind(id)
@@ -790,10 +857,17 @@ pub async fn favorite(app: &App, user: &str, id: &str, on: bool) -> Result<()> {
     Ok(())
 }
 pub async fn subscription_list(app: &App) -> Result<Value> {
-    let rows:Vec<(String,String,String,i64,i64,i64,String)>=sqlx::query_as("SELECT id,name,url,interval_seconds,updated_at,checked_at,error FROM subscriptions WHERE removed_at=0 ORDER BY name,id").fetch_all(&app.db).await?;
+    let rows:Vec<Subscription>=sqlx::query_as("SELECT id,name,url,interval_seconds,updated_at,checked_at,error,all_users FROM subscriptions WHERE removed_at=0 ORDER BY name,id").fetch_all(&app.db).await?;
+    let members: Vec<(String, String)> =
+        sqlx::query_as("SELECT subscription_id,user_id FROM subscription_users ORDER BY user_id")
+            .fetch_all(&app.db)
+            .await?;
     let current: Vec<Source> = sqlx::query_as("SELECT s.* FROM sources s JOIN subscriptions sub ON sub.id=s.subscription_id WHERE sub.removed_at=0 AND s.present=1 ORDER BY s.name,s.id").fetch_all(&app.db).await?;
     Ok(
-        json!({"subscriptions":rows.into_iter().map(|(id,name,url,interval_seconds,updated_at,checked_at,error)|json!({"id":id,"name":name,"url":url,"interval_seconds":interval_seconds,"updated_at":updated_at,"checked_at":checked_at,"error":error})).collect::<Vec<_>>(),"sources":current}),
+        json!({"subscriptions":rows.into_iter().map(|Subscription{id,name,url,interval_seconds,updated_at,checked_at,error,all_users}| {
+            let usage = access::Usage { mode: if all_users {access::UsageMode::All} else {access::UsageMode::Selected}, user_ids: members.iter().filter(|(sub,_)|sub==&id).map(|(_,user)|user.clone()).collect() };
+            json!({"id":id,"name":name,"url":url,"interval_seconds":interval_seconds,"updated_at":updated_at,"checked_at":checked_at,"error":error,"usage":usage})
+        }).collect::<Vec<_>>(),"sources":current}),
     )
 }
 pub async fn recommendations(app: &App, kind: &str) -> Result<Value> {
@@ -821,6 +895,7 @@ fn known_year(year: &str) -> bool {
 }
 async fn matching_posters(
     app: &App,
+    user: &str,
     title: &str,
     year: &str,
     kind: &str,
@@ -842,20 +917,32 @@ async fn matching_posters(
     .fetch_all(&app.db)
     .await?;
     let mut seen = HashSet::new();
+    let allowed: HashSet<_> = access::sources(app, user)
+        .await?
+        .into_iter()
+        .filter(Source::active)
+        .map(|s| s.id)
+        .collect();
     Ok(films
         .into_iter()
-        .filter(|f| version_markers(f) == markers && net::valid_url(&f.poster).is_ok())
+        .filter(|f| {
+            allowed.contains(&f.source_id)
+                && version_markers(f) == markers
+                && net::valid_url(&f.poster).is_ok()
+        })
         .map(|f| f.poster)
         .filter(|url| seen.insert(url.clone()))
         .take(8)
         .collect())
 }
-pub async fn film_posters(app: &App, id: &str) -> Result<Value> {
+pub async fn film_posters(app: &App, user: &str, id: &str) -> Result<Value> {
     let f = film(app, id).await?;
-    let urls = matching_posters(app, &f.title, &f.year, &f.kind, &version_markers(&f)).await?;
+    access::require_source(app, user, &f.source_id).await?;
+    let urls =
+        matching_posters(app, user, &f.title, &f.year, &f.kind, &version_markers(&f)).await?;
     Ok(json!({"urls":urls}))
 }
-pub async fn recommendation_posters(app: &App, id: &str, kind: &str) -> Result<Value> {
+pub async fn recommendation_posters(app: &App, user: &str, id: &str, kind: &str) -> Result<Value> {
     if id.is_empty() || id.len() > 20 || !id.bytes().all(|c| c.is_ascii_digit()) {
         return Err(Error::missing());
     }
@@ -867,16 +954,22 @@ pub async fn recommendation_posters(app: &App, id: &str, kind: &str) -> Result<V
         .ok_or_else(Error::missing)?;
     let title = text(subject, "title");
     // 仅为已有同名候选补元数据，不为每张失效推荐图发起全源搜索。
-    let existing: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM films f JOIN sources s ON s.id=f.source_id \
+    let existing: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT f.source_id FROM films f JOIN sources s ON s.id=f.source_id \
          JOIN subscriptions sub ON sub.id=s.subscription_id \
          WHERE lower(trim(f.title))=? AND f.poster<>'' AND f.year<>'' \
          AND s.present=1 AND s.enabled=1 AND s.upstream_enabled=1 AND sub.removed_at=0",
     )
     .bind(title.trim().to_lowercase())
-    .fetch_one(&app.db)
+    .fetch_all(&app.db)
     .await?;
-    if existing == 0 {
+    let allowed: HashSet<_> = access::sources(app, user)
+        .await?
+        .into_iter()
+        .filter(Source::active)
+        .map(|s| s.id)
+        .collect();
+    if !existing.iter().any(|s| allowed.contains(s)) {
         return Ok(json!({"urls":[]}));
     }
     let key = format!("recommendation-meta:v1:{id}");
@@ -904,6 +997,7 @@ pub async fn recommendation_posters(app: &App, id: &str, kind: &str) -> Result<V
     }
     let urls = matching_posters(
         app,
+        user,
         &title,
         &text(&metadata, "year"),
         category,

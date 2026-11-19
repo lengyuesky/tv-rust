@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tower::ServiceExt;
-use tv_rust::{auth, catalog, core::*, playback, router};
+use tv_rust::{access, auth, catalog, core::*, playback, preferences, router};
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -22,6 +22,7 @@ struct Harness {
     who: Identity,
     other: Identity,
     raw: String,
+    member_raw: String,
     film: String,
     episode: String,
     server: tokio::task::JoinHandle<()>,
@@ -104,7 +105,7 @@ async fn harness() -> Harness {
         .unwrap();
     let other = Identity {
         user,
-        auth_hash: hash(other_raw),
+        auth_hash: hash(&other_raw),
         client: "web".into(),
     };
     let config = json!({"cache_time":7200,"api_site":{"same.key":{"name":"测试源","api":format!("{base}/api"),"_comment":"说明"}}});
@@ -127,6 +128,7 @@ async fn harness() -> Harness {
         who,
         other,
         raw,
+        member_raw: other_raw,
         film: f.id,
         episode: ep.id,
         server,
@@ -159,6 +161,552 @@ async fn request(
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+async fn extra_member(h: &Harness) -> User {
+    auth::create_user(
+        &h.app,
+        &h.who,
+        &json!({"username":"extra","password":"extra-password-123"}),
+    )
+    .await
+    .unwrap();
+    sqlx::query_as("SELECT id,username,admin,disabled FROM users WHERE username='extra'")
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn image_preferences_are_saved_per_account_and_survive_restart() {
+    let h = harness().await;
+    let (_, initial) = request(&h, "GET", "/api/me", json!({}), Some(&h.member_raw)).await;
+    assert_eq!(
+        initial["preferences"]["douban_image_source"],
+        "cmliussss-cdn-tencent"
+    );
+    let value = json!({"douban_image_source":"custom","douban_image_custom_url":"https://images.example/fetch?url="});
+    assert_eq!(
+        request(
+            &h,
+            "PATCH",
+            "/api/me/preferences",
+            value.clone(),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, saved) = request(&h, "GET", "/api/me", json!({}), Some(&h.member_raw)).await;
+    assert_eq!(saved["preferences"], value);
+    let (_, admin) = request(&h, "GET", "/api/me", json!({}), Some(&h.raw)).await;
+    assert_eq!(
+        admin["preferences"]["douban_image_source"],
+        "cmliussss-cdn-tencent"
+    );
+    for invalid in [
+        json!({"douban_image_source":"server"}),
+        json!({"douban_image_source":"custom","douban_image_custom_url":""}),
+        json!({"douban_image_source":"custom","douban_image_custom_url":"javascript:alert(1)"}),
+        json!({"douban_image_source":"custom","douban_image_custom_url":"https://user:pass@images.example/fetch?url="}),
+        json!({"douban_image_source":"cmliussss-cdn-ali","user_id":h.who.user.id}),
+    ] {
+        assert_eq!(
+            request(
+                &h,
+                "PATCH",
+                "/api/me/preferences",
+                invalid,
+                Some(&h.member_raw)
+            )
+            .await
+            .0,
+            400
+        );
+    }
+    assert_eq!(
+        request(&h, "PATCH", "/api/me/preferences", value.clone(), None)
+            .await
+            .0,
+        401
+    );
+    let restart = App::new(h._dir.path().into(), true, String::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(preferences::get(&restart, &h.other.user.id).await.unwrap()).unwrap(),
+        value
+    );
+}
+
+#[tokio::test]
+async fn subscription_usage_is_atomic_admin_only_and_preserved_by_updates() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let path = format!("/api/subscriptions/{}", source.subscription_id);
+    let usage = json!({"mode":"selected","user_ids":[h.other.user.id]});
+    assert_eq!(
+        request(
+            &h,
+            "PATCH",
+            &path,
+            json!({"usage":usage}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        403
+    );
+    for invalid in [
+        json!({"mode":"selected","user_ids":[]}),
+        json!({"mode":"selected","user_ids":["missing"]}),
+        json!({"mode":"all","user_ids":[h.other.user.id]}),
+        json!({"mode":"selected","user_ids":[h.who.user.id]}),
+    ] {
+        assert_eq!(
+            request(&h, "PATCH", &path, json!({"usage":invalid}), Some(&h.raw))
+                .await
+                .0,
+            400
+        );
+    }
+    assert_eq!(
+        catalog::subscription_list(&h.app).await.unwrap()["subscriptions"][0]["usage"]["mode"],
+        "all"
+    );
+    let hits = h.hits.load(Ordering::Relaxed);
+    assert_eq!(
+        request(&h, "PATCH", &path, json!({"usage":usage}), Some(&h.raw))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(h.hits.load(Ordering::Relaxed), hits, "修改用户不能下载配置");
+    assert!(
+        access::source_allowed(&h.app, &h.other.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    let extra = extra_member(&h).await;
+    assert!(
+        !access::source_allowed(&h.app, &extra.id, &source.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        access::source_allowed(&h.app, &h.who.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    let config =
+        json!({"api_site":{"same.key":{"name":"保留授权源","api":source.api}}}).to_string();
+    catalog::import(
+        &h.app,
+        &json!({"id":source.subscription_id,"name":"更新订阅","content":config}),
+    )
+    .await
+    .unwrap();
+    let listing = catalog::subscription_list(&h.app).await.unwrap();
+    assert_eq!(listing["subscriptions"][0]["usage"], usage);
+    sqlx::query("UPDATE subscriptions SET url=? WHERE id=?")
+        .bind(
+            url::Url::parse(&source.api)
+                .unwrap()
+                .join("/config")
+                .unwrap()
+                .to_string(),
+        )
+        .bind(&source.subscription_id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    catalog::refresh(&h.app, &source.subscription_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog::subscription_list(&h.app).await.unwrap()["subscriptions"][0]["usage"],
+        usage
+    );
+    sqlx::query("UPDATE users SET disabled=1 WHERE id=?")
+        .bind(&h.other.user.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    assert!(
+        !access::source_allowed(&h.app, &h.other.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE users SET disabled=0 WHERE id=?")
+        .bind(&h.other.user.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    assert!(
+        access::source_allowed(&h.app, &h.other.user.id, &source.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        request(
+            &h,
+            "PATCH",
+            &path,
+            json!({"usage":{"mode":"all","user_ids":[]}}),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(
+        access::source_allowed(&h.app, &extra.id, &source.id)
+            .await
+            .unwrap(),
+        "所有用户包含后来创建的账号"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM subscriptions")
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap();
+    assert!(catalog::import(&h.app,&json!({"name":"无效分配","content":config,"usage":{"mode":"selected","user_ids":["missing"]}})).await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM subscriptions")
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap(),
+        count
+    );
+}
+
+#[tokio::test]
+async fn revoked_subscription_blocks_web_native_caches_posters_and_media() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let extra = extra_member(&h).await;
+    sqlx::query("UPDATE films SET poster=? WHERE id=?")
+        .bind("https://images.example/private-cover.jpg")
+        .bind(&h.film)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    catalog::favorite(&h.app, &h.other.user.id, &h.film, true)
+        .await
+        .unwrap();
+    let start = playback::start(&h.app, &h.other, &h.episode).await.unwrap();
+    let p = playback::get(&h.app, &text(&start, "id")).await.unwrap();
+    playback::record(&h.app, &p, 42.0, 120.0, None)
+        .await
+        .unwrap();
+    let fallback = playback::fallback(&h.app, &h.other, &p.id, "manual")
+        .await
+        .unwrap();
+    let warmed = catalog::search(&h.app, &h.other.user.id, "原生搜索结果", 1, None)
+        .await
+        .unwrap();
+    assert_eq!(warmed["items"].as_array().unwrap().len(), 1);
+    // 即便旧响应再次进入相同权限集合的缓存，命中时也要重新过滤源。
+    let prior_cache: (String, String) =
+        sqlx::query_as("SELECT key,value FROM cache WHERE key LIKE 'search:%'")
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap();
+    app_seed_recommendation(&h.app, "123", "测试电影").await;
+    h.app
+        .cache_put(
+            "recommendation-meta:v1:123",
+            &json!({"year":"2026","kind":"Movie"}),
+            3600,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !catalog::recommendation_posters(&h.app, &h.other.user.id, "123", "movie")
+            .await
+            .unwrap()["urls"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"selected","user_ids":[extra.id]}),
+    )
+    .await
+    .unwrap();
+    let hits = h.hits.load(Ordering::Relaxed);
+    let (status, sources) =
+        request(&h, "GET", "/api/sources", json!({}), Some(&h.member_raw)).await;
+    assert_eq!(status, 200);
+    assert!(sources["sources"].as_array().unwrap().is_empty());
+    let (_, search) = request(
+        &h,
+        "GET",
+        "/api/search?q=原生搜索结果",
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert!(search["items"].as_array().unwrap().is_empty());
+    assert!(search["sources"].as_array().unwrap().is_empty());
+    assert_eq!(
+        request(
+            &h,
+            "GET",
+            &format!("/api/films/{}?refresh=1", h.film),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        403
+    );
+    for path in [
+        format!("/api/films/{}/posters", h.film),
+        format!("/api/posters/{}", h.film),
+        format!("/tv-poster/{}", h.film),
+        format!("/v/api/v1/sys/img/tv-poster/{}", h.film),
+        format!("/v/api/v1/item/{}", h.film),
+        format!("/v/api/v1/season/list/{}", h.film),
+        format!("/v/api/v1/episode/list/{}", tv_rust::fntv::season(&h.film)),
+        format!("/v/api/v1/stream/list/{}", h.episode),
+        format!("/v/api/v1/media/range/{}", h.episode),
+    ] {
+        assert_eq!(
+            request(&h, "GET", &path, json!({}), Some(&h.member_raw))
+                .await
+                .0,
+            403,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/api/plays",
+            json!({"episode_id":h.episode}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        request(
+            &h,
+            "PUT",
+            &format!("/api/films/{}/favorite", h.film),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        403
+    );
+    for path in [
+        "/v/api/v1/play/info",
+        "/v/api/v1/stream",
+        "/v/api/v1/stream/directLink",
+        "/v/api/v1/play/play",
+        "/v/api/v1/play/record",
+    ] {
+        assert_eq!(
+            request(
+                &h,
+                "POST",
+                path,
+                json!({"media_guid":h.episode,"item_guid":h.film,"ts":55}),
+                Some(&h.member_raw)
+            )
+            .await
+            .0,
+            403,
+            "{path}"
+        );
+    }
+    let (_, native) = request(
+        &h,
+        "GET",
+        "/v/api/v1/search/list?q=原生搜索结果",
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert!(native["data"].as_array().unwrap().is_empty());
+    assert_eq!(
+        catalog::recommendation_posters(&h.app, &h.other.user.id, "123", "movie")
+            .await
+            .unwrap(),
+        json!({"urls":[]})
+    );
+    assert_eq!(
+        request(&h, "GET", &text(&fallback, "url"), json!({}), None)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "未授权请求不能访问上游"
+    );
+    let stale = playback::get(&h.app, &p.id).await.unwrap();
+    assert!(stale.ended);
+    assert_eq!(stale.state, "access_revoked");
+    assert!(
+        playback::record(&h.app, &p, 99.0, 120.0, None)
+            .await
+            .is_err()
+    );
+    playback::end_with_snapshot(&h.app, &p, Some((99.0, 120.0)))
+        .await
+        .unwrap();
+    for kind in ["favorites", "history"] {
+        let personal = catalog::personal(&h.app, &h.other.user.id, kind)
+            .await
+            .unwrap();
+        assert_eq!(personal[0]["available"], false);
+        assert_eq!(personal[0]["authorized"], false);
+        assert_eq!(
+            personal[0]["unavailable_reason"],
+            access::UNAUTHORIZED_SOURCE
+        );
+        assert_eq!(personal[0]["poster"], "");
+        assert_eq!(personal[0]["progress"]["position"], 42.0);
+    }
+    let (_, native_record) = request(
+        &h,
+        "POST",
+        "/v/api/v1/favorite/list",
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(native_record["data"]["list"][0]["can_play"], 0);
+    assert_eq!(native_record["data"]["list"][0]["poster"], "");
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"all","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    h.app
+        .cache_put(
+            &prior_cache.0,
+            &serde_json::from_str(&prior_cache.1).unwrap(),
+            180,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog::search(&h.app, &h.other.user.id, "原生搜索结果", 1, None)
+            .await
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        catalog::personal(&h.app, &h.other.user.id, "history")
+            .await
+            .unwrap()[0]["available"],
+        true
+    );
+    assert!(
+        playback::get(&h.app, &p.id).await.unwrap().ended,
+        "重新授权不恢复旧播放令牌"
+    );
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"selected","user_ids":[extra.id]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        request(
+            &h,
+            "DELETE",
+            &format!("/api/films/{}/favorite", h.film),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        request(
+            &h,
+            "DELETE",
+            &format!("/api/films/{}/history", h.film),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(
+        catalog::personal(&h.app, &h.other.user.id, "history")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn revoking_access_interrupts_a_waiting_stream_without_affecting_admin() {
+    let h = harness().await;
+    let extra = extra_member(&h).await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let e = catalog::episode(&h.app, &h.episode).await.unwrap();
+    sqlx::query("UPDATE episodes SET url=? WHERE id=?")
+        .bind(
+            url::Url::parse(&e.url)
+                .unwrap()
+                .join("/slow")
+                .unwrap()
+                .to_string(),
+        )
+        .bind(&e.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let start = playback::start(&h.app, &h.other, &e.id).await.unwrap();
+    let fb = playback::fallback(&h.app, &h.other, &text(&start, "id"), "manual")
+        .await
+        .unwrap();
+    let url = text(&fb, "url");
+    let parts: Vec<_> = url.split('/').collect();
+    let response = playback::proxy(&h.app, parts[2], parts[3], Method::GET, HeaderMap::new())
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    assert_eq!(
+        body.frame().await.unwrap().unwrap().into_data().unwrap(),
+        bytes::Bytes::from_static(b"first-chunk")
+    );
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"selected","user_ids":[extra.id]}),
+    )
+    .await
+    .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("撤权必须立即中断等待中的媒体读取");
+    assert!(next.is_none() || next.unwrap().is_err());
+    assert!(
+        playback::start(&h.app, &h.who, &e.id).await.is_ok(),
+        "管理员始终可以使用订阅"
+    );
 }
 
 #[tokio::test]
@@ -392,7 +940,7 @@ async fn legacy_removals_are_migrated_once_without_losing_favorites() {
             .fetch_one(&again.db)
             .await
             .unwrap(),
-        2
+        3
     );
 }
 
@@ -407,7 +955,9 @@ async fn search_filters_unrelated_rows_before_ingest_and_ranks_titles_for_both_c
     )
     .await
     .unwrap();
-    let result = catalog::search(&h.app, "你好", 1, None).await.unwrap();
+    let result = catalog::search(&h.app, &h.who.user.id, "你好", 1, None)
+        .await
+        .unwrap();
     let items = result["items"].as_array().unwrap();
     assert_eq!(items.len(), 3);
     assert_eq!(items[0]["title"], "你好");
@@ -418,28 +968,38 @@ async fn search_filters_unrelated_rows_before_ingest_and_ranks_titles_for_both_c
     assert!(catalog::film(&h.app, &noise).await.is_err());
     let hits = h.hits.load(Ordering::Relaxed);
     assert_eq!(
-        catalog::search(&h.app, "你好", 1, None).await.unwrap(),
+        catalog::search(&h.app, &h.who.user.id, "你好", 1, None)
+            .await
+            .unwrap(),
         result
     );
     assert_eq!(h.hits.load(Ordering::Relaxed), hits);
-    let nba = catalog::search(&h.app, "ＮＢＡ", 1, None).await.unwrap();
+    let nba = catalog::search(&h.app, &h.who.user.id, "ＮＢＡ", 1, None)
+        .await
+        .unwrap();
     assert_eq!(nba["items"].as_array().unwrap().len(), 1);
     assert!(text(&nba["items"][0], "title").contains("NBA"));
-    let words = catalog::search(&h.app, "你好 乔安", 1, None).await.unwrap();
+    let words = catalog::search(&h.app, &h.who.user.id, "你好 乔安", 1, None)
+        .await
+        .unwrap();
     assert_eq!(words["items"].as_array().unwrap().len(), 1);
     assert_eq!(words["items"][0]["search_rank"], 2);
-    let empty = catalog::search(&h.app, "完全不相关", 1, None)
+    let empty = catalog::search(&h.app, &h.who.user.id, "完全不相关", 1, None)
         .await
         .unwrap();
     assert!(empty["items"].as_array().unwrap().is_empty());
     assert_eq!(empty["has_more"], true);
     assert_eq!(
-        catalog::search(&h.app, "完全不相关", 500, None)
+        catalog::search(&h.app, &h.who.user.id, "完全不相关", 500, None)
             .await
             .unwrap()["has_more"],
         false
     );
-    assert!(catalog::search(&h.app, "!!!", 1, None).await.is_err());
+    assert!(
+        catalog::search(&h.app, &h.who.user.id, "!!!", 1, None)
+            .await
+            .is_err()
+    );
     let (status, native) = request(
         &h,
         "POST",
@@ -498,7 +1058,9 @@ async fn poster_urls_are_resolved_and_backups_only_use_the_same_known_work() {
     .unwrap();
     assert!(unsafe_url.poster.is_empty());
     let hits = h.hits.load(Ordering::Relaxed);
-    let candidates = catalog::film_posters(&h.app, &primary.id).await.unwrap();
+    let candidates = catalog::film_posters(&h.app, &h.who.user.id, &primary.id)
+        .await
+        .unwrap();
     let urls = candidates["urls"].as_array().unwrap();
     assert_eq!(urls.len(), 2);
     assert!(urls.contains(&json!(primary.poster)));
@@ -551,7 +1113,9 @@ async fn poster_urls_are_resolved_and_backups_only_use_the_same_known_work() {
         .await
         .unwrap();
     assert_eq!(
-        catalog::film_posters(&h.app, &primary.id).await.unwrap(),
+        catalog::film_posters(&h.app, &h.who.user.id, &primary.id)
+            .await
+            .unwrap(),
         json!({"urls":[]})
     );
 }

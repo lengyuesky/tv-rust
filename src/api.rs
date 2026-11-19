@@ -1,4 +1,4 @@
-use crate::{auth, catalog, core::*, net, playback};
+use crate::{access, auth, catalog, core::*, net, playback, preferences};
 use axum::{
     Json,
     body::{Body, to_bytes},
@@ -15,7 +15,11 @@ pub async fn handle(State(app): State<App>, request: Request) -> Response {
         .unwrap_or_else(IntoResponse::into_response)
 }
 fn json_response(value: Value) -> Response {
-    Json(value).into_response()
+    let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
 }
 fn cookie(app: &App, token: &str, remove: bool) -> String {
     format!(
@@ -28,8 +32,9 @@ fn cookie(app: &App, token: &str, remove: bool) -> String {
         }
     )
 }
-pub async fn poster(app: &App, id: &str) -> Result<Response> {
+pub async fn poster(app: &App, user: &str, id: &str) -> Result<Response> {
     let f = catalog::film(app, id).await?;
+    access::require_source(app, user, &f.source_id).await?;
     if f.poster.is_empty() {
         return Err(Error::missing());
     }
@@ -53,6 +58,7 @@ pub async fn poster(app: &App, id: &str) -> Result<Response> {
         return Err(Error::bad("封面格式不受支持"));
     }
     let bytes = net::bytes(r, 5 * 1024 * 1024, false).await?;
+    access::require_source(app, user, &f.source_id).await?;
     Ok(Response::builder()
         .header("content-type", mime)
         .header("cache-control", "private, max-age=3600")
@@ -127,7 +133,12 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
     match (method.as_str(), path.as_str()) {
         ("GET", "/api/me") => {
             return Ok(json_response(
-                json!({"user":who.user,"forbid_proxy":*app.forbid_proxy.borrow(),"public_url":app.public_url,"version":env!("CARGO_PKG_VERSION")}),
+                json!({"preferences":preferences::get(app,&who.user.id).await?,"user":who.user,"forbid_proxy":*app.forbid_proxy.borrow(),"public_url":app.public_url,"version":env!("CARGO_PKG_VERSION")}),
+            ));
+        }
+        ("PATCH", "/api/me/preferences") => {
+            return Ok(json_response(
+                json!({"preferences":preferences::save(app,&who.user.id,&value).await?}),
             ));
         }
         ("POST", "/api/logout") => {
@@ -161,13 +172,14 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         }
         ("GET", "/api/sources") => {
             return Ok(json_response(
-                json!({"sources":catalog::sources(app).await?.into_iter().filter(|s|s.active()).map(|s|json!({"id":s.id,"name":s.name})).collect::<Vec<_>>()}),
+                json!({"sources":access::sources(app,&who.user.id).await?.into_iter().filter(|s|s.active()).map(|s|json!({"id":s.id,"name":s.name})).collect::<Vec<_>>()}),
             ));
         }
         ("GET", "/api/search") => {
             return Ok(json_response(
                 catalog::search(
                     app,
+                    &who.user.id,
                     query.get("q").map(String::as_str).unwrap_or(""),
                     query.get("page").and_then(|v| v.parse().ok()).unwrap_or(1),
                     query
@@ -258,12 +270,15 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         .collect::<Vec<_>>();
     match parts.as_slice() {
         ["films", id, "posters"] if method == Method::GET => {
-            return Ok(json_response(catalog::film_posters(app, id).await?));
+            return Ok(json_response(
+                catalog::film_posters(app, &who.user.id, id).await?,
+            ));
         }
         ["recommendations", id, "posters"] if method == Method::GET => {
             return Ok(json_response(
                 catalog::recommendation_posters(
                     app,
+                    &who.user.id,
                     id,
                     query.get("kind").map(String::as_str).unwrap_or("movie"),
                 )
@@ -294,6 +309,12 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
             who.admin()?;
             catalog::refresh(app, id).await?;
         }
+        ["subscriptions", id] if method == Method::PATCH => {
+            who.admin()?;
+            return Ok(json_response(
+                json!({"usage":access::save_usage(app,id,&value["usage"]).await?}),
+            ));
+        }
         ["subscriptions", id] if method == Method::DELETE => {
             who.admin()?;
             catalog::remove_subscription(app, id).await?;
@@ -310,9 +331,11 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 .await?;
         }
         ["films", id] if method == Method::GET => {
+            let f = catalog::film(app, id).await?;
+            access::require_source(app, &who.user.id, &f.source_id).await?;
             let force = query.get("refresh").is_some_and(|v| v == "1");
             let mut warning = String::new();
-            if let Err(e) = catalog::detail(app, id, force).await {
+            if let Err(e) = catalog::detail(app, &who.user.id, id, force).await {
                 warning = e.1;
             }
             let mut v = catalog::view(app, &who.user.id, id, true).await?;
@@ -325,7 +348,14 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         ["films", id, "favorite"] if matches!(method, Method::PUT | Method::DELETE) => {
             catalog::favorite(app, &who.user.id, id, method == Method::PUT).await?;
         }
-        ["posters", id] if method == Method::GET => return poster(app, id).await,
+        ["films", id, "history"] if method == Method::DELETE => {
+            sqlx::query("DELETE FROM progress WHERE user_id=? AND film_id=?")
+                .bind(&who.user.id)
+                .bind(id)
+                .execute(&app.db)
+                .await?;
+        }
+        ["posters", id] if method == Method::GET => return poster(app, &who.user.id, id).await,
         ["plays", id, "fallback"] if method == Method::POST => {
             return Ok(json_response(
                 playback::fallback(app, &who, id, &text(&value, "reason")).await?,
@@ -347,6 +377,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         }
         ["plays", id, "event"] if method == Method::POST => {
             let p = playback::owned(app, &who, id).await?;
+            catalog::available(app, &who.user.id, &p.episode_id).await?;
             let event = text(&value, "event");
             let msg = match event.as_str() {
                 "playing" => "网页播放器报告开始播放",

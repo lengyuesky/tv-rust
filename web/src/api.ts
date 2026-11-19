@@ -14,6 +14,9 @@ export async function api(
     signal,
   });
   const value = await r.json();
-  if (!r.ok) throw new Error(value.error || `请求失败（${r.status}）`);
+  if (!r.ok)
+    throw Object.assign(new Error(value.error || `请求失败（${r.status}）`), {
+      status: r.status,
+    });
   return value;
 }

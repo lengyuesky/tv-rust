@@ -109,6 +109,7 @@ pub struct Inner {
     pub db: SqlitePool,
     pub data_dir: PathBuf,
     pub forbid_proxy: watch::Sender<bool>,
+    pub access_changes: watch::Sender<u64>,
     pub allow_private: bool,
     pub public_url: String,
     pub probe_slots: Semaphore,
@@ -170,6 +171,16 @@ impl App {
                 .await?;
             tx.commit().await?;
         }
+        if schema < 3 {
+            let mut tx = db.begin().await?;
+            sqlx::raw_sql(include_str!("../migrations/0003.sql"))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("PRAGMA user_version=3")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
         let blocked: String =
             sqlx::query_scalar("SELECT value FROM settings WHERE key='forbid_proxy'")
                 .fetch_one(&db)
@@ -179,6 +190,7 @@ impl App {
             db,
             data_dir: dir,
             forbid_proxy: policy,
+            access_changes: watch::channel(0).0,
             allow_private,
             public_url,
             probe_slots: Semaphore::new(2),

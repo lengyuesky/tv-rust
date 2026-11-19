@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod access;
 pub mod api;
 pub mod auth;
 pub mod catalog;
@@ -7,6 +8,7 @@ pub mod core;
 pub mod fntv;
 pub mod net;
 pub mod playback;
+pub mod preferences;
 pub mod probe;
 
 use axum::{

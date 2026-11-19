@@ -126,6 +126,66 @@ small,
 .wide {
   width: 100%;
 }
+.usage-selector {
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  margin: 22px 0;
+}
+.usage-selector legend {
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.usage-members {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.usage-members label {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  padding: 10px 0;
+}
+.usage-members input {
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.usage-members small {
+  display: block;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.subscription-main .subscription-usage {
+  display: block;
+  margin-top: 8px;
+  color: #a7be91;
+  overflow-wrap: anywhere;
+}
+.card-remove {
+  position: absolute;
+  z-index: 3;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  color: #d5d8df;
+  background: #12171ee8;
+}
+.card-remove:hover {
+  color: #efaaa1;
+}
 .center {
   display: flex;
   justify-content: center;

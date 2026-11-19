@@ -1,4 +1,4 @@
-use crate::{catalog, core::*, net, probe};
+use crate::{access, catalog, core::*, net, probe};
 use axum::{
     body::Body,
     http::{HeaderMap, Method, StatusCode},
@@ -60,6 +60,9 @@ pub async fn latest(app: &App, who: &Identity, episode_id: &str) -> Result<Play>
         .bind(&who.auth_hash).bind(episode_id).bind(now()).fetch_optional(&app.db).await?.ok_or_else(||Error::bad("播放会话已结束，请重新播放"))
 }
 async fn valid(app: &App, p: &Play) -> Result<()> {
+    if p.state == "access_revoked" {
+        return Err(Error::denied(access::UNAUTHORIZED_SOURCE));
+    }
     if p.ended || p.expires_at <= now() {
         return Err(Error::unauthorized());
     }
@@ -68,7 +71,7 @@ async fn valid(app: &App, p: &Play) -> Result<()> {
     if valid != 1 {
         return Err(Error::unauthorized());
     }
-    catalog::available(app, &p.episode_id).await?;
+    catalog::available(app, &p.user_id, &p.episode_id).await?;
     Ok(())
 }
 pub async fn asset(app: &App, p: &Play, url: &str) -> Result<String> {
@@ -136,12 +139,17 @@ async fn register_assets(app: &App, p: &Play, resources: &BTreeMap<String, Strin
     Ok(())
 }
 pub async fn start(app: &App, who: &Identity, episode_id: &str) -> Result<Value> {
-    let (e, f, _) = catalog::available(app, episode_id).await?;
+    let (e, f, _) = catalog::available(app, &who.user.id, episode_id).await?;
     let info = probe::get(app, &e).await?;
     let id = guid(&[&random()]);
     let access = random();
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    if !access::source_allowed_on(&mut tx, &who.user.id, &f.source_id).await? {
+        return Err(Error::denied(access::UNAUTHORIZED_SOURCE));
+    }
     sqlx::query("INSERT INTO plays(id,access_hash,user_id,auth_hash,film_id,episode_id,client,started_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)")
-        .bind(&id).bind(hash(&access)).bind(&who.user.id).bind(&who.auth_hash).bind(&f.id).bind(&e.id).bind(&who.client).bind(now()).bind(now()+6*3600).execute(&app.db).await?;
+        .bind(&id).bind(hash(&access)).bind(&who.user.id).bind(&who.auth_hash).bind(&f.id).bind(&e.id).bind(&who.client).bind(now()).bind(now()+6*3600).execute(&mut *tx).await?;
+    tx.commit().await?;
     let p = get(app, &id).await?;
     let root = asset(app, &p, &e.url).await?;
     event(
@@ -158,6 +166,7 @@ pub async fn start(app: &App, who: &Identity, episode_id: &str) -> Result<Value>
             .fetch_optional(&app.db)
             .await?;
     let position = prior.filter(|v| v.0 == e.id).map(|v| v.1).unwrap_or(0.0);
+    valid(app, &get(app, &id).await?).await?;
     Ok(
         json!({"id":id,"episode_id":e.id,"url":e.url,"mode":"direct","kind":info.kind,"duration":info.duration,
         "position":position,"allow_proxy":!*app.forbid_proxy.borrow(),"proxy_url":format!("/media/{access}/{root}"),"warning":info.warning}),
@@ -183,12 +192,16 @@ pub async fn fallback(app: &App, who: &Identity, id: &str, reason: &str) -> Resu
         _ => return Err(Error::bad("不支持的回退原因")),
     };
     let access = random();
-    sqlx::query("UPDATE plays SET mode='proxy',state='fallback',reason=?,access_hash=? WHERE id=?")
+    let changed = sqlx::query("UPDATE plays SET mode='proxy',state='fallback',reason=?,access_hash=? WHERE id=? AND ended=0")
         .bind(reason)
         .bind(hash(&access))
         .bind(id)
         .execute(&app.db)
         .await?;
+    if changed.rows_affected() == 0 {
+        valid(app, &get(app, id).await?).await?;
+        return Err(Error::bad("播放会话已结束，请重新播放"));
+    }
     let p = get(app, id).await?;
     event(app, &p, "proxy_selected", reason).await?;
     let e = catalog::episode(app, &p.episode_id).await?;
@@ -203,6 +216,8 @@ pub async fn record(
     native_link: Option<&str>,
 ) -> Result<bool> {
     validate_position(position, duration)?;
+    let f = catalog::film(app, &p.film_id).await?;
+    access::require_source(app, &p.user_id, &f.source_id).await?;
     if p.ended || p.expires_at <= now() {
         return Ok(false);
     }
@@ -214,6 +229,9 @@ pub async fn record(
         .await?;
     if current.ended || current.expires_at <= now() {
         return Ok(false);
+    }
+    if !access::source_allowed_on(&mut tx, &p.user_id, &f.source_id).await? {
+        return Err(Error::denied(access::UNAUTHORIZED_SOURCE));
     }
     if let Some(link) = native_link {
         if link.is_empty() || link.len() > 16384 {
@@ -318,7 +336,14 @@ pub async fn end_with_snapshot(app: &App, p: &Play, snapshot: Option<(f64, f64)>
         .bind(current.seq)
         .fetch_one(&mut *tx)
         .await?;
-        if newer == 0 && current.expires_at > now() {
+        let source: String = sqlx::query_scalar("SELECT source_id FROM films WHERE id=?")
+            .bind(&current.film_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if newer == 0
+            && current.expires_at > now()
+            && access::source_allowed_on(&mut tx, &current.user_id, &source).await?
+        {
             save_progress(&mut tx, &current, position, duration).await?;
         }
     }
@@ -384,8 +409,10 @@ pub async fn logs(app: &App, who: &Identity, before: i64) -> Result<Value> {
         .bind(&p.id)
         .fetch_all(&app.db)
         .await?;
+        let authorized = access::source_allowed(app, &who.user.id, &s.id).await?;
         items.push(json!({"seq":p.seq,"id":p.id,"username":username,"client":p.client,"film_id":f.id,"title":f.title,"episode":e.title,"source":s.name,"mode":p.mode,"state":p.state,
             "started_at":p.started_at,"reason":p.reason,"position":p.position,"reports":p.reports,"ended":p.ended,"mine":p.user_id==who.user.id,
+            "authorized":authorized,"unavailable_reason":if authorized {""} else {access::UNAUTHORIZED_SOURCE},
             "events":events.into_iter().map(|(at,mode,event,message)|json!({"at":at,"mode":mode,"event":event,"message":message})).collect::<Vec<_>>()}));
     }
     Ok(json!({"items":items,"forbid_proxy":*app.forbid_proxy.borrow()}))
@@ -472,6 +499,7 @@ pub async fn proxy_play(
         upstream_request.remove("if-range");
     }
     let response = net::request(app, method.clone(), &url, &upstream_request).await?;
+    valid(app, &get(app, &p.id).await?).await?;
     let status = response.status();
     let upstream_headers = response.headers().clone();
     let final_url = response.url().to_string();
@@ -514,8 +542,9 @@ pub async fn proxy_play(
         None => bytes::Bytes::new(),
     };
     proxy_allowed(app, p).await?;
+    valid(app, &get(app, &p.id).await?).await?;
     if p.state != "transferring" && p.state != "progress" {
-        sqlx::query("UPDATE plays SET state='transferring' WHERE id=? AND state NOT IN ('progress','ended')").bind(&p.id).execute(&app.db).await?;
+        sqlx::query("UPDATE plays SET state='transferring' WHERE id=? AND ended=0 AND state NOT IN ('progress','ended')").bind(&p.id).execute(&app.db).await?;
         event(
             app,
             p,
@@ -534,6 +563,7 @@ pub async fn proxy_play(
             bytes.extend(chunk);
         }
         proxy_allowed(app, p).await?;
+        valid(app, &get(app, &p.id).await?).await?;
         let owned_access;
         let access = if let Some(access) = access {
             access
@@ -548,6 +578,7 @@ pub async fn proxy_play(
         };
         let source = std::str::from_utf8(&bytes).map_err(|_| Error::bad("HLS 清单编码无效"))?;
         let body = rewrite(app, p, access, &final_url, source).await?;
+        valid(app, &get(app, &p.id).await?).await?;
         tracing::info!(play=%p.id, upstream_status=status.as_u16(), requested_range=headers.contains_key("range"), bytes=body.len(), "已交付完整重写 HLS 清单");
         return Ok(builder
             .status(StatusCode::OK)
@@ -570,9 +601,12 @@ pub async fn proxy_play(
     let app = app.clone();
     let p = p.clone();
     let mut policy = app.forbid_proxy.subscribe();
+    let mut access_updates = app.access_changes.subscribe();
     let body = async_stream::try_stream! {
         let blocked=*policy.borrow_and_update();
         if blocked{Err::<(),std::io::Error>(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"禁止转发已开启"))?;}
+        let current=get(&app,&p.id).await.map_err(|_|std::io::Error::other("播放会话失效"))?;
+        valid(&app,&current).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::PermissionDenied,"播放授权已失效"))?;
         yield first;
         let mut checked=std::time::Instant::now();
         loop {
@@ -580,6 +614,14 @@ pub async fn proxy_play(
                 biased;
                 _=policy.changed()=>{
                     if *policy.borrow_and_update(){Some(Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"禁止转发已开启")))}else{continue}
+                },
+                _=access_updates.changed()=>{
+                    access_updates.borrow_and_update();
+                    let check = async {
+                        let current=get(&app,&p.id).await.map_err(|_|std::io::Error::other("播放会话失效"))?;
+                        valid(&app,&current).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::PermissionDenied,"播放授权已失效"))
+                    }.await;
+                    if let Err(error)=check {Some(Err(error))} else {continue}
                 },
                 next=stream.next()=>next.map(|r|r.map_err(|_|std::io::Error::other("上游媒体读取中断"))),
             };
