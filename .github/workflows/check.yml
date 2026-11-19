@@ -121,15 +121,15 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           build-contexts: web-output=./web/dist
-          load: true
-          tags: tv-rust-ci:${{ matrix.arch }}
           labels: |
             org.opencontainers.image.title=TV Rust
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
           provenance: false
-          outputs: ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
+          outputs: |
+            type=docker,name=tv-rust-ci:${{ matrix.arch }}
+            ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
           cache-from: type=gha,scope=tv-rust-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=tv-rust-${{ matrix.arch }},ignore-error=true,timeout=3m
       - name: 验证镜像架构、空启动与网页
