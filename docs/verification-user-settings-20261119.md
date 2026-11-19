@@ -27,4 +27,6 @@
 
 ## 发布验证
 
-提交到 main 后记录 GitHub Actions 双架构构建、启动检查和 GHCR 发布结果。
+[GitHub Actions 工作流](https://github.com/lengyuesky/tv-rust/actions/runs/44549051628) 已成功，代码提交为 `0cebc829ac0421ddadc60052b6baa49758d8fac7`。检查与网页构建 45 秒，AMD64 原生构建及启动检查 2 分 24 秒，ARM64 1 分 35 秒，合并发布 20 秒；两种架构并行，整条工作流实测 **3 分 35 秒**，使用既有依赖与镜像分层缓存。
+
+已从 GHCR 独立核验 `ghcr.io/lengyuesky/tv-rust:latest` 与 `sha-0cebc829ac0421ddadc60052b6baa49758d8fac7` 指向相同索引，包含且仅包含 `linux/amd64`、`linux/arm64`，两个架构的镜像修订标签均匹配本次代码提交。索引摘要为 `sha256:c66462927bd777b17ed4bd0a9ad69b938140e40ce3d1896f96536227203dec56`。
