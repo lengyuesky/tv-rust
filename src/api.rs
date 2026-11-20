@@ -269,6 +269,23 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         .split('/')
         .collect::<Vec<_>>();
     match parts.as_slice() {
+        ["films", id, "source-quality"] if method == Method::GET => {
+            return Ok(json_response(
+                catalog::source_quality(
+                    app,
+                    &who.user.id,
+                    id,
+                    query.get("switch_from").map(String::as_str).unwrap_or(""),
+                    query
+                        .get("switch_episode")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    query.get("refresh").is_some_and(|value| value == "1"),
+                    query.get("selected").is_some_and(|value| value == "1"),
+                )
+                .await?,
+            ));
+        }
         ["films", id, "sources"] if method == Method::GET => {
             let refresh = query.get("refresh").is_some_and(|value| value == "1");
             return Ok(json_response(

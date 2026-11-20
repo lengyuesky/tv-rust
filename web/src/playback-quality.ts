@@ -9,6 +9,17 @@ export type VideoQuality = {
 const positive = (n: unknown, max = Number.MAX_SAFE_INTEGER) =>
   typeof n === "number" && Number.isFinite(n) && n > 0 && n <= max ? n : 0;
 
+export function compareQuality(a: VideoQuality = {}, b: VideoQuality = {}) {
+  const size = (quality: VideoQuality) => {
+    const width = positive(quality.width, 32768),
+      height = positive(quality.height, 32768);
+    return width && height ? [height, width] : [0, 0];
+  };
+  const left = size(a),
+    right = size(b);
+  return right[0] - left[0] || right[1] - left[1];
+}
+
 export function currentQuality(
   probed: VideoQuality = {},
   rendered?: VideoQuality,

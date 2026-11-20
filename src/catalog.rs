@@ -1,4 +1,4 @@
-use crate::{access, core::*, net};
+use crate::{access, core::*, net, probe};
 use axum::http::{HeaderMap, Method};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -278,6 +278,90 @@ pub async fn playback_sources(
         .cloned()
         .collect();
     Ok(json!({"items":items,"sources":sources}))
+}
+
+pub async fn source_quality(
+    app: &App,
+    user: &str,
+    target_id: &str,
+    from_id: &str,
+    episode_id: &str,
+    refresh: bool,
+    selected: bool,
+) -> Result<Value> {
+    let (_, from, _) = available(app, user, episode_id).await?;
+    if from.id != from_id {
+        return Err(Error::bad("画质参考单集不属于当前影片"));
+    }
+    let target = film(app, target_id).await?;
+    access::require_source(app, user, &target.source_id).await?;
+    if target.id != from.id
+        && (!known_year(from.year.trim()) || group_key(&from) != group_key(&target))
+    {
+        return Err(Error::bad("只能比较同一作品的来源画质"));
+    }
+    if target.id != from.id || refresh {
+        detail(app, user, target_id, refresh).await?;
+    }
+    let mut choices = Vec::new();
+    if target.id == from.id {
+        choices.push(available(app, user, episode_id).await?.0);
+    } else {
+        let lines: BTreeMap<_, _> = episodes(app, target_id)
+            .await?
+            .into_iter()
+            .map(|episode| (episode.line_order, episode.line_name))
+            .collect();
+        for line in lines.into_values() {
+            let hint =
+                switch_episode_hint(app, user, target_id, from_id, episode_id, Some(&line), 0.0)
+                    .await?;
+            if hint["matched"] == true {
+                choices.push(available(app, user, &text(&hint, "episode_id")).await?.0);
+            }
+        }
+    }
+    let mut measured = Vec::new();
+    for e in choices {
+        let quality = match probe::source_quality(app, user, &e, refresh, selected).await {
+            Ok(info) => probe::quality(&info),
+            Err(error)
+                if matches!(
+                    error.0,
+                    axum::http::StatusCode::UNAUTHORIZED | axum::http::StatusCode::FORBIDDEN
+                ) =>
+            {
+                return Err(error);
+            }
+            Err(_) => json!({}),
+        };
+        let fresh = available(app, user, &e.id).await?.0;
+        if fresh.url != e.url {
+            return Err(Error::bad("播放地址已更新，请重新识别画质"));
+        }
+        measured.push(json!({"episode_id":e.id,"episode_title":e.title,"line_name":e.line_name,"quality":quality}));
+    }
+    available(app, user, episode_id).await?;
+    access::require_source(app, user, &target.source_id).await?;
+    let rank = |item: &Value| {
+        let q = &item["quality"];
+        let width = q["width"].as_f64().unwrap_or(0.0) as u64;
+        let height = q["height"].as_f64().unwrap_or(0.0) as u64;
+        if width == 0 || height == 0 {
+            (0, 0)
+        } else {
+            (height, width)
+        }
+    };
+    measured.sort_by_key(|item| std::cmp::Reverse(rank(item)));
+    let best = measured.first();
+    Ok(json!({"id":target_id,"reference_episode_id":episode_id,
+        "status":if best.is_none() {"episode_required"} else if best.is_some_and(|item|rank(item)>(0,0)) {"measured"} else {"unknown"},
+        "quality":best.map(|item|item["quality"].clone()).unwrap_or(json!({})),
+        "episode_id":best.map(|item|text(item,"episode_id")).unwrap_or_default(),
+        "episode_title":best.map(|item|text(item,"episode_title")).unwrap_or_default(),
+        "line_name":best.map(|item|text(item,"line_name")).unwrap_or_default(),
+        "lines":measured}))
 }
 #[derive(Deserialize)]
 struct Config {

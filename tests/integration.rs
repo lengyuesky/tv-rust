@@ -73,6 +73,10 @@ async fn harness() -> Harness {
                 {"vod_id":403,"vod_name":"测试电影","vod_year":"2026","vod_remarks":"导演剪辑"},
                 {"vod_id":404,"vod_name":"测试电影外传","vod_year":"2026"}
             ],"pagecount":1})).into_response(),
+            "/quality-api"=>{
+                let host=req.headers().get("host").unwrap().to_str().unwrap();
+                axum::Json(json!({"list":[{"vod_id":1,"vod_name":"测试电影","vod_year":"2026","vod_play_from":"line","vod_play_url":format!("正片$http://{host}/encrypted.m3u8")}]})).into_response()
+            },
             _=>{
                 if req.headers().get("range").is_some(){Response::builder().status(206).header("content-range","bytes 2-5/8").header("accept-ranges","bytes").body(Body::from("2345")).unwrap()}
                 else{Response::builder().header("content-type","video/mp4").body(Body::from("01234567")).unwrap()}
@@ -1703,6 +1707,330 @@ async fn playback_reports_measured_quality_without_fabricating_unknown_streams()
     assert_eq!(measured["source_name"], "测试源");
     assert_eq!(measured["line_name"], "line");
     assert_eq!(measured["episode_title"], "正片");
+}
+
+#[tokio::test]
+async fn source_quality_uses_the_matching_episode_and_selects_its_measured_best_line() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let original = catalog::ingest(&h.app, &source, &json!({"vod_id":801,"vod_name":"画质对照剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"原线路","vod_play_url":"第01集$https://example.com/1.mp4#第03集$https://example.com/3.mp4"}), true).await.unwrap().unwrap();
+    let target = catalog::ingest(&h.app, &source, &json!({"vod_id":802,"vod_name":"画质对照剧集","vod_year":"2026","type_name":"电视剧","vod_remarks":"4K蓝光","vod_play_from":"liangzi$$$lzm3u8","vod_play_url":"第一集$https://example.com/first.mp4#第三集$https://example.com/low.mp4$$$第一集$https://example.com/first-high.mp4#第三集$https://example.com/high.mp4"}), true).await.unwrap().unwrap();
+    let current = catalog::episodes(&h.app, &original.id)
+        .await
+        .unwrap()
+        .remove(1);
+    let episodes = catalog::episodes(&h.app, &target.id).await.unwrap();
+    let cache = |width, height| {
+        json!({"kind":"mp4","duration":120,"size":8,"warning":"","streams":[{"codec_type":"video","codec_name":"h264","width":width,"height":height,"avg_frame_rate":"24/1"}]}).to_string()
+    };
+    for e in &episodes {
+        let (width, height) = if e.title == "第一集" {
+            (3840, 2160)
+        } else if e.line_name == "lzm3u8" {
+            (1280, 720)
+        } else {
+            (640, 360)
+        };
+        sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+            .bind(cache(width, height))
+            .bind(now())
+            .bind(&e.id)
+            .execute(&h.app.db)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(cache(640, 360))
+        .bind(now())
+        .bind(&current.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let path = format!(
+        "/api/films/{}/source-quality?switch_from={}&switch_episode={}",
+        target.id, original.id, current.id
+    );
+    let hits = h.hits.load(Ordering::Relaxed);
+    let (status, result) = request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(status, 200);
+    assert_eq!(result["status"], "measured");
+    assert_eq!(
+        result["quality"]["height"].as_f64(),
+        Some(720.0),
+        "不能把第一集 4K 或上游蓝光标签作为第三集的画质"
+    );
+    assert_eq!(result["episode_title"], "第三集");
+    assert_eq!(result["line_name"], "lzm3u8");
+    assert_eq!(result["lines"].as_array().unwrap().len(), 2);
+    assert!(
+        !result.to_string().contains("https://"),
+        "画质接口只返回测量结果，不交付媒体地址"
+    );
+    request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "有效探测缓存不重复请求媒体"
+    );
+    let (_, own) = request(
+        &h,
+        "GET",
+        &format!(
+            "/api/films/{}/source-quality?switch_from={}&switch_episode={}",
+            original.id, original.id, current.id
+        ),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(own["quality"]["height"].as_f64(), Some(360.0));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM plays")
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM progress")
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap(),
+        0
+    );
+    let unknown =
+        json!({"kind":"video","duration":0,"size":0,"warning":"","streams":[]}).to_string();
+    for e in episodes {
+        sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+            .bind(&unknown)
+            .bind(now())
+            .bind(&e.id)
+            .execute(&h.app.db)
+            .await
+            .unwrap();
+    }
+    let (_, result) = request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(result["status"], "unknown");
+    assert_eq!(result["quality"]["height"].as_f64(), Some(0.0));
+}
+
+#[tokio::test]
+async fn source_quality_rejects_unrelated_or_ambiguous_episodes_before_media_requests() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let original = catalog::ingest(&h.app, &source, &json!({"vod_id":811,"vod_name":"画质校验剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"原线路","vod_play_url":"第03集$https://example.com/3.mp4"}), true).await.unwrap().unwrap();
+    let episode = catalog::episodes(&h.app, &original.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let ambiguous = catalog::ingest(&h.app, &source, &json!({"vod_id":812,"vod_name":"画质校验剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"重复集号$$$合集","vod_play_url":"第03集$https://example.com/a.mp4#第003集$https://example.com/b.mp4$$$第01-03集$https://example.com/c.mp4"}), true).await.unwrap().unwrap();
+    let wrong_year = catalog::ingest(&h.app, &source, &json!({"vod_id":813,"vod_name":"画质校验剧集","vod_year":"2025","type_name":"电视剧","vod_play_from":"原线路","vod_play_url":"第03集$https://example.com/3.mp4"}), true).await.unwrap().unwrap();
+    let path = |target: &str, ep: &str| {
+        format!(
+            "/api/films/{target}/source-quality?switch_from={}&switch_episode={ep}",
+            original.id
+        )
+    };
+    let hits = h.hits.load(Ordering::Relaxed);
+    let (status, result) = request(
+        &h,
+        "GET",
+        &path(&ambiguous.id, &episode.id),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(result["status"], "episode_required");
+    assert!(result["lines"].as_array().unwrap().is_empty());
+    assert_eq!(
+        request(
+            &h,
+            "GET",
+            &path(&wrong_year.id, &episode.id),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        request(
+            &h,
+            "GET",
+            &path(&ambiguous.id, &h.episode),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        request(
+            &h,
+            "GET",
+            &path(&ambiguous.id, &episode.id),
+            json!({}),
+            None
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(h.hits.load(Ordering::Relaxed), hits);
+}
+
+#[tokio::test]
+async fn source_quality_refreshes_updated_media_instead_of_reusing_old_dimensions() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let api = url::Url::parse(&source.api)
+        .unwrap()
+        .join("/quality-api")
+        .unwrap();
+    sqlx::query("UPDATE sources SET api=? WHERE id=?")
+        .bind(api.as_str())
+        .bind(&source.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(json!({"kind":"mp4","duration":120,"size":8,"warning":"","streams":[{"codec_type":"video","width":1920,"height":1080}]}).to_string())
+        .bind(now()).bind(&h.episode).execute(&h.app.db).await.unwrap();
+    let path = format!(
+        "/api/films/{}/source-quality?switch_from={}&switch_episode={}",
+        h.film, h.film, h.episode
+    );
+    let hits = h.hits.load(Ordering::Relaxed);
+    let (_, cached) = request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(cached["quality"]["width"].as_f64(), Some(1920.0));
+    assert_eq!(h.hits.load(Ordering::Relaxed), hits);
+    let (status, fresh) = request(
+        &h,
+        "GET",
+        &format!("{path}&refresh=1"),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(fresh["status"], "measured");
+    assert_eq!(
+        fresh["quality"]["width"].as_f64(),
+        Some(64.0),
+        "重新获取当前来源的更新地址并实际探测加密 HLS"
+    );
+    assert_eq!(fresh["quality"]["codec"], "h264");
+    assert!(h.hits.load(Ordering::Relaxed) > hits);
+    assert!(
+        catalog::episode(&h.app, &h.episode)
+            .await
+            .unwrap()
+            .url
+            .ends_with("/encrypted.m3u8")
+    );
+    let hits = h.hits.load(Ordering::Relaxed);
+    let (_, cached) = request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(cached["quality"], fresh["quality"]);
+    assert_eq!(h.hits.load(Ordering::Relaxed), hits);
+    sqlx::query("UPDATE episodes SET probe='{}',probed_at=0 WHERE id=?")
+        .bind(&h.episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let background_slot = h.app.source_quality_slots.acquire().await.unwrap();
+    let (status, selected) = tokio::time::timeout(
+        Duration::from_secs(3),
+        request(
+            &h,
+            "GET",
+            &format!("{path}&selected=1"),
+            json!({}),
+            Some(&h.member_raw),
+        ),
+    )
+    .await
+    .expect("用户点击的来源确认不应排在后台探测之后");
+    assert_eq!(status, 200);
+    assert_eq!(selected["quality"], fresh["quality"]);
+    drop(background_slot);
+}
+
+#[tokio::test]
+async fn background_source_quality_leaves_playback_capacity_and_rechecks_revoked_access() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let subscription = catalog::import(&h.app,&json!({"name":"画质授权订阅","content":json!({"api_site":{"quality":{"name":"画质源","api":source.api}}}).to_string()})).await.unwrap();
+    let target_source = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.subscription_id == subscription)
+        .unwrap();
+    let media = url::Url::parse(&source.api)
+        .unwrap()
+        .join("/slow")
+        .unwrap()
+        .to_string();
+    let target = catalog::ingest(&h.app,&target_source,&json!({"vod_id":821,"vod_name":"测试电影","vod_year":"2026","vod_play_from":"线路","vod_play_url":format!("正片${media}")}),true).await.unwrap().unwrap();
+    let background_slot = h.app.source_quality_slots.acquire().await.unwrap();
+    let task_app = h.app.clone();
+    let member = h.other.user.id.clone();
+    let target_id = target.id.clone();
+    let from = h.film.clone();
+    let reference = h.episode.clone();
+    let background = tokio::spawn(async move {
+        catalog::source_quality(
+            &task_app, &member, &target_id, &from, &reference, false, false,
+        )
+        .await
+    });
+    let started = tokio::time::timeout(
+        Duration::from_secs(3),
+        playback::start(&h.app, &h.who, &h.episode),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!background.is_finished(), "后台排队不阻塞真实播放的探测");
+    assert!(!text(&started, "id").is_empty());
+    let hits = h.hits.load(Ordering::Relaxed);
+    access::save_usage(
+        &h.app,
+        &subscription,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    drop(background_slot);
+    let error = tokio::time::timeout(Duration::from_secs(3), background)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "排队期间撤权的来源不得发出媒体请求"
+    );
+    assert_eq!(
+        request(
+            &h,
+            "GET",
+            &format!(
+                "/api/films/{}/source-quality?switch_from={}&switch_episode={}",
+                target.id, h.film, h.episode
+            ),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        403
+    );
 }
 
 #[tokio::test]

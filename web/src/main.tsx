@@ -3,6 +3,7 @@ import React, {
   useEffect,
   useRef,
   useCallback,
+  useMemo,
   useImperativeHandle,
   forwardRef,
 } from "react";
@@ -46,6 +47,7 @@ import {
 } from "./image-source";
 import { PreferencesContext } from "./preferences";
 import {
+  compareQuality,
   currentQuality,
   qualityLabel,
   type VideoQuality,
@@ -56,6 +58,8 @@ const time = (s: number) =>
   `${Math.floor((s || 0) / 60)}:${String(Math.floor((s || 0) % 60)).padStart(2, "0")}`;
 const date = (s: number) =>
   new Date(s * 1000).toLocaleString("zh-CN", { hour12: false });
+const lineLabel = (name: string, index: number) =>
+  /\p{Script=Han}/u.test(name) ? name : `线路 ${index + 1}`;
 let finishActivePlayback: (() => Promise<void>) | null = null;
 const go = (path: string) => {
   void Promise.resolve(finishActivePlayback?.())
@@ -706,9 +710,10 @@ type PlayerProps = {
   session: PlayerState;
   onClose: () => void;
   onNext?: () => void;
+  onQuality?: (id: string, quality: VideoQuality) => void;
 };
 const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
-  { session, onClose, onNext },
+  { session, onClose, onNext, onQuality },
   ref,
 ) {
   const video = useRef<HTMLVideoElement>(null),
@@ -964,7 +969,14 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     void finish()
       .then(() => onNext?.())
       .catch(() => {});
-  const quality = currentQuality(state.quality, renderedQuality, levelQuality);
+  const quality = useMemo(
+    () => currentQuality(state.quality, renderedQuality, levelQuality),
+    [state.quality, renderedQuality, levelQuality],
+  );
+  useEffect(
+    () => onQuality?.(session.id, quality),
+    [session.id, quality, onQuality],
+  );
   const label = qualityLabel(quality);
   return (
     <div className="player-shell">
@@ -1060,18 +1072,30 @@ function PlaybackSources({
   session,
   line,
   busy,
+  episodeId,
+  liveQuality,
   onSelect,
 }: {
   film: Obj;
   session: PlayerState | null;
   line: string;
   busy: boolean;
+  episodeId: string;
+  liveQuality?: VideoQuality;
   onSelect: (id: string, line?: string) => void;
 }) {
   const [items, setItems] = useState<Obj[]>([]),
     [status, setStatus] = useState<Obj[]>([]),
     [loading, setLoading] = useState(false),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [qualityRevision, setQualityRevision] = useState(0),
+    [qualityResults, setQualityResults] = useState<{
+      context: string;
+      items: Record<string, Obj>;
+    }>({ context: "", items: {} }),
+    [qualityLoading, setQualityLoading] = useState(false);
+  const qualityStore = useRef(qualityResults);
+  const manualQualityRefresh = useRef("");
   const controller = useRef<AbortController | null>(null);
   const sequence = useRef(0);
   const load = useCallback(
@@ -1114,10 +1138,122 @@ function PlaybackSources({
       controller.current?.abort();
     };
   }, [load]);
+  const candidates = useMemo(
+    () =>
+      [film, ...items.filter((item) => item.id !== film.id)].map<{
+        id: string;
+        source_name: string;
+      }>((item) => ({ id: item.id, source_name: item.source_name })),
+    [film, items],
+  );
+  const candidateIds = candidates
+    .map((item) => item.id)
+    .sort()
+    .join(",");
+  const qualityContext = `${film.id}:${episodeId}`;
+  useEffect(() => {
+    const abort = new AbortController();
+    if (qualityStore.current.context !== qualityContext) {
+      manualQualityRefresh.current = "";
+      qualityStore.current = { context: qualityContext, items: {} };
+      setQualityResults(qualityStore.current);
+    }
+    if (!episodeId) {
+      setQualityLoading(false);
+      return () => abort.abort();
+    }
+    const ids = candidateIds
+      .split(",")
+      .filter(
+        (id) => qualityStore.current.items[id]?.revision !== qualityRevision,
+      );
+    let next = 0;
+    const refresh = manualQualityRefresh.current === qualityContext;
+    setQualityLoading(ids.length > 0);
+    const worker = async () => {
+      while (!abort.signal.aborted && next < ids.length) {
+        const id = ids[next++];
+        try {
+          const query = new URLSearchParams({
+            switch_from: film.id,
+            switch_episode: episodeId,
+          });
+          if (refresh) query.set("refresh", "1");
+          const result = await api(
+            `/films/${id}/source-quality?${query}`,
+            "GET",
+            undefined,
+            false,
+            abort.signal,
+          );
+          if (
+            abort.signal.aborted ||
+            qualityStore.current.context !== qualityContext
+          )
+            return;
+          qualityStore.current = {
+            context: qualityContext,
+            items: {
+              ...qualityStore.current.items,
+              [id]: { ...result, revision: qualityRevision },
+            },
+          };
+          setQualityResults(qualityStore.current);
+        } catch (error) {
+          if (abort.signal.aborted) return;
+          if ((error as Obj).status === 403 || (error as Obj).status === 404) {
+            setItems((old) => old.filter((item) => item.id !== id));
+          }
+          if (qualityStore.current.context === qualityContext) {
+            qualityStore.current = {
+              context: qualityContext,
+              items: {
+                ...qualityStore.current.items,
+                [id]: {
+                  quality: {},
+                  status: "unknown",
+                  revision: qualityRevision,
+                },
+              },
+            };
+            setQualityResults(qualityStore.current);
+          }
+        }
+      }
+    };
+    // 逐个返回结果，慢源不会挡住已有来源；媒体探测另受服务端全局限制。
+    void Promise.all(
+      Array.from({ length: Math.min(4, ids.length) }, worker),
+    ).then(() => {
+      if (!abort.signal.aborted) setQualityLoading(false);
+    });
+    return () => abort.abort();
+  }, [film.id, episodeId, candidateIds, qualityContext, qualityRevision]);
   const lines = [
     ...new Set<string>(film.episodes.map((episode: Obj) => episode.line_name)),
   ];
-  const alternatives = items.filter((item) => item.id !== film.id);
+  const results =
+    qualityResults.context === qualityContext ? qualityResults.items : {};
+  const displayed = candidates
+    .map((item) => ({
+      ...item,
+      measured: results[item.id],
+      quality:
+        item.id === film.id &&
+        session &&
+        liveQuality?.width &&
+        liveQuality?.height
+          ? liveQuality
+          : results[item.id]?.quality ||
+            (item.id === film.id ? session?.quality : undefined) ||
+            {},
+    }))
+    .sort(
+      (a, b) =>
+        compareQuality(a.quality, b.quality) ||
+        a.source_name.localeCompare(b.source_name, "zh-CN") ||
+        a.id.localeCompare(b.id),
+    );
   return (
     <section className="playback-sources" aria-label="播放源">
       <div className="playback-source-top">
@@ -1134,9 +1270,9 @@ function PlaybackSources({
               value={session?.line_name || line}
               onChange={(event) => onSelect(film.id, event.target.value)}
             >
-              {lines.map((name) => (
+              {lines.map((name, index) => (
                 <option key={name} value={name}>
-                  {name}
+                  {lineLabel(name, index)}
                 </option>
               ))}
             </select>
@@ -1145,7 +1281,11 @@ function PlaybackSources({
         <button
           className="ghost"
           disabled={loading || busy}
-          onClick={() => void load(true, true)}
+          onClick={() => {
+            manualQualityRefresh.current = qualityContext;
+            setQualityRevision((old) => old + 1);
+            void load(true, true);
+          }}
         >
           <RefreshCw className={loading ? "spin" : ""} size={15} />
           刷新来源
@@ -1156,17 +1296,36 @@ function PlaybackSources({
         role="group"
         aria-label="可切换播放源"
       >
-        <button className="active" disabled aria-current="true">
-          <Check size={14} />
-          {film.source_name}
-        </button>
-        {alternatives.map((item) => (
+        {displayed.map((item) => (
           <button
             key={item.id}
-            disabled={busy}
-            onClick={() => onSelect(item.id)}
+            className={item.id === film.id ? "active" : ""}
+            disabled={busy || item.id === film.id}
+            aria-current={item.id === film.id ? "true" : undefined}
+            aria-label={item.source_name}
+            aria-describedby={`source-quality-${item.id}`}
+            title={qualityLabel(item.quality)}
+            onClick={() =>
+              onSelect(
+                item.id,
+                item.measured?.status === "measured"
+                  ? item.measured.line_name
+                  : undefined,
+              )
+            }
           >
-            {item.source_name}
+            <strong>
+              {item.id === film.id && <Check size={14} />}
+              {item.source_name}
+            </strong>
+            <small id={`source-quality-${item.id}`}>
+              {item.measured?.status === "episode_required"
+                ? "需选集 · 画质待识别"
+                : qualityLabel(item.quality)
+                    .split(" · ")
+                    .slice(0, 2)
+                    .join(" · ")}
+            </small>
           </button>
         ))}
       </div>
@@ -1176,7 +1335,12 @@ function PlaybackSources({
           正在查找其他可用源…
         </p>
       )}
-      {!loading && !alternatives.length && (
+      {qualityLoading && (
+        <p className="small muted" role="status">
+          正在识别来源画质，按分辨率从高到低排列…
+        </p>
+      )}
+      {!loading && displayed.length <= 1 && (
         <p className="small muted">
           暂未找到标题、年份和版本一致的其他来源，可刷新或在搜索页查找。
         </p>
@@ -1207,6 +1371,14 @@ function FilmPage({
   playEpisode: string;
 }) {
   const player = useRef<PlayerHandle>(null);
+  const [liveQuality, setLiveQuality] = useState<{
+    id: string;
+    quality: VideoQuality;
+  } | null>(null);
+  const updateQuality = useCallback(
+    (id: string, quality: VideoQuality) => setLiveQuality({ id, quality }),
+    [],
+  );
   const operation = useRef(false),
     pageActive = useRef(true);
   const [film, setFilm] = useState<Obj | null>(null),
@@ -1330,22 +1502,19 @@ function FilmPage({
     }
   };
   if (!film) return error ? <Notice kind="error">{error}</Notice> : <Busy />;
-  const lines = [
-    ...new Set<string>(film.episodes.map((e: Obj) => e.line_name)),
-  ];
   const episodes: Obj[] = film.episodes.filter(
     (e: Obj) => e.line_name === line,
   );
   const index = episodes.findIndex((e) => e.id === playingId);
   const hint = film.switch_hint;
   const current = hint
-    ? film.episodes.find((e: Obj) => e.id === hint.episode_id)
+    ? episodes.find((e: Obj) => e.id === hint.episode_id)
     : episodes.find((e: Obj) => e.id === playingId) ||
-      film.episodes.find((e: Obj) => e.id === film.progress?.episode_id) ||
+      episodes.find((e: Obj) => e.id === film.progress?.episode_id) ||
       episodes[0];
   const sourceRoute = (target: string, chosenEpisode = "", targetLine = "") => {
     const query = new URLSearchParams({ switch_from: id });
-    const originalEpisode = playingId || current?.id;
+    const originalEpisode = session ? playingId : current?.id;
     if (originalEpisode) query.set("switch_episode", originalEpisode);
     if (targetLine) query.set("switch_line", targetLine);
     if (session) query.set("autoplay", "1");
@@ -1363,6 +1532,16 @@ function FilmPage({
     setBusy(true);
     setError("");
     try {
+      if (target !== id && !targetLine && playingId) {
+        const query = new URLSearchParams({
+          switch_from: id,
+          switch_episode: playingId,
+          selected: "1",
+        });
+        const measured = await api(`/films/${target}/source-quality?${query}`);
+        if (!pageActive.current) return;
+        if (measured.status === "measured") targetLine = measured.line_name;
+      }
       const route = sourceRoute(target, "", targetLine);
       const prepared = await api(`/films/${route.slice(6)}`);
       if (!pageActive.current) return;
@@ -1423,6 +1602,7 @@ function FilmPage({
           ref={player}
           key={session.id}
           session={session}
+          onQuality={updateQuality}
           onClose={() => {
             setSession(null);
             void refreshProgress();
@@ -1439,6 +1619,10 @@ function FilmPage({
         session={session}
         line={line}
         busy={busy}
+        episodeId={(session ? playingId : current?.id) || ""}
+        liveQuality={
+          liveQuality?.id === session?.id ? liveQuality?.quality : undefined
+        }
         onSelect={(target, targetLine) => void selectSource(target, targetLine)}
       />
       <div className="film-detail">
@@ -1474,7 +1658,7 @@ function FilmPage({
             <button
               className="primary"
               disabled={busy || !current || !film.available}
-              onClick={() => play(current.id)}
+              onClick={() => current && void play(current.id)}
             >
               {busy ? (
                 <Loader2 className="spin" size={18} />
@@ -1485,7 +1669,8 @@ function FilmPage({
                 ? hint.matched
                   ? "播放对应集 · " + hint.episode_title
                   : "请先选择对应单集"
-                : film.progress?.position > 0
+                : current?.id === film.progress?.episode_id &&
+                    film.progress?.position > 0
                   ? "继续观看 · " + time(film.progress.position)
                   : "立即播放"}
             </button>
@@ -1531,7 +1716,7 @@ function FilmPage({
           ，收藏和观看记录仍会保留。请搜索其他视频源。
         </Notice>
       )}
-      <section>
+      <section aria-label="选集播放">
         <div className="section-title">
           <h2>
             选集播放 <span>EPISODES</span>
@@ -1544,17 +1729,6 @@ function FilmPage({
           >
             {episodes.length} 个视频 <ChevronDown size={15} />
           </button>
-        </div>
-        <div className="line-tabs">
-          {lines.map((l) => (
-            <button
-              className={line === l ? "active" : ""}
-              key={l}
-              onClick={() => setLine(l)}
-            >
-              {l}
-            </button>
-          ))}
         </div>
         {episodes.length ? (
           <div className={`episode-grid ${selecting ? "expanded" : ""}`}>
@@ -1598,14 +1772,14 @@ function FilmPage({
               {sourceChoice.film.switch_hint?.message ||
                 "无法确认对应集数，请选择要播放的单集。"}
             </Notice>
-            <div className="line-tabs">
+            <div className="line-tabs" role="group" aria-label="新来源播放线路">
               {[
                 ...new Set<string>(
                   sourceChoice.film.episodes.map(
                     (episode: Obj) => episode.line_name,
                   ),
                 ),
-              ].map((name) => (
+              ].map((name, index) => (
                 <button
                   key={name}
                   className={sourceChoice.line === name ? "active" : ""}
@@ -1614,7 +1788,7 @@ function FilmPage({
                     setSourceChoice({ ...sourceChoice, line: name })
                   }
                 >
-                  {name}
+                  {lineLabel(name, index)}
                 </button>
               ))}
             </div>

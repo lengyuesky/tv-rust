@@ -266,12 +266,48 @@ async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
     }
     Ok(info)
 }
+fn cached(e: &Episode) -> Option<MediaInfo> {
+    let info = serde_json::from_str::<MediaInfo>(&e.probe).ok()?;
+    (e.probed_at > now() - 21600
+        && !(info.kind == "hls" && info.streams.is_empty() && info.probe_version == 0))
+        .then_some(info)
+}
+
 pub async fn get(app: &App, e: &Episode) -> Result<MediaInfo> {
-    if e.probed_at > now() - 21600
-        && let Ok(v) = serde_json::from_str::<MediaInfo>(&e.probe)
-        && !(v.kind == "hls" && v.streams.is_empty() && v.probe_version == 0)
-    {
-        return Ok(v);
+    get_inner(app, e, false).await
+}
+
+pub async fn source_quality(
+    app: &App,
+    user: &str,
+    e: &Episode,
+    refresh: bool,
+    selected: bool,
+) -> Result<MediaInfo> {
+    let fresh = catalog::available(app, user, &e.id).await?.0;
+    if !refresh && let Some(info) = cached(&fresh) {
+        return Ok(info);
+    }
+    // 后台来源识别最多占用一个探测槽，保留另一个供网页和飞牛开始播放。
+    let _background = if selected {
+        None
+    } else {
+        Some(
+            app.source_quality_slots
+                .acquire()
+                .await
+                .map_err(|_| Error::bad("来源画质识别已停止"))?,
+        )
+    };
+    let fresh = catalog::available(app, user, &e.id).await?.0;
+    let info = get_inner(app, &fresh, refresh).await?;
+    catalog::available(app, user, &e.id).await?;
+    Ok(info)
+}
+
+async fn get_inner(app: &App, e: &Episode, refresh: bool) -> Result<MediaInfo> {
+    if !refresh && let Some(info) = cached(e) {
+        return Ok(info);
     }
     let _slot = app
         .probe_slots
@@ -279,10 +315,7 @@ pub async fn get(app: &App, e: &Episode) -> Result<MediaInfo> {
         .await
         .map_err(|_| Error::bad("媒体探测已停止"))?;
     let fresh = catalog::episode(app, &e.id).await?;
-    if fresh.probed_at > now() - 21600
-        && let Ok(v) = serde_json::from_str::<MediaInfo>(&fresh.probe)
-        && !(v.kind == "hls" && v.streams.is_empty() && v.probe_version == 0)
-    {
+    if !refresh && let Some(v) = cached(&fresh) {
         return Ok(v);
     }
     let result = tokio::time::timeout(Duration::from_secs(14), inspect(app, &fresh)).await;
@@ -309,12 +342,17 @@ pub async fn get(app: &App, e: &Episode) -> Result<MediaInfo> {
             }
         }
     };
-    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
-        .bind(serde_json::to_string(&info).unwrap())
-        .bind(now())
-        .bind(&e.id)
-        .execute(&app.db)
-        .await?;
+    let saved =
+        sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=? AND url=? AND active=1")
+            .bind(serde_json::to_string(&info).unwrap())
+            .bind(now())
+            .bind(&e.id)
+            .bind(&fresh.url)
+            .execute(&app.db)
+            .await?;
+    if saved.rows_affected() == 0 {
+        return Err(Error::bad("播放地址已更新，请重新识别画质"));
+    }
     Ok(info)
 }
 pub fn video(info: &MediaInfo) -> Value {
@@ -331,7 +369,9 @@ pub fn quality(info: &MediaInfo) -> Value {
                 Value::String(s) => s.parse().ok(),
                 _ => None,
             })
-            .filter(|n| n.is_finite() && *n > 0.0)
+            .filter(|n| {
+                n.is_finite() && *n > 0.0 && (!matches!(key, "width" | "height") || *n <= 32768.0)
+            })
             .unwrap_or(0.0)
     };
     let rate = |key: &str| {
