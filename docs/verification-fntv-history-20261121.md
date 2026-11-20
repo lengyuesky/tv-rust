@@ -52,4 +52,8 @@ Rust 集成测试 **48 项**、`cargo clippy --locked --all-targets -- -D warnin
 
 ## 发布验证
 
-本节在 GitHub Actions 与双架构镜像发布完成后补充。
+[GitHub Actions](https://github.com/lengyuesky/tv-rust/actions/runs/44798374163) 已成功，功能提交为 `903a62d198eec4d181319347ffc987c54b644604`。检查和网页构建 1 分 21 秒，AMD64 原生构建及启动检查 4 分 45 秒，ARM64 3 分 35 秒，合并发布 23 秒；两种架构并行，完整工作流 6 分 38 秒。本轮保留原有免费标准 runner 原生并行构建及一次网页构建流程，Dockerfile 仅补齐来源标签字体及其许可文件。
+
+已独立检查 GHCR：`ghcr.io/lengyuesky/tv-rust:latest` 和 `sha-903a62d198eec4d181319347ffc987c54b644604` 指向相同索引，包含且仅包含 `linux/amd64` 和 `linux/arm64`。两种架构的 OCI 源码修订标签都等于本次功能提交。索引摘要为 `sha256:5ebeb9fb1a7f4f5904ba55f566f565cf246b17b9a50e0808d1c693414b6df345`。
+
+发布及镜像证据位于恢复目录 `/Users/jiangyang/.codex/tmp/tv-rust-recovery-20261121/` 的 `ci-run.json`、`image-verification.json`、`image-latest.json`、`image-sha.json` 和 `image-configs.json`。镜像已发布，用户的运行中部署尚未更新。
