@@ -978,6 +978,40 @@ pub async fn personal(app: &App, user: &str, kind: &str) -> Result<Vec<Value>> {
     }
     Ok(rows)
 }
+
+pub async fn continue_watching(app: &App, user: &str) -> Result<Vec<Value>> {
+    // 先按观看时间挑选每部作品最近使用的来源，再限制首页卡片数量。
+    // 同一秒内的换源以播放会话序号判断先后，不能按位置大小挑选。
+    let mut films = sqlx::query_as::<_, Film>(
+        "SELECT f.* FROM films f JOIN progress p ON p.film_id=f.id WHERE p.user_id=? \
+         ORDER BY p.updated_at DESC,p.authority DESC,f.id",
+    )
+    .bind(user)
+    .fetch(&app.db);
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    while let Some(film) = films.next().await {
+        let film = film?;
+        let key = if known_year(film.year.trim()) {
+            group_key(&film)
+        } else {
+            film.id.clone()
+        };
+        if seen.insert(key) {
+            ids.push(film.id);
+            if ids.len() == 6 {
+                break;
+            }
+        }
+    }
+    drop(films);
+    let mut rows = Vec::new();
+    for id in ids {
+        rows.push(view(app, user, &id, false).await?);
+    }
+    Ok(rows)
+}
+
 pub async fn view(app: &App, user: &str, id: &str, full: bool) -> Result<Value> {
     let f = film(app, id).await?;
     let s = source(app, &f.source_id).await?;

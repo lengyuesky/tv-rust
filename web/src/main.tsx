@@ -313,7 +313,7 @@ function Home({ me }: { me: Obj }) {
     [busy, setBusy] = useState(true),
     [q, setQ] = useState("");
   useEffect(() => {
-    Promise.all([api("/sources"), api("/favorites"), api("/history")])
+    Promise.all([api("/sources"), api("/favorites"), api("/continue-watching")])
       .then(([s, f, h]) => {
         setSources(s.sources);
         setFavorites(f.items);
@@ -428,7 +428,7 @@ function Home({ me }: { me: Obj }) {
         </div>
       )}
       {history.length > 0 && (
-        <section>
+        <section aria-label="继续观看">
           <div className="section-title">
             <h2>
               继续观看 <span>CONTINUE WATCHING</span>
@@ -437,7 +437,7 @@ function Home({ me }: { me: Obj }) {
               全部记录 <ArrowRight size={16} />
             </a>
           </div>
-          <Cards items={history.slice(0, 6)} />
+          <Cards items={history} />
         </section>
       )}
       <section>

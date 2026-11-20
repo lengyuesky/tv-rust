@@ -1503,6 +1503,208 @@ async fn native_progress_rejects_a_conflicting_play_link() {
     assert_eq!(view["progress"]["position"], 12.0);
 }
 
+async fn watched_film(
+    h: &Harness,
+    source: &catalog::Source,
+    row: Value,
+    progress: (&str, f64, i64, i64),
+) -> catalog::Film {
+    let film = catalog::ingest(&h.app, source, &row, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let episode = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+    sqlx::query("INSERT INTO progress VALUES(?,?,?,?,?,?,?)")
+        .bind(progress.0)
+        .bind(&film.id)
+        .bind(&episode.id)
+        .bind(progress.1)
+        .bind(120.0)
+        .bind(progress.2)
+        .bind(progress.3)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    film
+}
+
+#[tokio::test]
+async fn continue_watching_groups_sources_without_merging_progress_or_user_records() {
+    let h = harness().await;
+    let primary = catalog::sources(&h.app).await.unwrap().remove(0);
+    let subscription = catalog::import(
+        &h.app,
+        &json!({"name":"继续观看订阅","content":json!({"api_site":{
+        "a":{"name":"观看源A","api":primary.api},
+        "b":{"name":"观看源B","api":primary.api},
+        "c":{"name":"观看源C","api":primary.api}
+    }}).to_string()}),
+    )
+    .await
+    .unwrap();
+    let sources: Vec<_> = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|source| source.subscription_id == subscription)
+        .collect();
+    let mut films = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        let film = watched_film(&h, source, json!({"vod_id":901,"vod_name":"午夜规则","vod_year":"2026","type_name":"电视剧","vod_pic":"https://example.com/poster.jpg","vod_play_from":"line","vod_play_url":"第03集$https://example.com/3.mp4"}),
+            (&h.other.user.id, [2.0,53.0,12.0][index], index as i64+1, now()-30+index as i64)).await;
+        catalog::favorite(&h.app, &h.other.user.id, &film.id, true)
+            .await
+            .unwrap();
+        films.push(film);
+    }
+    let (_, before) = request(&h, "GET", "/api/history", json!({}), Some(&h.member_raw)).await;
+    let (status, grouped) = request(
+        &h,
+        "GET",
+        "/api/continue-watching",
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(grouped["items"].as_array().unwrap().len(), 1);
+    assert_eq!(grouped["items"][0]["id"], films[2].id);
+    assert_eq!(
+        grouped["items"][0]["progress"]["position"], 12.0,
+        "选择最近观看记录，不能选进度最大的53秒来源"
+    );
+    assert_eq!(before["items"].as_array().unwrap().len(), 3);
+    let (_, after) = request(&h, "GET", "/api/history", json!({}), Some(&h.member_raw)).await;
+    assert_eq!(before, after, "首页合并展示不改写任何来源的观看记录");
+    let (_, favorites) = request(&h, "GET", "/api/favorites", json!({}), Some(&h.member_raw)).await;
+    assert_eq!(favorites["items"].as_array().unwrap().len(), 3);
+    let (_, admin) = request(&h, "GET", "/api/continue-watching", json!({}), Some(&h.raw)).await;
+    assert!(
+        admin["items"].as_array().unwrap().is_empty(),
+        "只读取当前账号的记录"
+    );
+    assert_eq!(
+        request(&h, "GET", "/api/continue-watching", json!({}), None)
+            .await
+            .0,
+        401
+    );
+    access::save_usage(
+        &h.app,
+        &subscription,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    let (_, revoked) = request(
+        &h,
+        "GET",
+        "/api/continue-watching",
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(revoked["items"].as_array().unwrap().len(), 1);
+    assert_eq!(revoked["items"][0]["id"], films[2].id);
+    assert_eq!(revoked["items"][0]["authorized"], false);
+    assert_eq!(revoked["items"][0]["poster"], "");
+    assert_eq!(revoked["items"][0]["progress"]["position"], 12.0);
+}
+
+#[tokio::test]
+async fn continue_watching_distinguishes_versions_and_uses_latest_session_within_one_second() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let descriptions = [
+        ("午夜规则", "2026", "电视剧", "", 53.0, 1),
+        ("午夜规则", "2026", "电视剧", "", 2.0, 2),
+        ("午夜规则", "2025", "电视剧", "", 12.0, 3),
+        ("午夜规则", "2026", "电影", "", 12.0, 4),
+        ("午夜规则", "2026", "电视剧", "导演剪辑", 12.0, 5),
+        ("年份未知作品", "", "电视剧", "", 12.0, 6),
+        ("年份未知作品", "", "电视剧", "", 12.0, 7),
+    ];
+    let mut films = Vec::new();
+    let at = now();
+    for (index, (title, year, kind, remarks, position, authority)) in
+        descriptions.into_iter().enumerate()
+    {
+        films.push(watched_film(&h,&source,json!({"vod_id":910+index,"vod_name":title,"vod_year":year,"type_name":kind,"vod_remarks":remarks,"vod_play_from":"line","vod_play_url":"第03集$https://example.com/3.mp4"}),
+            (&h.who.user.id,position,authority,at)).await);
+    }
+    let grouped = catalog::continue_watching(&h.app, &h.who.user.id)
+        .await
+        .unwrap();
+    assert_eq!(grouped.len(), 6);
+    assert!(!grouped.iter().any(|item| item["id"] == films[0].id));
+    for film in &films[1..] {
+        assert!(
+            grouped.iter().any(|item| item["id"] == film.id),
+            "不同年份、类别、版本或无法确认年份的条目独立显示"
+        );
+    }
+    assert_eq!(
+        grouped
+            .iter()
+            .find(|item| item["id"] == films[1].id)
+            .unwrap()["progress"]["position"],
+        2.0
+    );
+    assert_eq!(
+        catalog::personal(&h.app, &h.who.user.id, "history")
+            .await
+            .unwrap()
+            .len(),
+        7
+    );
+}
+
+#[tokio::test]
+async fn continue_watching_deduplicates_before_applying_the_homepage_limit() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let at = now();
+    let mut most_recent = String::new();
+    for index in 0..10 {
+        most_recent = watched_film(&h,&source,json!({"vod_id":930+index,"vod_name":"午夜规则","vod_year":"2026","type_name":"电视剧","vod_play_from":"line","vod_play_url":"第03集$https://example.com/3.mp4"}),
+            (&h.who.user.id,index as f64,index,at)).await.id;
+    }
+    for index in 0..6 {
+        watched_film(&h,&source,json!({"vod_id":950+index,"vod_name":format!("其他作品{index}"),"vod_year":"2026","type_name":"电视剧","vod_play_from":"line","vod_play_url":"第01集$https://example.com/1.mp4"}),
+            (&h.who.user.id,12.0,10+index,at-1-index)).await;
+    }
+    let grouped = catalog::continue_watching(&h.app, &h.who.user.id)
+        .await
+        .unwrap();
+    assert_eq!(grouped.len(), 6, "重复来源不能占满首页的六张卡片");
+    assert_eq!(grouped[0]["id"], most_recent);
+    assert_eq!(
+        grouped
+            .iter()
+            .filter(|item| item["title"] == "午夜规则")
+            .count(),
+        1
+    );
+    assert_eq!(grouped[5]["title"], "其他作品4");
+    assert!(!grouped.iter().any(|item| item["title"] == "其他作品5"));
+    assert_eq!(
+        catalog::personal(&h.app, &h.who.user.id, "history")
+            .await
+            .unwrap()
+            .len(),
+        16
+    );
+    let concurrent = futures_util::future::join_all(
+        (0..8).map(|_| catalog::continue_watching(&h.app, &h.who.user.id)),
+    );
+    for result in tokio::time::timeout(Duration::from_secs(3), concurrent)
+        .await
+        .expect("并发打开首页不得占满连接池并阻塞详情读取")
+    {
+        assert_eq!(result.unwrap(), grouped);
+    }
+}
+
 #[tokio::test]
 async fn playback_sources_discover_only_the_same_work_and_obey_access() {
     let h = harness().await;

@@ -209,6 +209,11 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 json!({"items":catalog::personal(app,&who.user.id,"history").await?}),
             ));
         }
+        ("GET", "/api/continue-watching") => {
+            return Ok(json_response(
+                json!({"items":catalog::continue_watching(app,&who.user.id).await?}),
+            ));
+        }
         ("GET", "/api/logs") => {
             return Ok(json_response(
                 playback::logs(
