@@ -47,3 +47,7 @@
 网页 **12 项测试**、TypeScript、Vite 构建及格式检查通过。Chrome **157.0.8103.80** 使用独立数据库及真实 MP4/HLS，完成 **13 组浏览器回归**，无 JavaScript 异常。覆盖此前的精确集号、重复切线路、权限过滤、刷新、失败保留原播放、重复点击、独立进度、合集选集、HLS 实际画质和返回前进；新增验证后台查询被暂时阻塞时，已保存的源名称仍可见且可选择，以及手机直接点击源名称后更新当前源标记、自动播放对应第三集。
 
 源按钮已核验位于视频下方。桌面与 390px 手机截图已人工检查，名称直接可见，手机没有横向溢出，具体画质继续显示。证据目录为 `tmp/playback-inline-20261120-TCPsIH/`，包括 `results.json`、桌面／手机换源截图、手机点击后的截图及服务日志；检查日志为 `tmp/playback-inline-20261120/`，脚本为 `tmp/ui-regression-tools/playback-inline-check.mjs`。隔离服务与浏览器均已停止，用户部署和实际数据库没有改动。
+
+[源名称直接显示的发布工作流](https://github.com/lengyuesky/tv-rust/actions/runs/44690584146) 已成功，功能提交为 `bfe0576739cbc3cfe5947afed034f3fe596952a0`。CI 检查和网页构建 51 秒，AMD64 原生构建及启动检查 43 秒，ARM64 44 秒，合并发布 21 秒，整条工作流 **2 分 6 秒**。
+
+已独立核验 GHCR `latest` 与 `sha-bfe0576739cbc3cfe5947afed034f3fe596952a0` 指向同一索引，包含且仅包含 `linux/amd64`、`linux/arm64`，两个架构的修订标签均匹配该提交；索引摘要为 `sha256:6a38dd1d49dabeb78390c5545007a26a7d4d5c094455ffc34bfec42ca557e158`。发布和镜像证据为 `tmp/playback-inline-20261120/ci-run.json`、`image-verification.json` 及同目录的原始镜像信息。新版镜像已发布，用户实际部署尚未更新。
