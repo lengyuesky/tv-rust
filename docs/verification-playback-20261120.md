@@ -31,3 +31,11 @@
 最终浏览器证据位于忽略目录 `tmp/playback-page-20261120-IjAfeR/`，包含 `results.json`、桌面和手机换源截图、HLS 画质截图、隔离服务日志；截图已人工核对。检查日志位于 `tmp/playback-20261120/`，脚本为 `tmp/ui-regression-tools/playback-page-check.mjs`。隔离服务和浏览器已停止。
 
 本轮实际播放覆盖 MP4 的 360p、720p 和多档 HLS 的实际 360p；未宣称实测 HLS 在同一次播放中自动变档，也未进行本轮真实飞牛客户端或用户生产部署验收。没有更改用户实际数据库和部署。
+
+## 发布验证
+
+[GitHub Actions 工作流](https://github.com/lengyuesky/tv-rust/actions/runs/44688828440) 已成功，功能提交为 `560ecd6230e599fbad2949b0c094bd85c9ba8875`。检查及网页构建 55 秒，AMD64 原生构建和启动检查 2 分 24 秒，ARM64 1 分 44 秒，合并发布 21 秒；两种架构并行，整条工作流实测 **3 分 49 秒**。
+
+已从 GHCR 独立核验 `ghcr.io/lengyuesky/tv-rust:latest` 与 `sha-560ecd6230e599fbad2949b0c094bd85c9ba8875` 指向同一索引，包含且仅包含 `linux/amd64`、`linux/arm64`，两个架构的镜像修订标签均匹配本次功能提交。索引摘要为 `sha256:89c3216b3625aa43d96370caa6bcf19b886f9379799dedfe9cfdff9e43f063b4`。
+
+发布与镜像证据保留在 `tmp/playback-20261120/ci-run.json`、`image-verification.json` 及对应的原始索引和镜像配置文件中。本轮没有改动既有原生双架构并行构建流程。镜像已发布，用户实际部署尚未更新。
