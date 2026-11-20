@@ -35,6 +35,9 @@ import {
   X,
   Loader2,
   ChevronDown,
+  ChevronUp,
+  ArrowDownUp,
+  History,
 } from "lucide-react";
 import "./style.css";
 import { api } from "./api";
@@ -46,6 +49,16 @@ import {
   type UserPreferences,
 } from "./image-source";
 import { PreferencesContext } from "./preferences";
+import {
+  Confirm,
+  Modal,
+  SkeletonCards,
+  Toasts,
+  clearToasts,
+  modalOpen,
+  store,
+  toast,
+} from "./ui";
 import {
   compareQuality,
   currentQuality,
@@ -256,11 +269,13 @@ function Cards({
   onOpen,
   onRemove,
   removing,
+  resume,
 }: {
   items: Obj[];
   onOpen?: (f: Obj) => void;
   onRemove?: (f: Obj) => void;
   removing?: string;
+  resume?: boolean;
 }) {
   return (
     <div className="cards">
@@ -270,13 +285,23 @@ function Cards({
           <button
             className="card-open"
             aria-label={`打开${f.title}`}
+            title={
+              resume && f.available !== false && f.progress?.episode_id
+                ? `从 ${time(f.progress.position)} 继续播放`
+                : undefined
+            }
             onClick={() =>
               onOpen
                 ? onOpen(f)
                 : go(
                     f.authorized === false
                       ? "/search?q=" + encodeURIComponent(f.title)
-                      : "/film/" + f.id,
+                      : resume &&
+                          f.available !== false &&
+                          f.progress?.episode_id
+                        ? // 有观看进度的卡片一步续播，播放开始后地址会还原为影片页。
+                          `/film/${f.id}?autoplay=1&play_episode=${encodeURIComponent(f.progress.episode_id)}`
+                        : "/film/" + f.id,
                   )
             }
           />
@@ -307,7 +332,9 @@ function Home({ me }: { me: Obj }) {
     [favorites, setFavorites] = useState<Obj[]>([]),
     [history, setHistory] = useState<Obj[]>([]),
     [rec, setRec] = useState<Obj[]>([]),
-    [kind, setKind] = useState("movie"),
+    [kind, setKindState] = useState(() =>
+      store.get("home-kind") === "tv" ? "tv" : "movie",
+    ),
     [recommendationRetry, setRecommendationRetry] = useState(0),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(true),
@@ -342,9 +369,13 @@ function Home({ me }: { me: Obj }) {
       active = false;
     };
   }, [kind, recommendationRetry]);
+  const setKind = (value: string) => {
+    store.set("home-kind", value);
+    setKindState(value);
+  };
   const search = (e: React.FormEvent) => {
     e.preventDefault();
-    if (q.trim()) go("/search?q=" + encodeURIComponent(q));
+    if (q.trim()) go("/search?q=" + encodeURIComponent(q.trim()));
   };
   return (
     <>
@@ -420,7 +451,7 @@ function Home({ me }: { me: Obj }) {
             </p>
           </div>
           {me.user.admin && (
-            <button className="outline" onClick={() => go("/settings")}>
+            <button className="outline" onClick={() => go("/settings/sources")}>
               <Plus size={16} />
               导入订阅
             </button>
@@ -437,7 +468,7 @@ function Home({ me }: { me: Obj }) {
               全部记录 <ArrowRight size={16} />
             </a>
           </div>
-          <Cards items={history} />
+          <Cards items={history} resume />
         </section>
       )}
       <section>
@@ -462,7 +493,7 @@ function Home({ me }: { me: Obj }) {
         </div>
         <p className="section-sub">豆瓣热门 · 选择作品，搜索你的可用视频源</p>
         {busy ? (
-          <Busy />
+          <SkeletonCards />
         ) : rec.length ? (
           <Cards
             items={rec}
@@ -501,7 +532,18 @@ function Home({ me }: { me: Obj }) {
     </>
   );
 }
-function SearchPage({ route }: { route: string }) {
+const recentKey = (userId: string) => "recent-searches:" + userId;
+const readRecent = (userId: string): string[] => {
+  try {
+    const value = JSON.parse(store.get(recentKey(userId)) || "[]");
+    return Array.isArray(value)
+      ? value.filter((item) => typeof item === "string").slice(0, 8)
+      : [];
+  } catch {
+    return [];
+  }
+};
+function SearchPage({ route, userId }: { route: string; userId: string }) {
   const params = new URLSearchParams(route.split("?")[1] || "");
   const query = (params.get("q") || "").trim();
   const switchFrom = params.get("switch_from") || "";
@@ -519,7 +561,9 @@ function SearchPage({ route }: { route: string }) {
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [page, setPage] = useState(1),
-    [expanded, setExpanded] = useState<string | null>(null);
+    [expanded, setExpanded] = useState<string | null>(null),
+    [recent, setRecent] = useState(() => readRecent(userId));
+  const input = useRef<HTMLInputElement>(null);
   const requestVersion = useRef(0);
   const pending = useRef<AbortController | null>(null);
   const load = useCallback(
@@ -545,6 +589,15 @@ function SearchPage({ route }: { route: string }) {
           items: mergeSearchItems(pg > 1 && old ? old.items : [], r.items),
         }));
         setPage(pg);
+        if (pg === 1 && r.items.length) {
+          // 只记录确实搜到内容的片名，按账号保存在当前浏览器。
+          const next = [
+            query,
+            ...readRecent(userId).filter((item) => item !== query),
+          ].slice(0, 8);
+          store.set(recentKey(userId), JSON.stringify(next));
+          setRecent(next);
+        }
       } catch (e) {
         if (version === requestVersion.current && !controller.signal.aborted)
           setError((e as Error).message);
@@ -552,9 +605,10 @@ function SearchPage({ route }: { route: string }) {
         if (version === requestVersion.current) setBusy(false);
       }
     },
-    [query],
+    [query, userId],
   );
   useEffect(() => {
+    if (!query) input.current?.focus();
     setQ(query);
     setResult(null);
     setExpanded(null);
@@ -591,16 +645,62 @@ function SearchPage({ route }: { route: string }) {
           <Search size={20} />
           <input
             aria-label="影片关键词"
+            ref={input}
+            type="search"
+            enterKeyHint="search"
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="电影、电视剧、动漫…"
           />
-          <button className="primary" disabled={busy}>
+          <button className="primary" disabled={busy || !q.trim()}>
             搜索
           </button>
         </form>
       </div>
-      {error && <Notice kind="error">{error}</Notice>}
+      {!query && recent.length > 0 && (
+        <section className="recent-searches" aria-label="最近搜索">
+          <div>
+            <span>
+              <History size={14} />
+              最近搜索
+            </span>
+            <button
+              className="ghost"
+              onClick={() => {
+                store.remove(recentKey(userId));
+                setRecent([]);
+              }}
+            >
+              清空
+            </button>
+          </div>
+          <div className="chips">
+            {recent.map((item) => (
+              <button
+                key={item}
+                onClick={() =>
+                  go("/search?q=" + encodeURIComponent(item) + switchQuery)
+                }
+              >
+                {item}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+      {!query && !recent.length && (
+        <p className="muted small">
+          输入片名开始搜索。结果按作品合并，可在每部作品中选择来源。
+        </p>
+      )}
+      {error && (
+        <Notice kind="error">
+          {error}
+          <button className="inline-action" onClick={() => void load(1)}>
+            重试
+          </button>
+        </Notice>
+      )}
       {result && (
         <>
           <div className="search-summary">
@@ -658,35 +758,27 @@ function SearchPage({ route }: { route: string }) {
           )}
         </>
       )}
-      {busy && <Busy />}
+      {busy && (result ? <Busy /> : <SkeletonCards count={12} />)}
       {expanded && (
-        <div className="modal-backdrop" onClick={() => setExpanded(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <button
-              className="close"
-              onClick={() => setExpanded(null)}
-              aria-label="关闭"
-            >
-              <X />
-            </button>
-            <span className="eyebrow">CHOOSE A SOURCE</span>
-            <h2>{grouped.get(expanded)?.[0].title}</h2>
-            <p>选择来源。各版本的集数、画质可能不同。</p>
-            <div className="choose-sources">
-              {grouped.get(expanded)?.map((f) => (
-                <button key={f.id} onClick={() => openFilm(f.id)}>
-                  <span>
-                    <strong>{f.source_name}</strong>
-                    <small>
-                      {f.year} · {f.remarks}
-                    </small>
-                  </span>
-                  <ArrowRight size={18} />
-                </button>
-              ))}
-            </div>
+        <Modal onClose={() => setExpanded(null)}>
+          <span className="eyebrow">CHOOSE A SOURCE</span>
+          <h2>{grouped.get(expanded)?.[0].title}</h2>
+          <p>选择来源。各版本的集数、画质可能不同。</p>
+          <div className="choose-sources">
+            {grouped.get(expanded)?.map((f) => (
+              <button key={f.id} onClick={() => openFilm(f.id)}>
+                <span>
+                  <strong>{f.source_name}</strong>
+                  <small>
+                    {[f.year, f.remarks].filter(Boolean).join(" · ") ||
+                      "暂无版本信息"}
+                  </small>
+                </span>
+                <ArrowRight size={18} />
+              </button>
+            ))}
           </div>
-        </div>
+        </Modal>
       )}
     </>
   );
@@ -706,14 +798,16 @@ type PlayerState = {
   episode_title?: string;
 };
 type PlayerHandle = { finish: () => Promise<void> };
+const speeds = ["0.75", "1", "1.25", "1.5", "2"];
 type PlayerProps = {
   session: PlayerState;
   onClose: () => void;
   onNext?: () => void;
+  onPrev?: () => void;
   onQuality?: (id: string, quality: VideoQuality) => void;
 };
 const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
-  { session, onClose, onNext, onQuality },
+  { session, onClose, onNext, onPrev, onQuality },
   ref,
 ) {
   const video = useRef<HTMLVideoElement>(null),
@@ -733,7 +827,11 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     [switching, setSwitching] = useState(false),
     [renderedQuality, setRenderedQuality] = useState<VideoQuality>({}),
     [levelQuality, setLevelQuality] = useState<VideoQuality | undefined>(),
-    [speed, setSpeed] = useState("1");
+    [speed, setSpeed] = useState(() => {
+      // 倍速在换集、换源后沿用上一次的选择。
+      const saved = store.get("playback-speed") || "1";
+      return speeds.includes(saved) ? saved : "1";
+    });
   active.current = state;
   const event = useCallback(
     (e: string) => {
@@ -969,6 +1067,65 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     void finish()
       .then(() => onNext?.())
       .catch(() => {});
+  const prev = () =>
+    void finish()
+      .then(() => onPrev?.())
+      .catch(() => {});
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      const v = video.current;
+      const target = e.target as HTMLElement | null;
+      // 视频自身聚焦时由浏览器原生控件处理；输入、按钮和弹窗内不拦截按键。
+      if (
+        !v ||
+        e.ctrlKey ||
+        e.metaKey ||
+        e.altKey ||
+        modalOpen() ||
+        target === v ||
+        target?.closest("input,textarea,select,button,a,[contenteditable]")
+      )
+        return;
+      const seek = (delta: number) => {
+        if (Number.isFinite(v.duration))
+          v.currentTime = Math.min(
+            Math.max(0, v.currentTime + delta),
+            v.duration,
+          );
+      };
+      switch (e.key) {
+        case " ":
+        case "k":
+          if (v.paused) void v.play().catch(() => {});
+          else v.pause();
+          break;
+        case "ArrowLeft":
+          seek(-10);
+          break;
+        case "ArrowRight":
+          seek(10);
+          break;
+        case "ArrowUp":
+          v.volume = Math.min(1, v.volume + 0.1);
+          break;
+        case "ArrowDown":
+          v.volume = Math.max(0, v.volume - 0.1);
+          break;
+        case "m":
+          v.muted = !v.muted;
+          break;
+        case "f":
+          if (document.fullscreenElement) void document.exitFullscreen();
+          else void v.requestFullscreen?.().catch(() => {});
+          break;
+        default:
+          return;
+      }
+      e.preventDefault();
+    };
+    document.addEventListener("keydown", key);
+    return () => document.removeEventListener("keydown", key);
+  }, []);
   const quality = useMemo(
     () => currentQuality(state.quality, renderedQuality, levelQuality),
     [state.quality, renderedQuality, levelQuality],
@@ -1026,12 +1183,15 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
             value={speed}
             onChange={(e) => {
               setSpeed(e.target.value);
+              store.set("playback-speed", e.target.value);
               if (video.current)
                 video.current.playbackRate = Number(e.target.value);
             }}
           >
-            {["0.75", "1", "1.25", "1.5", "2"].map((v) => (
-              <option key={v}>{v}</option>
+            {speeds.map((v) => (
+              <option key={v} value={v}>
+                {v}×
+              </option>
             ))}
           </select>
         </label>
@@ -1048,6 +1208,7 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
         <button
           className="ghost"
           disabled={switching || state.mode === "proxy" || !state.allow_proxy}
+          title="直链卡顿或无法加载时，改由本站转发当前视频"
           onClick={() => fallback()}
         >
           转发重试
@@ -1055,11 +1216,23 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
         {!state.allow_proxy && (
           <span className="muted small">管理员已禁止转发</span>
         )}
-        {onNext && (
-          <button className="outline" onClick={next}>
-            下一集 <ArrowRight size={16} />
-          </button>
+        {(onPrev || onNext) && (
+          <span className="episode-nav">
+            {onPrev && (
+              <button className="ghost" onClick={prev}>
+                <ArrowLeft size={16} /> 上一集
+              </button>
+            )}
+            {onNext && (
+              <button className="outline" onClick={next}>
+                下一集 <ArrowRight size={16} />
+              </button>
+            )}
+          </span>
         )}
+        <span className="muted small shortcut-hint">
+          空格 暂停 · ← → 快退/快进 10 秒 · F 全屏 · M 静音
+        </span>
         <a href="#/logs" className="muted small">
           查看播放日志
         </a>
@@ -1388,6 +1561,9 @@ function FilmPage({
     [session, setSession] = useState<PlayerState | null>(null),
     [playingId, setPlayingId] = useState(""),
     [selecting, setSelecting] = useState(false),
+    [reversed, setReversed] = useState(
+      () => store.get("episodes-reversed") === "1",
+    ),
     [sourceChoice, setSourceChoice] = useState<{
       film: Obj;
       line: string;
@@ -1501,7 +1677,39 @@ function FilmPage({
       setBusy(false);
     }
   };
-  if (!film) return error ? <Notice kind="error">{error}</Notice> : <Busy />;
+  const episodeGrid = useRef<HTMLDivElement>(null);
+  const filmTitle = film?.title;
+  useEffect(() => {
+    if (filmTitle) document.title = `${filmTitle} · TV Rust`;
+  }, [filmTitle]);
+  const sessionId = session?.id;
+  useEffect(() => {
+    // 从页面下方的选集开始播放时，把播放器带回视野。
+    if (sessionId) window.scrollTo({ top: 0, behavior: "smooth" });
+  }, [sessionId]);
+  const lastEpisode = film?.progress?.episode_id;
+  useEffect(() => {
+    // 长剧集的选集区域有独立滚动，定位到正在播放或上次观看的单集。
+    const grid = episodeGrid.current;
+    const target = grid?.querySelector<HTMLElement>(
+      "button.active, button.last",
+    );
+    if (grid && target && grid.scrollHeight > grid.clientHeight)
+      grid.scrollTop =
+        target.offsetTop - grid.clientHeight / 2 + target.clientHeight / 2;
+  }, [playingId, lastEpisode, line, reversed, selecting, film?.id]);
+  if (!film)
+    return error ? (
+      <>
+        <Notice kind="error">{error}</Notice>
+        <button className="outline" onClick={() => go("/")}>
+          <ArrowLeft size={16} />
+          返回首页
+        </button>
+      </>
+    ) : (
+      <Busy />
+    );
   const episodes: Obj[] = film.episodes.filter(
     (e: Obj) => e.line_name === line,
   );
@@ -1587,120 +1795,105 @@ function FilmPage({
         {},
       );
       setFilm({ ...film, favorite: !film.favorite });
+      toast(film.favorite ? "已取消收藏" : "已加入收藏");
     } catch (e) {
       setError((e as Error).message);
     }
   };
-  return (
-    <>
-      <button className="back" onClick={() => history.back()}>
-        <ArrowLeft size={16} />
-        返回
-      </button>
-      {session && (
-        <Player
-          ref={player}
-          key={session.id}
-          session={session}
-          onQuality={updateQuality}
-          onClose={() => {
-            setSession(null);
-            void refreshProgress();
-          }}
-          onNext={
-            index >= 0 && index < episodes.length - 1
-              ? () => play(episodes[index + 1].id)
-              : undefined
-          }
-        />
-      )}
-      <PlaybackSources
-        film={film}
-        session={session}
-        line={line}
-        busy={busy}
-        episodeId={(session ? playingId : current?.id) || ""}
-        liveQuality={
-          liveQuality?.id === session?.id ? liveQuality?.quality : undefined
-        }
-        onSelect={(target, targetLine) => void selectSource(target, targetLine)}
-      />
-      <div className="film-detail">
-        <div className="detail-poster">
-          <Poster film={film} />
-        </div>
-        <div className="detail-info">
-          <span className="eyebrow">
-            {film.kind === "TV" ? "SERIES" : "MOVIE"} · {film.source_name}
-          </span>
-          <h1>{film.title}</h1>
-          <div className="film-meta">
-            <span>{film.year || "年份未知"}</span>
-            <span>{film.category}</span>
-            <span>{film.remarks}</span>
-          </div>
-          <p className="overview">
-            {film.overview || "这个视频源暂未提供简介。"}
-          </p>
-          {film.actor && (
-            <p className="credits">
-              <span>演员</span>
-              {film.actor}
-            </p>
-          )}
-          {film.director && (
-            <p className="credits">
-              <span>导演</span>
-              {film.director}
-            </p>
-          )}
-          <div className="detail-actions">
-            <button
-              className="primary"
-              disabled={busy || !current || !film.available}
-              onClick={() => current && void play(current.id)}
-            >
-              {busy ? (
-                <Loader2 className="spin" size={18} />
-              ) : (
-                <Play size={18} fill="currentColor" />
-              )}
-              {hint
-                ? hint.matched
-                  ? "播放对应集 · " + hint.episode_title
-                  : "请先选择对应单集"
-                : current?.id === film.progress?.episode_id &&
-                    film.progress?.position > 0
-                  ? "继续观看 · " + time(film.progress.position)
-                  : "立即播放"}
-            </button>
-            <button
-              className={film.favorite ? "outline liked" : "outline"}
-              onClick={favorite}
-            >
-              <Heart size={17} fill={film.favorite ? "currentColor" : "none"} />
-              {film.favorite ? "已收藏" : "收藏"}
-            </button>
-            <button
-              className="ghost"
-              onClick={() =>
-                go(
-                  "/search?q=" +
-                    encodeURIComponent(film.title) +
-                    "&switch_from=" +
-                    encodeURIComponent(id),
-                )
-              }
-            >
-              <RefreshCw size={16} />
-              搜索其他源
-            </button>
-          </div>
-          <p className="muted small">
-            换源后请核对集数与版本。无法确认对应单集时重新选集。
-          </p>
-        </div>
+  const sourcesNode = (
+    <PlaybackSources
+      key="sources"
+      film={film}
+      session={session}
+      line={line}
+      busy={busy}
+      episodeId={(session ? playingId : current?.id) || ""}
+      liveQuality={
+        liveQuality?.id === session?.id ? liveQuality?.quality : undefined
+      }
+      onSelect={(target, targetLine) => void selectSource(target, targetLine)}
+    />
+  );
+  const detailNode = (
+    <div className="film-detail" key="detail">
+      <div className="detail-poster">
+        <Poster film={film} />
       </div>
+      <div className="detail-info">
+        <span className="eyebrow">
+          {film.kind === "TV" ? "SERIES" : "MOVIE"} · {film.source_name}
+        </span>
+        <h1>{film.title}</h1>
+        <div className="film-meta">
+          <span>{film.year || "年份未知"}</span>
+          <span>{film.category}</span>
+          <span>{film.remarks}</span>
+        </div>
+        <p className="overview">
+          {film.overview || "这个视频源暂未提供简介。"}
+        </p>
+        {film.actor && (
+          <p className="credits">
+            <span>演员</span>
+            {film.actor}
+          </p>
+        )}
+        {film.director && (
+          <p className="credits">
+            <span>导演</span>
+            {film.director}
+          </p>
+        )}
+        <div className="detail-actions">
+          <button
+            className="primary"
+            disabled={busy || !current || !film.available}
+            onClick={() => current && void play(current.id)}
+          >
+            {busy ? (
+              <Loader2 className="spin" size={18} />
+            ) : (
+              <Play size={18} fill="currentColor" />
+            )}
+            {hint
+              ? hint.matched
+                ? "播放对应集 · " + hint.episode_title
+                : "请先选择对应单集"
+              : current?.id === film.progress?.episode_id &&
+                  film.progress?.position > 0
+                ? "继续观看 · " + time(film.progress.position)
+                : "立即播放"}
+          </button>
+          <button
+            className={film.favorite ? "outline liked" : "outline"}
+            onClick={favorite}
+          >
+            <Heart size={17} fill={film.favorite ? "currentColor" : "none"} />
+            {film.favorite ? "已收藏" : "收藏"}
+          </button>
+          <button
+            className="ghost"
+            onClick={() =>
+              go(
+                "/search?q=" +
+                  encodeURIComponent(film.title) +
+                  "&switch_from=" +
+                  encodeURIComponent(id),
+              )
+            }
+          >
+            <RefreshCw size={16} />
+            搜索其他源
+          </button>
+        </div>
+        <p className="muted small">
+          换源后请核对集数与版本。无法确认对应单集时重新选集。
+        </p>
+      </div>
+    </div>
+  );
+  const noticesNode = (
+    <React.Fragment key="notices">
       {error && <Notice kind="error">{error}</Notice>}
       {hint && (
         <Notice>
@@ -1716,103 +1909,158 @@ function FilmPage({
           ，收藏和观看记录仍会保留。请搜索其他视频源。
         </Notice>
       )}
-      <section aria-label="选集播放">
-        <div className="section-title">
-          <h2>
-            选集播放 <span>EPISODES</span>
-          </h2>
-          <button
-            className="ghost"
-            onClick={() => {
-              setSelecting(!selecting);
-            }}
-          >
-            {episodes.length} 个视频 <ChevronDown size={15} />
-          </button>
+    </React.Fragment>
+  );
+  const episodesNode = (
+    <section aria-label="选集播放" key="episodes">
+      <div className="section-title">
+        <h2>
+          选集播放 <span>EPISODES</span>
+        </h2>
+        <div className="episode-tools">
+          <span className="muted small">{episodes.length} 个视频</span>
+          {episodes.length > 1 && (
+            <button
+              className="ghost"
+              aria-pressed={reversed}
+              title="切换选集排列顺序"
+              onClick={() => {
+                store.set("episodes-reversed", reversed ? "0" : "1");
+                setReversed(!reversed);
+              }}
+            >
+              <ArrowDownUp size={15} />
+              {reversed ? "倒序" : "正序"}
+            </button>
+          )}
+          {episodes.length > 24 && (
+            <button
+              className="ghost"
+              aria-expanded={selecting}
+              onClick={() => setSelecting(!selecting)}
+            >
+              {selecting ? "收起" : "展开全部"}
+              {selecting ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+            </button>
+          )}
         </div>
-        {episodes.length ? (
-          <div className={`episode-grid ${selecting ? "expanded" : ""}`}>
-            {episodes.map((e) => (
+      </div>
+      {episodes.length ? (
+        <div
+          ref={episodeGrid}
+          className={`episode-grid ${selecting ? "expanded" : ""}`}
+        >
+          {(reversed ? [...episodes].reverse() : episodes).map((e) => (
+            <button
+              key={e.id}
+              disabled={busy || !film.available}
+              className={
+                session && playingId === e.id
+                  ? "active"
+                  : !session && lastEpisode === e.id
+                    ? "last"
+                    : ""
+              }
+              title={
+                !session && lastEpisode === e.id && film.progress?.position > 0
+                  ? `上次看到 ${time(film.progress.position)}`
+                  : undefined
+              }
+              onClick={() => play(e.id)}
+            >
+              {e.title}
+              {session && playingId === e.id && <Play size={13} />}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <Empty title="没有找到播放地址">
+          这个条目可能需要网页解析，尝试搜索其他视频源。
+        </Empty>
+      )}
+    </section>
+  );
+  return (
+    <>
+      <button
+        className="back"
+        onClick={() => (history.length > 1 ? history.back() : go("/"))}
+      >
+        <ArrowLeft size={16} />
+        返回
+      </button>
+      {session && (
+        <Player
+          ref={player}
+          key={session.id}
+          session={session}
+          onQuality={updateQuality}
+          onClose={() => {
+            setSession(null);
+            void refreshProgress();
+          }}
+          onPrev={index > 0 ? () => play(episodes[index - 1].id) : undefined}
+          onNext={
+            index >= 0 && index < episodes.length - 1
+              ? () => play(episodes[index + 1].id)
+              : undefined
+          }
+        />
+      )}
+      {/* 播放时选集紧跟播放器；未播放时先展示影片信息。带 key 的节点换位不会重置状态。 */}
+      {session
+        ? [sourcesNode, noticesNode, episodesNode, detailNode]
+        : [detailNode, noticesNode, sourcesNode, episodesNode]}
+      {sourceChoice && (
+        <Modal
+          onClose={() => setSourceChoice(null)}
+          locked={busy}
+          closeLabel="关闭换源选集"
+        >
+          <h2>选择新来源的单集</h2>
+          <p>
+            {sourceChoice.film.source_name} · {sourceChoice.film.title}
+          </p>
+          <Notice>
+            {sourceChoice.film.switch_hint?.message ||
+              "无法确认对应集数，请选择要播放的单集。"}
+          </Notice>
+          <div className="line-tabs" role="group" aria-label="新来源播放线路">
+            {[
+              ...new Set<string>(
+                sourceChoice.film.episodes.map(
+                  (episode: Obj) => episode.line_name,
+                ),
+              ),
+            ].map((name, index) => (
               <button
-                key={e.id}
-                disabled={busy || !film.available}
-                className={playingId === e.id ? "active" : ""}
-                onClick={() => play(e.id)}
+                key={name}
+                className={sourceChoice.line === name ? "active" : ""}
+                disabled={busy}
+                onClick={() => setSourceChoice({ ...sourceChoice, line: name })}
               >
-                {e.title}
-                {playingId === e.id && <Play size={13} />}
+                {lineLabel(name, index)}
               </button>
             ))}
           </div>
-        ) : (
-          <Empty title="没有找到播放地址">
-            这个条目可能需要网页解析，尝试搜索其他视频源。
-          </Empty>
-        )}
-      </section>
-      {sourceChoice && (
-        <div
-          className="modal-backdrop"
-          onClick={() => !busy && setSourceChoice(null)}
-        >
-          <div className="modal" onClick={(event) => event.stopPropagation()}>
-            <button
-              className="close"
-              disabled={busy}
-              aria-label="关闭换源选集"
-              onClick={() => setSourceChoice(null)}
-            >
-              <X />
-            </button>
-            <h2>选择新来源的单集</h2>
-            <p>
-              {sourceChoice.film.source_name} · {sourceChoice.film.title}
-            </p>
-            <Notice>
-              {sourceChoice.film.switch_hint?.message ||
-                "无法确认对应集数，请选择要播放的单集。"}
-            </Notice>
-            <div className="line-tabs" role="group" aria-label="新来源播放线路">
-              {[
-                ...new Set<string>(
-                  sourceChoice.film.episodes.map(
-                    (episode: Obj) => episode.line_name,
-                  ),
-                ),
-              ].map((name, index) => (
+          <div className="episode-grid expanded">
+            {sourceChoice.film.episodes
+              .filter((episode: Obj) => episode.line_name === sourceChoice.line)
+              .map((episode: Obj) => (
                 <button
-                  key={name}
-                  className={sourceChoice.line === name ? "active" : ""}
+                  key={episode.id}
                   disabled={busy}
-                  onClick={() =>
-                    setSourceChoice({ ...sourceChoice, line: name })
-                  }
+                  onClick={() => void selectSourceEpisode(episode.id)}
                 >
-                  {lineLabel(name, index)}
+                  {episode.title}
                 </button>
               ))}
-            </div>
-            <div className="episode-grid expanded">
-              {sourceChoice.film.episodes
-                .filter(
-                  (episode: Obj) => episode.line_name === sourceChoice.line,
-                )
-                .map((episode: Obj) => (
-                  <button
-                    key={episode.id}
-                    disabled={busy}
-                    onClick={() => void selectSourceEpisode(episode.id)}
-                  >
-                    {episode.title}
-                  </button>
-                ))}
-            </div>
-            {!sourceChoice.film.episodes.length && (
-              <p>该来源没有可用的播放地址，请选择其他来源。</p>
-            )}
-            {error && <Notice kind="error">{error}</Notice>}
           </div>
-        </div>
+          {!sourceChoice.film.episodes.length && (
+            <p>该来源没有可用的播放地址，请选择其他来源。</p>
+          )}
+          {error && <Notice kind="error">{error}</Notice>}
+        </Modal>
       )}
     </>
   );
@@ -1820,7 +2068,8 @@ function FilmPage({
 function Collection({ kind }: { kind: "favorites" | "history" }) {
   const [items, setItems] = useState<Obj[] | null>(null),
     [error, setError] = useState(""),
-    [removing, setRemoving] = useState("");
+    [removing, setRemoving] = useState(""),
+    [pending, setPending] = useState<Obj | null>(null);
   const remove = async (film: Obj) => {
     if (removing) return;
     setRemoving(film.id);
@@ -1834,10 +2083,12 @@ function Collection({ kind }: { kind: "favorites" | "history" }) {
       setItems(
         (current) => current?.filter((item) => item.id !== film.id) || [],
       );
+      toast(kind === "favorites" ? "已取消收藏" : "观看记录已移除");
     } catch (error) {
       setError((error as Error).message);
     } finally {
       setRemoving("");
+      setPending(null);
     }
   };
   useEffect(() => {
@@ -1867,7 +2118,13 @@ function Collection({ kind }: { kind: "favorites" | "history" }) {
       {items === null ? (
         <Busy />
       ) : items.length ? (
-        <Cards items={items} onRemove={remove} removing={removing} />
+        <Cards
+          items={items}
+          // 取消收藏可以随时加回；观看进度移除后无法找回，先确认。
+          onRemove={kind === "favorites" ? remove : setPending}
+          removing={removing}
+          resume={kind === "history"}
+        />
       ) : (
         <Empty
           title={kind === "favorites" ? "收藏夹还很安静" : "还没有观看记录"}
@@ -1879,6 +2136,19 @@ function Collection({ kind }: { kind: "favorites" | "history" }) {
         >
           找到感兴趣的影片，开启你的观看清单。
         </Empty>
+      )}
+      {pending && (
+        <Confirm
+          title="移除这条观看记录？"
+          action="移除记录"
+          busy={!!removing}
+          onClose={() => setPending(null)}
+          onConfirm={() => void remove(pending)}
+        >
+          《{pending.title}》
+          {pending.source_name ? ` · ${pending.source_name}` : ""}{" "}
+          的观看进度将被清除，收藏不受影响。
+        </Confirm>
       )}
     </>
   );
@@ -2102,17 +2372,42 @@ function SettingsPage({
   me,
   refreshMe,
   updatePreferences,
+  routeTab,
 }: {
   me: Obj;
   refreshMe: () => void;
   updatePreferences: (value: UserPreferences) => void;
+  routeTab: string;
 }) {
-  const [tab, setTab] = useState(me.user.admin ? "sources" : "playback"),
-    [data, setData] = useState<Obj | null>(null),
+  const tabs = me.user.admin
+    ? [
+        ["sources", "订阅与视频源"],
+        ["images", "封面设置"],
+        ["playback", "播放设置"],
+        ["users", "家庭账号"],
+        ["connection", "飞牛与数据"],
+        ["account", "我的账号"],
+      ]
+    : [
+        ["images", "封面设置"],
+        ["playback", "播放设置"],
+        ["connection", "飞牛连接"],
+        ["account", "我的账号"],
+      ];
+  // 当前标签来自地址，刷新、后退和分享链接都能回到同一处。
+  const tab = tabs.some(([id]) => id === routeTab)
+    ? routeTab
+    : me.user.admin
+      ? "sources"
+      : "playback";
+  const [data, setData] = useState<Obj | null>(null),
     [users, setUsers] = useState<Obj[]>([]),
     [error, setError] = useState(""),
-    [message, setMessage] = useState(""),
     [busy, setBusy] = useState(false),
+    [sourceFilter, setSourceFilter] = useState(""),
+    [removingSubscription, setRemovingSubscription] = useState<Obj | null>(
+      null,
+    ),
     [importing, setImporting] = useState(false),
     [mode, setMode] = useState("url");
   const [usage, setUsage] = useState<SubscriptionUsage>(allUsers),
@@ -2156,11 +2451,11 @@ function SettingsPage({
     actionBusy.current = true;
     setBusy(true);
     setError("");
-    setMessage("");
+    clearToasts();
     try {
       await fn();
       await load();
-      setMessage(success);
+      toast(success);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -2174,6 +2469,11 @@ function SettingsPage({
       refreshMe();
     });
   const connection = me.public_url || location.origin;
+  const keyword = sourceFilter.trim().toLowerCase();
+  const visibleSources: Obj[] = (data?.sources || []).filter(
+    (s: Obj) =>
+      !keyword || `${s.name} ${s.source_key}`.toLowerCase().includes(keyword),
+  );
   return (
     <>
       <div className="page-heading">
@@ -2182,28 +2482,14 @@ function SettingsPage({
         <p>管理片源、播放方式与家庭账号。</p>
       </div>
       <div className="settings-tabs">
-        {(me.user.admin
-          ? [
-              ["sources", "订阅与视频源"],
-              ["images", "封面设置"],
-              ["playback", "播放设置"],
-              ["users", "家庭账号"],
-              ["connection", "飞牛与数据"],
-              ["account", "我的账号"],
-            ]
-          : [
-              ["images", "封面设置"],
-              ["playback", "播放设置"],
-              ["connection", "飞牛连接"],
-              ["account", "我的账号"],
-            ]
-        ).map(([id, label]) => (
+        {tabs.map(([id, label]) => (
           <button
             key={id}
+            aria-current={tab === id ? "page" : undefined}
             onClick={() => {
-              setTab(id);
+              go("/settings/" + id);
               setError("");
-              setMessage("");
+              clearToasts();
               if (me.user.admin && (id === "sources" || id === "users")) {
                 void load().catch((error) => setError(error.message));
               }
@@ -2214,12 +2500,8 @@ function SettingsPage({
           </button>
         ))}
       </div>
-      {error && <Notice kind="error">{error}</Notice>}
-      {message && (
-        <div className="success">
-          <Check size={16} />
-          {message}
-        </div>
+      {error && !importing && !editingUsage && (
+        <Notice kind="error">{error}</Notice>
       )}
       {tab === "sources" && me.user.admin && (
         <>
@@ -2306,12 +2588,7 @@ function SettingsPage({
                     className="icon-button"
                     title="移除订阅"
                     disabled={busy}
-                    onClick={() =>
-                      action(
-                        () => api("/subscriptions/" + s.id, "DELETE", {}),
-                        "订阅已移除，收藏和历史仍保留",
-                      )
-                    }
+                    onClick={() => setRemovingSubscription(s)}
                   >
                     <Trash2 size={17} />
                   </button>
@@ -2323,11 +2600,34 @@ function SettingsPage({
             <>
               <div className="section-title">
                 <h2>
-                  视频源 <span>{data.sources.length} SOURCES</span>
+                  视频源{" "}
+                  <span>
+                    已启用{" "}
+                    {
+                      data.sources.filter(
+                        (s: Obj) =>
+                          s.enabled && s.present && s.upstream_enabled,
+                      ).length
+                    }{" "}
+                    / {data.sources.length}
+                  </span>
                 </h2>
+                {data.sources.length > 8 && (
+                  <input
+                    className="source-filter"
+                    type="search"
+                    aria-label="筛选视频源"
+                    placeholder="筛选视频源名称"
+                    value={sourceFilter}
+                    onChange={(event) => setSourceFilter(event.target.value)}
+                  />
+                )}
               </div>
+              {!visibleSources.length && (
+                <p className="muted small">没有名称匹配的视频源。</p>
+              )}
               <div className="source-table">
-                {data.sources.map((s: Obj) => (
+                {visibleSources.map((s: Obj) => (
                   <div className="source-row" key={s.id}>
                     <div>
                       <strong>{s.name}</strong>
@@ -2584,7 +2884,7 @@ function SettingsPage({
                 onClick={() =>
                   void navigator.clipboard
                     .writeText(connection)
-                    .then(() => setMessage("连接地址已复制"))
+                    .then(() => toast("连接地址已复制"))
                     .catch(() => setError("浏览器不允许复制，请手动选择地址"))
                 }
               >
@@ -2671,13 +2971,8 @@ function SettingsPage({
         </form>
       )}
       {importing && (
-        <div
-          className="modal-backdrop"
-          onClick={() => !busy && setImporting(false)}
-        >
+        <Modal onClose={() => setImporting(false)} locked={busy}>
           <form
-            className="modal"
-            onClick={(e) => e.stopPropagation()}
             onSubmit={(e) => {
               e.preventDefault();
               action(async () => {
@@ -2694,14 +2989,6 @@ function SettingsPage({
               }, "订阅导入成功");
             }}
           >
-            <button
-              className="close"
-              type="button"
-              onClick={() => setImporting(false)}
-              aria-label="关闭"
-            >
-              <X />
-            </button>
             <span className="eyebrow">ADD YOUR SOURCE</span>
             <h2>导入配置订阅</h2>
             <p>支持 LunaTV 配置格式，自动识别 JSON 和 Base58。</p>
@@ -2757,9 +3044,11 @@ function SettingsPage({
                   accept=".json,.txt"
                   onChange={(e) => {
                     const f = e.target.files?.[0];
-                    if (f && f.size <= 4 * 1024 * 1024)
+                    if (!f) return;
+                    if (f.size <= 4 * 1024 * 1024) {
+                      setError("");
                       void f.text().then(setContent);
-                    else setError("文件不能超过 4 MiB");
+                    } else setError("文件不能超过 4 MiB");
                   }}
                 />
               </label>
@@ -2785,16 +3074,11 @@ function SettingsPage({
               导入配置
             </button>
           </form>
-        </div>
+        </Modal>
       )}
       {editingUsage && (
-        <div
-          className="modal-backdrop"
-          onClick={() => !busy && setEditingUsage(null)}
-        >
+        <Modal onClose={() => setEditingUsage(null)} locked={busy}>
           <form
-            className="modal"
-            onClick={(event) => event.stopPropagation()}
             onSubmit={(event) => {
               event.preventDefault();
               void action(async () => {
@@ -2805,15 +3089,6 @@ function SettingsPage({
               }, "订阅使用范围已保存");
             }}
           >
-            <button
-              className="close"
-              type="button"
-              aria-label="关闭"
-              disabled={busy}
-              onClick={() => setEditingUsage(null)}
-            >
-              <X />
-            </button>
             <h2>修改订阅使用用户</h2>
             <p>{editingUsage.name}</p>
             <UsageSelector
@@ -2837,9 +3112,146 @@ function SettingsPage({
               保存使用用户
             </button>
           </form>
-        </div>
+        </Modal>
+      )}
+      {removingSubscription && (
+        <Confirm
+          title="移除这份订阅？"
+          action="移除订阅"
+          busy={busy}
+          onClose={() => setRemovingSubscription(null)}
+          onConfirm={() =>
+            void action(
+              () =>
+                api("/subscriptions/" + removingSubscription.id, "DELETE", {}),
+              "订阅已移除，收藏和历史仍保留",
+            ).finally(() => setRemovingSubscription(null))
+          }
+        >
+          「{removingSubscription.name}」及其{" "}
+          {
+            (data?.sources || []).filter(
+              (s: Obj) => s.subscription_id === removingSubscription.id,
+            ).length
+          }{" "}
+          个视频源将不再用于搜索和播放。收藏与观看记录会保留并标记为来源失效；重新导入会作为新订阅，不会恢复原有关联。
+        </Confirm>
       )}
     </>
+  );
+}
+function HeaderSearch({ hidden }: { hidden: boolean }) {
+  const [q, setQ] = useState("");
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    // 按 “/” 直接开始搜索；正在输入或弹窗打开时不抢焦点。
+    const key = (e: KeyboardEvent) => {
+      if (
+        e.key !== "/" ||
+        e.ctrlKey ||
+        e.metaKey ||
+        e.altKey ||
+        modalOpen() ||
+        (e.target as HTMLElement | null)?.closest(
+          "input,textarea,select,[contenteditable]",
+        )
+      )
+        return;
+      const target =
+        input.current?.offsetParent != null
+          ? input.current
+          : document.querySelector<HTMLInputElement>(
+              ".hero-search input, .search-form input",
+            );
+      if (target) {
+        e.preventDefault();
+        target.focus();
+      }
+    };
+    document.addEventListener("keydown", key);
+    return () => document.removeEventListener("keydown", key);
+  }, []);
+  return (
+    <form
+      // 首页和搜索页已有大搜索框，这里只保留 “/” 快捷键。
+      className={hidden ? "header-search hidden" : "header-search"}
+      role="search"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!q.trim()) return;
+        go("/search?q=" + encodeURIComponent(q.trim()));
+        setQ("");
+        input.current?.blur();
+      }}
+    >
+      <Search size={16} />
+      <input
+        ref={input}
+        type="search"
+        enterKeyHint="search"
+        aria-label="搜索片名"
+        placeholder="搜索片名"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+      />
+      <kbd aria-hidden="true">/</kbd>
+    </form>
+  );
+}
+function UserMenu({ me, onLogout }: { me: Obj; onLogout: () => void }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const outside = (e: Event) => {
+      if (!root.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", key);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", key);
+    };
+  }, [open]);
+  return (
+    <div className="user-menu" ref={root}>
+      <button
+        className="avatar"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={`账号菜单：${me.user.username}`}
+        onClick={() => setOpen(!open)}
+      >
+        {me.user.username[0].toUpperCase()}
+      </button>
+      {open && (
+        <div className="menu" role="menu" onClick={() => setOpen(false)}>
+          <div className="menu-head">
+            <strong>{me.user.username}</strong>
+            <small>{me.user.admin ? "管理员" : "家庭成员"}</small>
+          </div>
+          <a role="menuitem" href="#/settings/account">
+            <Users size={16} />
+            我的账号
+          </a>
+          <a role="menuitem" href="#/settings">
+            <Settings size={16} />
+            设置
+          </a>
+          <a role="menuitem" href="#/logs">
+            <Activity size={16} />
+            播放日志
+          </a>
+          <button role="menuitem" onClick={onLogout}>
+            <LogOut size={16} />
+            退出登录
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 function App() {
@@ -2867,6 +3279,28 @@ function App() {
     refreshMe();
   }, [refreshMe]);
   const userId = me?.user.id;
+  useEffect(() => {
+    const path = route.split("?")[0];
+    const query = new URLSearchParams(route.split("?")[1] || "").get("q");
+    const name = !userId
+      ? ""
+      : path.startsWith("/search")
+        ? query
+          ? `搜索“${query}”`
+          : "搜索"
+        : path === "/favorites"
+          ? "收藏"
+          : path === "/history"
+            ? "最近观看"
+            : path === "/logs"
+              ? "播放日志"
+              : path.startsWith("/settings")
+                ? "设置"
+                : "";
+    // 影片页在读取到片名后自行更新标题。
+    if (!path.startsWith("/film/") || !userId)
+      document.title = name ? `${name} · TV Rust` : "TV Rust · 你的私人放映室";
+  }, [route, userId]);
   useEffect(() => {
     if (!userId) return;
     const sync = () => {
@@ -2906,15 +3340,28 @@ function App() {
         }}
       />
     );
+  // 手机底栏用搜索替换播放日志；日志仍可从账号菜单进入。
   const nav = [
-    ["/", "发现", Clapperboard],
-    ["/favorites", "收藏", Heart],
-    ["/history", "最近观看", Clock],
-    ["/logs", "播放日志", Activity],
-    ["/settings", "设置", Settings],
+    ["/", "发现", Clapperboard, ""],
+    ["/search", "搜索", Search, "mobile-only"],
+    ["/favorites", "收藏", Heart, ""],
+    ["/history", "最近观看", Clock, ""],
+    ["/logs", "播放日志", Activity, "desktop-only"],
+    ["/settings", "设置", Settings, ""],
   ] as const;
+  const path = route.split("?")[0];
+  const logout = () => {
+    void Promise.resolve(finishActivePlayback?.())
+      .then(() => api("/logout", "POST", {}))
+      .then(() => {
+        ++meRequest.current;
+        setMe(null);
+      })
+      .catch(() => toast("退出失败，请检查连接后重试", "error"));
+  };
   let page: React.ReactNode;
-  if (route.startsWith("/search")) page = <SearchPage route={route} />;
+  if (route.startsWith("/search"))
+    page = <SearchPage route={route} userId={me.user.id} />;
   else if (route.startsWith("/film/")) {
     const [id, query] = route.slice(6).split("?");
     const params = new URLSearchParams(query);
@@ -2932,10 +3379,11 @@ function App() {
   } else if (route === "/favorites" || route === "/history")
     page = <Collection kind={route.slice(1) as "favorites" | "history"} />;
   else if (route === "/logs") page = <Logs />;
-  else if (route === "/settings")
+  else if (path === "/settings" || path.startsWith("/settings/"))
     page = (
       <SettingsPage
         key={me.user.id}
+        routeTab={path.split("/")[2] || ""}
         me={me}
         refreshMe={refreshMe}
         updatePreferences={(preferences) => {
@@ -2954,40 +3402,28 @@ function App() {
       <header>
         <div className="header-inner">
           <Brand />
-          <nav>
-            {nav.map(([href, label, Icon]) => (
-              <a
-                href={"#" + href}
-                className={route === href ? "active" : ""}
-                key={href}
-              >
-                <Icon size={17} />
-                <span>{label}</span>
-              </a>
-            ))}
+          <nav aria-label="主导航">
+            {nav.map(([href, label, Icon, scope]) => {
+              const active =
+                href === "/"
+                  ? path === "/"
+                  : path === href || path.startsWith(href + "/");
+              return (
+                <a
+                  href={"#" + href}
+                  className={`${active ? "active" : ""} ${scope}`.trim()}
+                  aria-current={active ? "page" : undefined}
+                  key={href}
+                >
+                  <Icon size={17} />
+                  <span>{label}</span>
+                </a>
+              );
+            })}
           </nav>
           <div className="header-actions">
-            <a className="icon-button" href="#/search" aria-label="搜索">
-              <Search size={19} />
-            </a>
-            <span className="avatar" title={me.user.username}>
-              {me.user.username[0].toUpperCase()}
-            </span>
-            <button
-              className="icon-button"
-              title="退出登录"
-              onClick={() => {
-                void Promise.resolve(finishActivePlayback?.())
-                  .then(() => api("/logout", "POST", {}))
-                  .then(() => {
-                    ++meRequest.current;
-                    setMe(null);
-                  })
-                  .catch(() => {});
-              }}
-            >
-              <LogOut size={17} />
-            </button>
+            <HeaderSearch hidden={path === "/" || path.startsWith("/search")} />
+            <UserMenu me={me} onLogout={logout} />
           </div>
         </div>
       </header>
@@ -2997,6 +3433,7 @@ function App() {
         <span>好故事，总有下一幕。</span>
         <small>TV RUST · {me.version}</small>
       </footer>
+      <Toasts />
     </PreferencesContext.Provider>
   );
 }
