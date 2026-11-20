@@ -24,3 +24,11 @@
 最终浏览器证据为 `tmp/playback-lines-20261120-tcxCRR/`，包括 `results.json`、来源排序桌面截图、线路及手机截图、换源选集弹窗截图和隔离服务日志。截图已人工核对。检查日志为 `tmp/playback-lines-20261120/`，浏览器脚本为 `tmp/ui-regression-tools/playback-lines-check.mjs`。隔离服务和浏览器已停止。
 
 实际播放验收使用受控媒体，未对用户截图中的全部外部视频源作播放验收，也未进行本轮真实飞牛客户端播放。HLS 本次实际选择 360p，显示随实际解码尺寸更新；没有宣称同一次 HLS 播放自动变档已经实测。本轮没有修改用户实际数据库和生产部署。
+
+## 发布验证
+
+[GitHub Actions 工作流](https://github.com/lengyuesky/tv-rust/actions/runs/44697709617) 已成功，功能提交为 `66cd9cc005212f4b44d0c2807917345862036864`。CI 检查及网页构建 52 秒，AMD64 原生构建及启动检查 2 分 2 秒，ARM64 1 分 49 秒，合并发布 27 秒；两种架构并行，整条工作流 **3 分 29 秒**。
+
+已从 GHCR 独立核验 `ghcr.io/lengyuesky/tv-rust:latest` 与 `sha-66cd9cc005212f4b44d0c2807917345862036864` 指向同一索引，包含且仅包含 `linux/amd64`、`linux/arm64`，两个架构的镜像修订标签均匹配本次功能提交。索引摘要为 `sha256:1b3fa6700b9cdcafd2dc12b999720f1a163fff21d98abc9bc7d49000f0720641`。
+
+发布和镜像证据为 `tmp/playback-lines-20261120/ci-run.json`、`image-verification.json` 及同目录的原始索引与镜像配置。新版镜像已发布，用户实际部署尚未更新。
