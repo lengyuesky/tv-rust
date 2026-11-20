@@ -67,6 +67,12 @@ async fn harness() -> Harness {
                 {"vod_id":993,"vod_name":"你好","vod_year":"2021"}
             ],"page":"1","pagecount":6303})).into_response(),
             "/config"=>axum::Json(json!({"api_site":{"same.key":{"name":"更新源","api":"https://example.com/api"}}})).into_response(),
+            "/switch-api"=>axum::Json(json!({"list":[
+                {"vod_id":401,"vod_name":"测试电影","vod_year":"2026","vod_play_from":"备用线路","vod_play_url":"正片$https://example.com/movie.mp4"},
+                {"vod_id":402,"vod_name":"测试电影","vod_year":"2025"},
+                {"vod_id":403,"vod_name":"测试电影","vod_year":"2026","vod_remarks":"导演剪辑"},
+                {"vod_id":404,"vod_name":"测试电影外传","vod_year":"2026"}
+            ],"pagecount":1})).into_response(),
             _=>{
                 if req.headers().get("range").is_some(){Response::builder().status(206).header("content-range","bytes 2-5/8").header("accept-ranges","bytes").body(Body::from("2345")).unwrap()}
                 else{Response::builder().header("content-type","video/mp4").body(Body::from("01234567")).unwrap()}
@@ -1491,6 +1497,212 @@ async fn native_progress_rejects_a_conflicting_play_link() {
         .await
         .unwrap();
     assert_eq!(view["progress"]["position"], 12.0);
+}
+
+#[tokio::test]
+async fn playback_sources_discover_only_the_same_work_and_obey_access() {
+    let h = harness().await;
+    let primary = catalog::sources(&h.app).await.unwrap().remove(0);
+    let api = url::Url::parse(&primary.api)
+        .unwrap()
+        .join("/switch-api")
+        .unwrap()
+        .to_string();
+    let subscription = catalog::import(&h.app, &json!({"name":"换源订阅","content":json!({"api_site":{"backup":{"name":"备用源","api":api}}}).to_string()})).await.unwrap();
+    let path = format!("/api/films/{}/sources", h.film);
+    let hits = h.hits.load(Ordering::Relaxed);
+    let (status, cached) = request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(status, 200);
+    assert_eq!(cached["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "已保存来源列表无需上游请求"
+    );
+    let (_, discovered) = request(
+        &h,
+        "GET",
+        &format!("{path}?refresh=1"),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(
+        discovered["items"].as_array().unwrap().len(),
+        2,
+        "排除年份不同、剪辑不同和片名包含匹配"
+    );
+    let discovered_hits = h.hits.load(Ordering::Relaxed);
+    request(
+        &h,
+        "GET",
+        &format!("{path}?discover=1"),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        discovered_hits,
+        "首次展开可复用搜索缓存"
+    );
+    request(
+        &h,
+        "GET",
+        &format!("{path}?refresh=1"),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert!(
+        h.hits.load(Ordering::Relaxed) > discovered_hits,
+        "手动刷新必须重新查询上游"
+    );
+    let backup = discovered["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["source_name"] == "备用源")
+        .unwrap();
+    assert_eq!(backup["title"], "测试电影");
+    assert!(backup["episodes"].is_null(), "来源列表不交付媒体 URL");
+    let episode = catalog::episodes(&h.app, &h.film).await.unwrap().remove(0);
+    let (status, view) = request(
+        &h,
+        "GET",
+        &format!(
+            "/api/films/{}?switch_from={}&switch_episode={}",
+            text(backup, "id"),
+            h.film,
+            episode.id
+        ),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(view["switch_hint"]["matched"], true);
+    assert_eq!(view["switch_hint"]["episode_title"], "正片");
+    access::save_usage(
+        &h.app,
+        &subscription,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    let (_, revoked) = request(
+        &h,
+        "GET",
+        &format!("{path}?refresh=1"),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(revoked["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        request(
+            &h,
+            "GET",
+            &format!(
+                "/api/films/{}?switch_from={}&switch_episode={}",
+                text(backup, "id"),
+                h.film,
+                episode.id
+            ),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(request(&h, "GET", &path, json!({}), None).await.0, 401);
+    access::save_usage(
+        &h.app,
+        &primary.subscription_id,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        request(&h, "GET", &path, json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        403
+    );
+}
+
+#[tokio::test]
+async fn quick_switch_matches_the_current_episode_without_saved_progress() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let original = catalog::ingest(&h.app,&source,&json!({"vod_id":701,"vod_name":"快速换源剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"原线路","vod_play_url":"第01集$https://example.com/1.m3u8#第03集$https://example.com/3.m3u8"}),true).await.unwrap().unwrap();
+    let target = catalog::ingest(&h.app,&source,&json!({"vod_id":702,"vod_name":"快速换源剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"普通$$$重复线路","vod_play_url":"第一集$https://example.com/one.m3u8#第三集$https://example.com/three.m3u8$$$第03集$https://example.com/a.m3u8#第003集$https://example.com/b.m3u8"}),true).await.unwrap().unwrap();
+    let episode = catalog::episodes(&h.app, &original.id)
+        .await
+        .unwrap()
+        .remove(1);
+    let path = format!(
+        "/api/films/{}?switch_from={}&switch_episode={}",
+        target.id, original.id, episode.id
+    );
+    let (status, view) = request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(status, 200);
+    assert_eq!(view["switch_hint"]["matched"], true);
+    assert_eq!(
+        view["switch_hint"]["episode_title"], "第三集",
+        "按实际标签匹配而非列表顺序"
+    );
+    assert!(view["progress"].is_null(), "快速换源不复制个人进度");
+    let (_, ambiguous) = request(
+        &h,
+        "GET",
+        &format!(
+            "{path}&switch_line={}",
+            url::form_urlencoded::byte_serialize("重复线路".as_bytes()).collect::<String>()
+        ),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(ambiguous["switch_hint"]["matched"], false);
+    let invalid = format!(
+        "/api/films/{}?switch_from={}&switch_episode={}",
+        target.id, original.id, h.episode
+    );
+    assert_eq!(
+        request(&h, "GET", &invalid, json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        400
+    );
+}
+
+#[tokio::test]
+async fn playback_reports_measured_quality_without_fabricating_unknown_streams() {
+    let h = harness().await;
+    let unknown = playback::start(&h.app, &h.who, &h.episode).await.unwrap();
+    assert_eq!(unknown["quality"]["codec"], "");
+    assert_eq!(unknown["quality"]["height"].as_f64(), Some(0.0));
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(json!({"kind":"mp4","duration":120,"size":8,"warning":"","streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30000/1001","bit_rate":"5000000"}]}).to_string())
+        .bind(now()).bind(&h.episode).execute(&h.app.db).await.unwrap();
+    let (status, measured) = request(
+        &h,
+        "POST",
+        "/api/plays",
+        json!({"episode_id":h.episode}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(measured["quality"]["width"].as_f64(), Some(1920.0));
+    assert_eq!(measured["quality"]["height"].as_f64(), Some(1080.0));
+    assert_eq!(measured["quality"]["codec"], "h264");
+    assert!((measured["quality"]["frame_rate"].as_f64().unwrap() - 29.97).abs() < 0.01);
+    assert_eq!(measured["source_name"], "测试源");
+    assert_eq!(measured["line_name"], "line");
+    assert_eq!(measured["episode_title"], "正片");
 }
 
 #[tokio::test]

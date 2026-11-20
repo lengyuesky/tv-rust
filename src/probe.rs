@@ -320,3 +320,36 @@ pub async fn get(app: &App, e: &Episode) -> Result<MediaInfo> {
 pub fn video(info: &MediaInfo) -> Value {
     info.streams.iter().find(|v|v["codec_type"]=="video").cloned().unwrap_or(json!({"index":0,"codec_type":"video","codec_name":"h264","width":0,"height":0,"level":0,"pix_fmt":"yuv420p"}))
 }
+
+pub fn quality(info: &MediaInfo) -> Value {
+    // 网页只展示实际探测字段，不采用协议适配中的缺省 H.264 占位。
+    let video = info.streams.iter().find(|v| v["codec_type"] == "video");
+    let number = |key: &str| {
+        video
+            .and_then(|v| match &v[key] {
+                Value::Number(n) => n.as_f64(),
+                Value::String(s) => s.parse().ok(),
+                _ => None,
+            })
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .unwrap_or(0.0)
+    };
+    let rate = |key: &str| {
+        let raw = video.map(|v| text(v, key)).unwrap_or_default();
+        let fps = if let Some((a, b)) = raw.split_once('/') {
+            a.parse::<f64>()
+                .ok()
+                .zip(b.parse::<f64>().ok())
+                .map(|(a, b)| a / b)
+        } else {
+            raw.parse::<f64>().ok()
+        };
+        fps.filter(|n| n.is_finite() && *n > 0.0 && *n <= 1000.0)
+            .unwrap_or(0.0)
+    };
+    let average = rate("avg_frame_rate");
+    json!({"width":number("width"),"height":number("height"),
+        "codec":video.map(|v|text(v,"codec_name")).unwrap_or_default(),
+        "frame_rate":if average>0.0 {average} else {rate("r_frame_rate")},
+        "bitrate":number("bit_rate")})
+}

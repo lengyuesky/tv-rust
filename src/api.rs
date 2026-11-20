@@ -269,6 +269,19 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         .split('/')
         .collect::<Vec<_>>();
     match parts.as_slice() {
+        ["films", id, "sources"] if method == Method::GET => {
+            let refresh = query.get("refresh").is_some_and(|value| value == "1");
+            return Ok(json_response(
+                catalog::playback_sources(
+                    app,
+                    &who.user.id,
+                    id,
+                    refresh || query.get("discover").is_some_and(|value| value == "1"),
+                    refresh,
+                )
+                .await?,
+            ));
+        }
         ["films", id, "posters"] if method == Method::GET => {
             return Ok(json_response(
                 catalog::film_posters(app, &who.user.id, id).await?,
@@ -341,7 +354,24 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
             let mut v = catalog::view(app, &who.user.id, id, true).await?;
             v["warning"] = json!(warning);
             if let Some(from) = query.get("switch_from").filter(|s| !s.is_empty()) {
-                v["switch_hint"] = catalog::switch_hint(app, &who.user.id, id, from).await?;
+                v["switch_hint"] = if let Some(episode) =
+                    query.get("switch_episode").filter(|s| !s.is_empty())
+                {
+                    let position: Option<f64> = sqlx::query_scalar("SELECT position FROM progress WHERE user_id=? AND film_id=? AND episode_id=?")
+                            .bind(&who.user.id).bind(from).bind(episode).fetch_optional(&app.db).await?;
+                    catalog::switch_episode_hint(
+                        app,
+                        &who.user.id,
+                        id,
+                        from,
+                        episode,
+                        query.get("switch_line").map(String::as_str),
+                        position.unwrap_or(0.0),
+                    )
+                    .await?
+                } else {
+                    catalog::switch_hint(app, &who.user.id, id, from).await?
+                };
             }
             return Ok(json_response(v));
         }

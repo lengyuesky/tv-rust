@@ -145,11 +145,26 @@ pub async fn switch_hint(app: &App, user: &str, target_id: &str, from_id: &str) 
             json!({"matched":false,"message":"原来源尚无可用观看进度，请在新来源选择要播放的单集。"}),
         );
     };
+    switch_episode_hint(app, user, target_id, from_id, &episode_id, None, position).await
+}
+
+pub async fn switch_episode_hint(
+    app: &App,
+    user: &str,
+    target_id: &str,
+    from_id: &str,
+    episode_id: &str,
+    line: Option<&str>,
+    position: f64,
+) -> Result<Value> {
     let from = film(app, from_id).await?;
     let target = film(app, target_id).await?;
     access::require_source(app, user, &from.source_id).await?;
     access::require_source(app, user, &target.source_id).await?;
-    let original = episode(app, &episode_id).await?;
+    let original = episode(app, episode_id).await?;
+    if original.film_id != from.id {
+        return Err(Error::bad("换源单集不属于当前影片"));
+    }
     let source = source(app, &from.source_id).await?;
     let mut hint = json!({"matched":false,"from_episode":original.title,"from_position":position,"from_source":source.name,
         "message":"无法确认对应单集，请核对版本并重新选集。"});
@@ -161,13 +176,24 @@ pub async fn switch_hint(app: &App, user: &str, target_id: &str, from_id: &str) 
         hint["message"] = json!("标题、年份或版本无法确认一致，请在新来源重新选集。");
         return Ok(hint);
     }
-    let candidates = episodes(app, target_id).await?;
+    let candidates: Vec<_> = episodes(app, target_id)
+        .await?
+        .into_iter()
+        .filter(|e| line.is_none_or(|name| e.line_name == name))
+        .collect();
     let matching = if from.kind == "Movie" {
         // 花絮、预告和多个剪辑不猜测为正片。
         if original.title.trim() != "正片" {
             None
         } else {
-            candidates.iter().find(|e| e.title.trim() == "正片")
+            let mut lines = BTreeMap::<i64, Vec<&Episode>>::new();
+            for e in candidates.iter().filter(|e| e.title.trim() == "正片") {
+                lines.entry(e.line_order).or_default().push(e);
+            }
+            lines
+                .into_values()
+                .next()
+                .and_then(|matches| (matches.len() == 1).then(|| matches[0]))
         }
     } else if let Some(number) = episode_number(&original.title) {
         let mut lines = BTreeMap::<i64, Vec<&Episode>>::new();
@@ -194,6 +220,64 @@ pub async fn switch_hint(app: &App, user: &str, target_id: &str, from_id: &str) 
         ));
     }
     Ok(hint)
+}
+
+pub async fn playback_sources(
+    app: &App,
+    user: &str,
+    id: &str,
+    discover: bool,
+    refresh: bool,
+) -> Result<Value> {
+    let current = film(app, id).await?;
+    access::require_source(app, user, &current.source_id).await?;
+    let status = if discover {
+        search_inner(app, user, &current.title, 1, None, refresh).await?["sources"].clone()
+    } else {
+        json!([])
+    };
+    let allowed: HashSet<_> = access::sources(app, user)
+        .await?
+        .into_iter()
+        .filter(Source::active)
+        .map(|s| s.id)
+        .collect();
+    let rows: Vec<Film> = sqlx::query_as::<_, Film>(
+        "SELECT * FROM films WHERE lower(trim(title))=? AND trim(year)=? AND kind=? ORDER BY updated_at DESC,id",
+    ).bind(current.title.trim().to_lowercase()).bind(current.year.trim()).bind(&current.kind)
+        .fetch_all(&app.db).await?;
+    let mut items = Vec::new();
+    if known_year(current.year.trim()) {
+        for f in rows {
+            if !allowed.contains(&f.source_id) || group_key(&f) != group_key(&current) {
+                continue;
+            }
+            let source = source(app, &f.source_id).await?;
+            items.push(
+                json!({"id":f.id,"title":f.title,"year":f.year,"kind":f.kind,
+                "source_id":source.id,"source_name":source.name,"remarks":f.remarks}),
+            );
+            if items.len() >= 100 {
+                break;
+            }
+        }
+    }
+    access::require_source(app, user, &current.source_id).await?;
+    let fresh: HashSet<_> = access::sources(app, user)
+        .await?
+        .into_iter()
+        .filter(Source::active)
+        .map(|s| s.id)
+        .collect();
+    items.retain(|item| fresh.contains(&text(item, "source_id")));
+    let sources: Vec<_> = status
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| fresh.contains(&text(s, "id")))
+        .cloned()
+        .collect();
+    Ok(json!({"items":items,"sources":sources}))
 }
 #[derive(Deserialize)]
 struct Config {
@@ -657,6 +741,17 @@ pub async fn search(
     page: i64,
     source_filter: Option<&str>,
 ) -> Result<Value> {
+    search_inner(app, user, query, page, source_filter, false).await
+}
+
+async fn search_inner(
+    app: &App,
+    user: &str,
+    query: &str,
+    page: i64,
+    source_filter: Option<&str>,
+    refresh: bool,
+) -> Result<Value> {
     let query = query.trim();
     if search_text(query).is_empty() || query.chars().count() > 100 || !(1..=500).contains(&page) {
         return Err(Error::bad("关键词或页码无效"));
@@ -677,7 +772,7 @@ pub async fn search(
                 .join(",")
         ))
     );
-    if let Some(v) = app.cache_get(&key).await? {
+    if !refresh && let Some(v) = app.cache_get(&key).await? {
         return filter_search(app, user, v).await;
     }
     let results = stream::iter(enabled.into_iter().map(|s| async move {

@@ -139,7 +139,7 @@ async fn register_assets(app: &App, p: &Play, resources: &BTreeMap<String, Strin
     Ok(())
 }
 pub async fn start(app: &App, who: &Identity, episode_id: &str) -> Result<Value> {
-    let (e, f, _) = catalog::available(app, &who.user.id, episode_id).await?;
+    let (e, f, source) = catalog::available(app, &who.user.id, episode_id).await?;
     let info = probe::get(app, &e).await?;
     let id = guid(&[&random()]);
     let access = random();
@@ -169,7 +169,8 @@ pub async fn start(app: &App, who: &Identity, episode_id: &str) -> Result<Value>
     valid(app, &get(app, &id).await?).await?;
     Ok(
         json!({"id":id,"episode_id":e.id,"url":e.url,"mode":"direct","kind":info.kind,"duration":info.duration,
-        "position":position,"allow_proxy":!*app.forbid_proxy.borrow(),"proxy_url":format!("/media/{access}/{root}"),"warning":info.warning}),
+        "position":position,"allow_proxy":!*app.forbid_proxy.borrow(),"proxy_url":format!("/media/{access}/{root}"),"warning":info.warning,
+        "quality":probe::quality(&info),"source_id":source.id,"source_name":source.name,"line_name":e.line_name,"episode_title":e.title}),
     )
 }
 pub async fn proxy_allowed(app: &App, p: &Play) -> Result<()> {

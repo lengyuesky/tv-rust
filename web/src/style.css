@@ -1064,6 +1064,90 @@ section {
   color: #777f8b;
   font-size: 12px;
   background: #141922;
+  flex-wrap: wrap;
+}
+.player-quality {
+  color: #bdc9b3;
+  overflow-wrap: anywhere;
+}
+.playback-sources {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+  background: #11171d;
+  margin: 0 0 28px;
+}
+.playback-source-top,
+.playback-source-heading {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.playback-source-top > div {
+  flex: 1;
+  min-width: 150px;
+}
+.playback-source-top strong {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.playback-source-top small {
+  display: block;
+  color: var(--muted);
+  margin-top: 6px;
+}
+.playback-source-top label {
+  margin: 0;
+  font-size: 12px;
+  gap: 4px;
+  max-width: 220px;
+}
+.playback-source-top select {
+  padding: 8px;
+}
+.playback-source-heading p {
+  flex: 1;
+  min-width: 160px;
+  margin: 16px 0;
+  font-size: 12px;
+}
+.playback-source-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.playback-source-options button {
+  text-align: left;
+  border: 1px solid #303c48;
+  border-radius: 8px;
+  padding: 12px;
+  position: relative;
+}
+.playback-source-options button.active {
+  color: var(--accent);
+  border-color: #658451;
+  opacity: 1;
+}
+.playback-source-options button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.playback-source-options strong {
+  display: block;
+  font-size: 13px;
+  margin-right: 20px;
+  overflow-wrap: anywhere;
+}
+.playback-source-options small {
+  display: block;
+  color: var(--muted);
+  margin-top: 5px;
+}
+.playback-source-options svg {
+  position: absolute;
+  right: 10px;
+  top: 14px;
 }
 .player-top > button {
   margin-left: auto;
@@ -2102,8 +2186,11 @@ footer > small {
     padding: 7px 10px;
     gap: 9px;
   }
-  .player-top > span:nth-child(2) {
-    display: none;
+  .player-top .player-quality {
+    flex-basis: 100%;
+    order: 1;
+    font-size: 11px;
+    line-height: 1.6;
   }
   .player-top .ghost {
     font-size: 10px;

@@ -45,6 +45,11 @@ import {
   type UserPreferences,
 } from "./image-source";
 import { PreferencesContext } from "./preferences";
+import {
+  currentQuality,
+  qualityLabel,
+  type VideoQuality,
+} from "./playback-quality";
 
 type Obj = Record<string, any>;
 const time = (s: number) =>
@@ -60,22 +65,36 @@ const go = (path: string) => {
     .catch(() => {});
 };
 function useRoute() {
-  const [route, set] = useState(location.hash.slice(1) || "/");
+  const [navigation, set] = useState({
+    route: location.hash.slice(1) || "/",
+    key: 0,
+  });
   useEffect(() => {
-    const fn = async () => {
+    let sequence = 0,
+      restore = "";
+    const fn = async (event: HashChangeEvent) => {
+      const request = ++sequence;
+      const route = new URL(event.newURL).hash.slice(1) || "/";
+      restore ||= new URL(event.oldURL).hash || "#/";
       try {
         await finishActivePlayback?.();
-        set(location.hash.slice(1) || "/");
+        if (request !== sequence) return;
+        // 自动换源后会清理 URL 参数；再次进入相同换源地址仍是一次新导航。
+        set((old) => ({ route, key: old.key + 1 }));
+        restore = "";
         window.scrollTo(0, 0);
       } catch {
         // 最终快照未保存时保留播放器，让用户看到同步错误并重试。
-        history.replaceState(null, "", "#" + route);
+        if (request === sequence) {
+          history.replaceState(null, "", restore);
+          restore = "";
+        }
       }
     };
     addEventListener("hashchange", fn);
     return () => removeEventListener("hashchange", fn);
-  }, [route]);
-  return route;
+  }, []);
+  return navigation;
 }
 function Notice({
   children,
@@ -677,6 +696,10 @@ type PlayerState = {
   duration: number;
   allow_proxy: boolean;
   warning?: string;
+  quality?: VideoQuality;
+  source_name?: string;
+  line_name?: string;
+  episode_title?: string;
 };
 type PlayerHandle = { finish: () => Promise<void> };
 type PlayerProps = {
@@ -703,6 +726,8 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     [error, setError] = useState(""),
     [syncError, setSyncError] = useState(""),
     [switching, setSwitching] = useState(false),
+    [renderedQuality, setRenderedQuality] = useState<VideoQuality>({}),
+    [levelQuality, setLevelQuality] = useState<VideoQuality | undefined>(),
     [speed, setSpeed] = useState("1");
   active.current = state;
   const event = useCallback(
@@ -807,7 +832,14 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     v.removeAttribute("src");
     v.load();
     reportedPlaying.current = false;
+    setRenderedQuality({});
+    setLevelQuality(undefined);
+    const dimensions = () => {
+      if (!disposed && v.videoWidth > 0 && v.videoHeight > 0)
+        setRenderedQuality({ width: v.videoWidth, height: v.videoHeight });
+    };
     const loaded = () => {
+      dimensions();
       if (position.current > 0 && Number.isFinite(v.duration))
         v.currentTime = Math.min(
           position.current,
@@ -825,6 +857,7 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
       else setError("当前媒体播放失败。可以切换来源，或手动尝试转发。");
     };
     v.addEventListener("loadedmetadata", loaded);
+    v.addEventListener("resize", dimensions);
     v.addEventListener("timeupdate", remember);
     v.addEventListener("error", fail);
     if (state.kind === "hls") {
@@ -846,6 +879,19 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
           hls.current = instance;
           instance.loadSource(state.url);
           instance.attachMedia(v);
+          instance.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
+            if (disposed) return;
+            const level = instance.levels[data.level];
+            if (level)
+              setLevelQuality({
+                width: level.width,
+                height: level.height,
+                codec: level.videoCodec,
+                frame_rate: level.frameRate,
+                bitrate: level.bitrate,
+              });
+            dimensions();
+          });
           instance.on(Hls.Events.ERROR, (_event, data) => {
             if (!data.fatal || disposed) return;
             event("error");
@@ -873,6 +919,7 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
       ready.current = false;
       disposed = true;
       v.removeEventListener("loadedmetadata", loaded);
+      v.removeEventListener("resize", dimensions);
       v.removeEventListener("timeupdate", remember);
       v.removeEventListener("error", fail);
       hls.current?.destroy();
@@ -917,6 +964,8 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     void finish()
       .then(() => onNext?.())
       .catch(() => {});
+  const quality = currentQuality(state.quality, renderedQuality, levelQuality);
+  const label = qualityLabel(quality);
   return (
     <div className="player-shell">
       <div className="player-top">
@@ -924,7 +973,13 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
           <span />
           {state.mode === "direct" ? "直链播放" : "转发播放"}
         </span>
-        <span>{switching ? "正在切换转发…" : "原始画质"}</span>
+        <span className="player-quality" aria-label="当前画质">
+          {switching
+            ? "正在切换转发…"
+            : label === "画质待识别"
+              ? label
+              : `${renderedQuality.width ? "实际画质" : "探测画质"}：${label}`}
+        </span>
         <button className="ghost" onClick={close}>
           <X size={17} />
           关闭播放器
@@ -1000,26 +1055,203 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     </div>
   );
 });
-function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
+function PlaybackSources({
+  film,
+  session,
+  line,
+  busy,
+  onSelect,
+}: {
+  film: Obj;
+  session: PlayerState | null;
+  line: string;
+  busy: boolean;
+  onSelect: (id: string, line?: string) => void;
+}) {
+  const [items, setItems] = useState<Obj[]>([]),
+    [status, setStatus] = useState<Obj[]>([]),
+    [open, setOpen] = useState(false),
+    [loading, setLoading] = useState(false),
+    [error, setError] = useState(""),
+    [discovered, setDiscovered] = useState(false);
+  const controller = useRef<AbortController | null>(null);
+  const sequence = useRef(0);
+  const load = useCallback(
+    async (discover: boolean, refresh = false) => {
+      controller.current?.abort();
+      const request = ++sequence.current;
+      const abort = new AbortController();
+      controller.current = abort;
+      setLoading(true);
+      setError("");
+      try {
+        const result = await api(
+          `/films/${film.id}/sources${refresh ? "?refresh=1" : discover ? "?discover=1" : ""}`,
+          "GET",
+          undefined,
+          false,
+          abort.signal,
+        );
+        if (request === sequence.current && !abort.signal.aborted) {
+          setItems(result.items);
+          setStatus(result.sources);
+          if (discover) setDiscovered(true);
+        }
+      } catch (error) {
+        if (!abort.signal.aborted) setError((error as Error).message);
+      } finally {
+        if (request === sequence.current && !abort.signal.aborted)
+          setLoading(false);
+      }
+    },
+    [film.id],
+  );
+  useEffect(() => {
+    void load(false);
+    return () => controller.current?.abort();
+  }, [load]);
+  const lines = [
+    ...new Set<string>(film.episodes.map((episode: Obj) => episode.line_name)),
+  ];
+  const alternatives = items.filter((item) => item.id !== film.id);
+  return (
+    <section className="playback-sources" aria-label="播放源">
+      <div className="playback-source-top">
+        <div>
+          <strong>当前播放源：{film.source_name}</strong>
+          <small>{session?.episode_title || "选择单集开始播放"}</small>
+        </div>
+        {lines.length > 1 && (
+          <label>
+            播放线路
+            <select
+              aria-label="快速切换播放线路"
+              disabled={busy}
+              value={session?.line_name || line}
+              onChange={(event) => onSelect(film.id, event.target.value)}
+            >
+              {lines.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        <button
+          className="outline"
+          disabled={busy}
+          aria-expanded={open}
+          onClick={() => {
+            setOpen(!open);
+            if (!open && !discovered) void load(true);
+          }}
+        >
+          <RefreshCw size={16} />
+          切换播放源
+        </button>
+      </div>
+      {open && (
+        <>
+          <div className="playback-source-heading">
+            <p>同一作品可直接换源；能确认集数时自动切换，进度按来源保存。</p>
+            <button
+              className="ghost"
+              disabled={loading || busy}
+              onClick={() => void load(true, true)}
+            >
+              <RefreshCw className={loading ? "spin" : ""} size={15} />
+              刷新来源
+            </button>
+          </div>
+          {error && <Notice kind="error">{error}</Notice>}
+          {loading && (
+            <p className="small muted" role="status">
+              正在查找其他可用源…
+            </p>
+          )}
+          <div className="playback-source-options">
+            <button className="active" disabled aria-current="true">
+              <strong>{film.source_name}</strong>
+              <small>当前来源</small>
+            </button>
+            {alternatives.map((item) => (
+              <button
+                key={item.id}
+                disabled={busy}
+                onClick={() => onSelect(item.id)}
+              >
+                <strong>{item.source_name}</strong>
+                <small>
+                  {item.year} · {item.remarks || "切换来源"}
+                </small>
+                <ArrowRight size={16} />
+              </button>
+            ))}
+          </div>
+          {!loading && !alternatives.length && (
+            <p className="small muted">
+              暂未找到标题、年份和版本一致的其他来源，可刷新或在搜索页查找。
+            </p>
+          )}
+          {status.some((source) => !source.ok) && (
+            <p className="small muted">
+              {status.filter((source) => !source.ok).length}{" "}
+              个源暂未响应，已显示其余可用结果。
+            </p>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function FilmPage({
+  id,
+  switchFrom,
+  switchEpisode,
+  switchLine,
+  autoPlay,
+  playEpisode,
+}: {
+  id: string;
+  switchFrom: string;
+  switchEpisode: string;
+  switchLine: string;
+  autoPlay: boolean;
+  playEpisode: string;
+}) {
   const player = useRef<PlayerHandle>(null);
+  const operation = useRef(false),
+    pageActive = useRef(true);
   const [film, setFilm] = useState<Obj | null>(null),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [line, setLine] = useState(""),
     [session, setSession] = useState<PlayerState | null>(null),
     [playingId, setPlayingId] = useState(""),
-    [selecting, setSelecting] = useState(false);
+    [selecting, setSelecting] = useState(false),
+    [sourceChoice, setSourceChoice] = useState<{
+      film: Obj;
+      line: string;
+    } | null>(null);
+  useEffect(() => {
+    pageActive.current = true;
+    return () => {
+      pageActive.current = false;
+    };
+  }, []);
   useEffect(() => {
     let active = true;
     setSession(null);
     setFilm(null);
     setError("");
-    api(
-      "/films/" +
-        id +
-        (switchFrom ? "?switch_from=" + encodeURIComponent(switchFrom) : ""),
-    )
-      .then((f) => {
+    const query = new URLSearchParams();
+    if (switchFrom) query.set("switch_from", switchFrom);
+    if (switchEpisode) query.set("switch_episode", switchEpisode);
+    if (switchLine) query.set("switch_line", switchLine);
+    api(`/films/${id}${query.size ? "?" + query.toString() : ""}`)
+      .then(async (f) => {
         if (!active) return;
         setFilm(f);
         setLine(
@@ -1030,6 +1262,44 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
             f.episodes?.[0]?.line_name ||
             "",
         );
+        if (autoPlay) {
+          const episodeId =
+            playEpisode &&
+            f.episodes.some((episode: Obj) => episode.id === playEpisode)
+              ? playEpisode
+              : f.switch_hint?.matched
+                ? f.switch_hint.episode_id
+                : "";
+          if (!episodeId || !f.available) return;
+          operation.current = true;
+          setBusy(true);
+          try {
+            const started = await api("/plays", "POST", {
+              episode_id: episodeId,
+            });
+            if (!active) {
+              void api(`/plays/${started.id}/end`, "POST", {}).catch(() => {});
+              return;
+            }
+            // 同一影片内部切线路承接本次位置；跨来源仍用各自的进度。
+            if (id === switchFrom && f.switch_hint?.matched && !playEpisode)
+              started.position =
+                f.switch_hint.from_position || started.position;
+            setSession(started);
+            setPlayingId(episodeId);
+            setLine(
+              f.episodes.find((episode: Obj) => episode.id === episodeId)
+                ?.line_name || "",
+            );
+            setFilm({ ...f, switch_hint: null });
+            history.replaceState(null, "", `#/film/${id}`);
+          } catch (error) {
+            if (active) setError((error as Error).message);
+          } finally {
+            operation.current = false;
+            if (active) setBusy(false);
+          }
+        }
       })
       .catch((e) => {
         if (active) setError(e.message);
@@ -1037,7 +1307,7 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
     return () => {
       active = false;
     };
-  }, [id, switchFrom]);
+  }, [id, switchFrom, switchEpisode, switchLine, autoPlay, playEpisode]);
   const refreshProgress = async () => {
     try {
       const f = await api("/films/" + id);
@@ -1051,13 +1321,18 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
     }
   };
   const play = async (eid: string) => {
-    if (busy) return;
+    if (operation.current) return;
+    operation.current = true;
     setBusy(true);
     setError("");
     try {
       await player.current?.finish();
       setSession(null);
       const s = await api("/plays", "POST", { episode_id: eid });
+      if (!pageActive.current) {
+        void api(`/plays/${s.id}/end`, "POST", {}).catch(() => {});
+        return;
+      }
       setSession(s);
       setPlayingId(eid);
       setFilm((f) => f && { ...f, switch_hint: null });
@@ -1065,6 +1340,7 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      operation.current = false;
       setBusy(false);
     }
   };
@@ -1079,8 +1355,66 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
   const hint = film.switch_hint;
   const current = hint
     ? film.episodes.find((e: Obj) => e.id === hint.episode_id)
-    : film.episodes.find((e: Obj) => e.id === film.progress?.episode_id) ||
+    : episodes.find((e: Obj) => e.id === playingId) ||
+      film.episodes.find((e: Obj) => e.id === film.progress?.episode_id) ||
       episodes[0];
+  const sourceRoute = (target: string, chosenEpisode = "", targetLine = "") => {
+    const query = new URLSearchParams({ switch_from: id });
+    const originalEpisode = playingId || current?.id;
+    if (originalEpisode) query.set("switch_episode", originalEpisode);
+    if (targetLine) query.set("switch_line", targetLine);
+    if (session) query.set("autoplay", "1");
+    if (chosenEpisode) query.set("play_episode", chosenEpisode);
+    return `/film/${target}?${query.toString()}`;
+  };
+  const selectSource = async (target: string, targetLine = "") => {
+    if (operation.current) return;
+    if (!session) {
+      if (target === id) setLine(targetLine);
+      else go(sourceRoute(target, "", targetLine));
+      return;
+    }
+    operation.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      const route = sourceRoute(target, "", targetLine);
+      const prepared = await api(`/films/${route.slice(6)}`);
+      if (!pageActive.current) return;
+      if (!prepared.available)
+        throw new Error(prepared.unavailable_reason || "该来源暂不可用");
+      if (prepared.switch_hint?.matched) {
+        await player.current?.finish();
+        if (pageActive.current) go(route);
+      } else {
+        setSourceChoice({
+          film: prepared,
+          line: targetLine || prepared.episodes[0]?.line_name || "",
+        });
+      }
+    } catch (error) {
+      if (pageActive.current) setError((error as Error).message);
+    } finally {
+      operation.current = false;
+      if (pageActive.current) setBusy(false);
+    }
+  };
+  const selectSourceEpisode = async (episodeId: string) => {
+    if (operation.current || !sourceChoice) return;
+    operation.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      await player.current?.finish();
+      if (pageActive.current)
+        go(sourceRoute(sourceChoice.film.id, episodeId, sourceChoice.line));
+    } catch (error) {
+      if (pageActive.current) setError((error as Error).message);
+    } finally {
+      operation.current = false;
+      if (pageActive.current) setBusy(false);
+    }
+  };
   const favorite = async () => {
     try {
       await api(
@@ -1115,6 +1449,13 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
           }
         />
       )}
+      <PlaybackSources
+        film={film}
+        session={session}
+        line={line}
+        busy={busy}
+        onSelect={(target, targetLine) => void selectSource(target, targetLine)}
+      />
       <div className="film-detail">
         <div className="detail-poster">
           <Poster film={film} />
@@ -1250,6 +1591,70 @@ function FilmPage({ id, switchFrom }: { id: string; switchFrom: string }) {
           </Empty>
         )}
       </section>
+      {sourceChoice && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !busy && setSourceChoice(null)}
+        >
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <button
+              className="close"
+              disabled={busy}
+              aria-label="关闭换源选集"
+              onClick={() => setSourceChoice(null)}
+            >
+              <X />
+            </button>
+            <h2>选择新来源的单集</h2>
+            <p>
+              {sourceChoice.film.source_name} · {sourceChoice.film.title}
+            </p>
+            <Notice>
+              {sourceChoice.film.switch_hint?.message ||
+                "无法确认对应集数，请选择要播放的单集。"}
+            </Notice>
+            <div className="line-tabs">
+              {[
+                ...new Set<string>(
+                  sourceChoice.film.episodes.map(
+                    (episode: Obj) => episode.line_name,
+                  ),
+                ),
+              ].map((name) => (
+                <button
+                  key={name}
+                  className={sourceChoice.line === name ? "active" : ""}
+                  disabled={busy}
+                  onClick={() =>
+                    setSourceChoice({ ...sourceChoice, line: name })
+                  }
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+            <div className="episode-grid expanded">
+              {sourceChoice.film.episodes
+                .filter(
+                  (episode: Obj) => episode.line_name === sourceChoice.line,
+                )
+                .map((episode: Obj) => (
+                  <button
+                    key={episode.id}
+                    disabled={busy}
+                    onClick={() => void selectSourceEpisode(episode.id)}
+                  >
+                    {episode.title}
+                  </button>
+                ))}
+            </div>
+            {!sourceChoice.film.episodes.length && (
+              <p>该来源没有可用的播放地址，请选择其他来源。</p>
+            )}
+            {error && <Notice kind="error">{error}</Notice>}
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -2279,7 +2684,7 @@ function SettingsPage({
   );
 }
 function App() {
-  const route = useRoute();
+  const { route, key: routeKey } = useRoute();
   const [initialized, setInitialized] = useState<boolean | null>(null),
     [me, setMe] = useState<Obj | null>(null),
     [ready, setReady] = useState(false),
@@ -2353,11 +2758,16 @@ function App() {
   if (route.startsWith("/search")) page = <SearchPage route={route} />;
   else if (route.startsWith("/film/")) {
     const [id, query] = route.slice(6).split("?");
+    const params = new URLSearchParams(query);
     page = (
       <FilmPage
-        key={route}
+        key={routeKey}
         id={id}
-        switchFrom={new URLSearchParams(query).get("switch_from") || ""}
+        switchFrom={params.get("switch_from") || ""}
+        switchEpisode={params.get("switch_episode") || ""}
+        switchLine={params.get("switch_line") || ""}
+        autoPlay={params.get("autoplay") === "1"}
+        playEpisode={params.get("play_episode") || ""}
       />
     );
   } else if (route === "/favorites" || route === "/history")
