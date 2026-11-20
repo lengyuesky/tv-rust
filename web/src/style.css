@@ -1077,8 +1077,7 @@ section {
   background: #11171d;
   margin: 0 0 28px;
 }
-.playback-source-top,
-.playback-source-heading {
+.playback-source-top {
   display: flex;
   align-items: center;
   gap: 14px;
@@ -1106,24 +1105,23 @@ section {
 .playback-source-top select {
   padding: 8px;
 }
-.playback-source-heading p {
-  flex: 1;
-  min-width: 160px;
-  margin: 16px 0;
-  font-size: 12px;
-}
 .playback-source-options {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 10px;
-  margin-bottom: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
 }
 .playback-source-options button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   text-align: left;
   border: 1px solid #303c48;
   border-radius: 8px;
-  padding: 12px;
-  position: relative;
+  padding: 9px 13px;
+  font-size: 13px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 .playback-source-options button.active {
   color: var(--accent);
@@ -1133,21 +1131,8 @@ section {
 .playback-source-options button:hover:not(:disabled) {
   border-color: var(--accent);
 }
-.playback-source-options strong {
-  display: block;
-  font-size: 13px;
-  margin-right: 20px;
-  overflow-wrap: anywhere;
-}
-.playback-source-options small {
-  display: block;
-  color: var(--muted);
-  margin-top: 5px;
-}
 .playback-source-options svg {
-  position: absolute;
-  right: 10px;
-  top: 14px;
+  flex-shrink: 0;
 }
 .player-top > button {
   margin-left: auto;

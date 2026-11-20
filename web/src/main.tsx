@@ -1070,10 +1070,8 @@ function PlaybackSources({
 }) {
   const [items, setItems] = useState<Obj[]>([]),
     [status, setStatus] = useState<Obj[]>([]),
-    [open, setOpen] = useState(false),
     [loading, setLoading] = useState(false),
-    [error, setError] = useState(""),
-    [discovered, setDiscovered] = useState(false);
+    [error, setError] = useState("");
   const controller = useRef<AbortController | null>(null);
   const sequence = useRef(0);
   const load = useCallback(
@@ -1095,7 +1093,6 @@ function PlaybackSources({
         if (request === sequence.current && !abort.signal.aborted) {
           setItems(result.items);
           setStatus(result.sources);
-          if (discover) setDiscovered(true);
         }
       } catch (error) {
         if (!abort.signal.aborted) setError((error as Error).message);
@@ -1107,8 +1104,15 @@ function PlaybackSources({
     [film.id],
   );
   useEffect(() => {
-    void load(false);
-    return () => controller.current?.abort();
+    let active = true;
+    // 先显示已保存的来源，再自动补齐其他候选，避免等待上游时隐藏可选名称。
+    void load(false).then(() => {
+      if (active) void load(true);
+    });
+    return () => {
+      active = false;
+      controller.current?.abort();
+    };
   }, [load]);
   const lines = [
     ...new Set<string>(film.episodes.map((episode: Obj) => episode.line_name)),
@@ -1139,68 +1143,49 @@ function PlaybackSources({
           </label>
         )}
         <button
-          className="outline"
-          disabled={busy}
-          aria-expanded={open}
-          onClick={() => {
-            setOpen(!open);
-            if (!open && !discovered) void load(true);
-          }}
+          className="ghost"
+          disabled={loading || busy}
+          onClick={() => void load(true, true)}
         >
-          <RefreshCw size={16} />
-          切换播放源
+          <RefreshCw className={loading ? "spin" : ""} size={15} />
+          刷新来源
         </button>
       </div>
-      {open && (
-        <>
-          <div className="playback-source-heading">
-            <p>同一作品可直接换源；能确认集数时自动切换，进度按来源保存。</p>
-            <button
-              className="ghost"
-              disabled={loading || busy}
-              onClick={() => void load(true, true)}
-            >
-              <RefreshCw className={loading ? "spin" : ""} size={15} />
-              刷新来源
-            </button>
-          </div>
-          {error && <Notice kind="error">{error}</Notice>}
-          {loading && (
-            <p className="small muted" role="status">
-              正在查找其他可用源…
-            </p>
-          )}
-          <div className="playback-source-options">
-            <button className="active" disabled aria-current="true">
-              <strong>{film.source_name}</strong>
-              <small>当前来源</small>
-            </button>
-            {alternatives.map((item) => (
-              <button
-                key={item.id}
-                disabled={busy}
-                onClick={() => onSelect(item.id)}
-              >
-                <strong>{item.source_name}</strong>
-                <small>
-                  {item.year} · {item.remarks || "切换来源"}
-                </small>
-                <ArrowRight size={16} />
-              </button>
-            ))}
-          </div>
-          {!loading && !alternatives.length && (
-            <p className="small muted">
-              暂未找到标题、年份和版本一致的其他来源，可刷新或在搜索页查找。
-            </p>
-          )}
-          {status.some((source) => !source.ok) && (
-            <p className="small muted">
-              {status.filter((source) => !source.ok).length}{" "}
-              个源暂未响应，已显示其余可用结果。
-            </p>
-          )}
-        </>
+      <div
+        className="playback-source-options"
+        role="group"
+        aria-label="可切换播放源"
+      >
+        <button className="active" disabled aria-current="true">
+          <Check size={14} />
+          {film.source_name}
+        </button>
+        {alternatives.map((item) => (
+          <button
+            key={item.id}
+            disabled={busy}
+            onClick={() => onSelect(item.id)}
+          >
+            {item.source_name}
+          </button>
+        ))}
+      </div>
+      {error && <Notice kind="error">{error}</Notice>}
+      {loading && (
+        <p className="small muted" role="status">
+          正在查找其他可用源…
+        </p>
+      )}
+      {!loading && !alternatives.length && (
+        <p className="small muted">
+          暂未找到标题、年份和版本一致的其他来源，可刷新或在搜索页查找。
+        </p>
+      )}
+      {status.some((source) => !source.ok) && (
+        <p className="small muted">
+          {status.filter((source) => !source.ok).length}{" "}
+          个源暂未响应，已显示其余可用结果。
+        </p>
       )}
     </section>
   );
