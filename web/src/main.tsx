@@ -2145,9 +2145,7 @@ function Collection({ kind }: { kind: "favorites" | "history" }) {
           onClose={() => setPending(null)}
           onConfirm={() => void remove(pending)}
         >
-          《{pending.title}》
-          {pending.source_name ? ` · ${pending.source_name}` : ""}{" "}
-          的观看进度将被清除，收藏不受影响。
+          《{pending.title}》在所有来源的观看进度将被清除，收藏不受影响。
         </Confirm>
       )}
     </>

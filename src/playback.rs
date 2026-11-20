@@ -28,6 +28,7 @@ pub struct Play {
     pub reports: i64,
     pub native_link_hash: String,
     pub ended: bool,
+    pub recording_disabled: bool,
 }
 pub async fn event(app: &App, p: &Play, kind: &str, message: &str) -> Result<()> {
     sqlx::query("INSERT INTO play_events(play_id,at,mode,event,message) VALUES(?,?,?,?,?)")
@@ -217,6 +218,9 @@ pub async fn record(
     native_link: Option<&str>,
 ) -> Result<bool> {
     validate_position(position, duration)?;
+    if p.recording_disabled {
+        return Ok(false);
+    }
     let f = catalog::film(app, &p.film_id).await?;
     access::require_source(app, &p.user_id, &f.source_id).await?;
     if p.ended || p.expires_at <= now() {
@@ -228,7 +232,7 @@ pub async fn record(
         .bind(&p.id)
         .fetch_one(&mut *tx)
         .await?;
-    if current.ended || current.expires_at <= now() {
+    if current.ended || current.recording_disabled || current.expires_at <= now() {
         return Ok(false);
     }
     if !access::source_allowed_on(&mut tx, &p.user_id, &f.source_id).await? {
@@ -293,7 +297,7 @@ async fn save_progress(
     duration: f64,
 ) -> Result<()> {
     let result = sqlx::query(
-        "UPDATE plays SET position=?,reports=reports+1,state=CASE WHEN state='fallback' THEN state ELSE 'progress' END WHERE id=? AND ended=0",
+        "UPDATE plays SET position=?,reports=reports+1,state=CASE WHEN state='fallback' THEN state ELSE 'progress' END WHERE id=? AND ended=0 AND recording_disabled=0",
     )
     .bind(position)
     .bind(&p.id)
@@ -328,7 +332,7 @@ pub async fn end_with_snapshot(app: &App, p: &Play, snapshot: Option<(f64, f64)>
     if current.ended {
         return Ok(());
     }
-    if let Some((position, duration)) = snapshot {
+    if let Some((position, duration)) = snapshot.filter(|_| !current.recording_disabled) {
         let newer: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM plays WHERE user_id=? AND film_id=? AND seq>?",
         )
@@ -359,6 +363,32 @@ pub async fn end_with_snapshot(app: &App, p: &Play, snapshot: Option<(f64, f64)>
     }
     tx.commit().await?;
     tracing::info!(play=%current.id,mode=%current.mode,event="ended","收到客户端结束播放通知");
+    Ok(())
+}
+pub async fn remove_history(app: &App, user: &str, film_ids: &[String]) -> Result<()> {
+    if film_ids.is_empty() {
+        return Ok(());
+    }
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut grouped = HashSet::new();
+    for id in film_ids {
+        grouped.extend(catalog::history_film_ids_on(&mut tx, user, id).await?);
+    }
+    // 清除记录和禁用旧会话的进度写入共用一把写锁；正在播放的媒体仍可继续。
+    for sql in [
+        "UPDATE plays SET recording_disabled=1 WHERE user_id=",
+        "DELETE FROM progress WHERE user_id=",
+    ] {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(sql);
+        query.push_bind(user).push(" AND film_id IN (");
+        let mut ids = query.separated(",");
+        for id in &grouped {
+            ids.push_bind(id);
+        }
+        query.push(")");
+        query.build().execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 pub async fn set_forbidden(app: &App, on: bool) -> Result<()> {

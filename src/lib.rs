@@ -10,6 +10,7 @@ pub mod net;
 pub mod playback;
 pub mod preferences;
 pub mod probe;
+mod source_poster;
 
 use axum::{
     Router,
@@ -25,6 +26,7 @@ pub fn router(app: App, web_dir: &str) -> Router {
         .route("/trimcon", any(fntv::handle))
         .route("/v/{*path}", any(fntv::handle))
         .route("/tv-poster/{*path}", any(fntv::handle))
+        .route("/fntv-source-poster/{*path}", any(fntv::handle))
         .route("/media/{access}/{asset}", any(media))
         .fallback_service(
             ServeDir::new(web_dir)

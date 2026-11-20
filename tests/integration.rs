@@ -562,7 +562,7 @@ async fn admins_only_subscriptions_support_import_edit_refresh_and_restart() {
             .fetch_one(&restarted.db)
             .await
             .unwrap(),
-        3
+        4
     );
 }
 
@@ -1124,7 +1124,7 @@ async fn legacy_removals_are_migrated_once_without_losing_favorites() {
             .fetch_one(&again.db)
             .await
             .unwrap(),
-        3
+        4
     );
 }
 
@@ -1573,9 +1573,16 @@ async fn continue_watching_groups_sources_without_merging_progress_or_user_recor
         grouped["items"][0]["progress"]["position"], 12.0,
         "选择最近观看记录，不能选进度最大的53秒来源"
     );
-    assert_eq!(before["items"].as_array().unwrap().len(), 3);
+    assert_eq!(before["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        catalog::personal(&h.app, &h.other.user.id, "history")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
     let (_, after) = request(&h, "GET", "/api/history", json!({}), Some(&h.member_raw)).await;
-    assert_eq!(before, after, "首页合并展示不改写任何来源的观看记录");
+    assert_eq!(before, after, "两个观看入口采用相同的作品合并规则");
     let (_, favorites) = request(&h, "GET", "/api/favorites", json!({}), Some(&h.member_raw)).await;
     assert_eq!(favorites["items"].as_array().unwrap().len(), 3);
     let (_, admin) = request(&h, "GET", "/api/continue-watching", json!({}), Some(&h.raw)).await;
@@ -3025,4 +3032,770 @@ async fn default_network_policy_rejects_loopback_before_request() {
         .await
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn native_continue_watching_groups_works_and_deletes_all_sources_for_only_its_user() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let at = now();
+    let mut films = Vec::new();
+    for index in 0..3 {
+        films.push(watched_film(&h,&source,json!({"vod_id":6000+index,"vod_name":"原生继续观看","vod_year":"2026","type_name":"电视剧","vod_play_from":"line","vod_play_url":"第01集$https://example.com/1.mp4#第03集$https://example.com/3.mp4"}),
+            (&h.other.user.id,[53.0,12.0,2.0][index as usize],index,at)).await);
+    }
+    for film in &films {
+        let episode = catalog::episodes(&h.app, &film.id).await.unwrap().remove(1);
+        sqlx::query("UPDATE progress SET episode_id=? WHERE user_id=? AND film_id=?")
+            .bind(&episode.id)
+            .bind(&h.other.user.id)
+            .bind(&film.id)
+            .execute(&h.app.db)
+            .await
+            .unwrap();
+    }
+    let different = watched_film(&h,&source,json!({"vod_id":6010,"vod_name":"原生继续观看","vod_year":"2025","type_name":"电视剧","vod_play_from":"line","vod_play_url":"第03集$https://example.com/3.mp4"}),
+        (&h.other.user.id,9.0,0,at-1)).await;
+    for index in 0..7 {
+        watched_film(&h,&source,json!({"vod_id":6020+index,"vod_name":format!("原生其他作品{index}"),"vod_year":"2026","type_name":"电视剧","vod_play_from":"line","vod_play_url":"第03集$https://example.com/3.mp4"}),
+            (&h.other.user.id,3.0,0,at-2-index)).await;
+    }
+    catalog::favorite(&h.app, &h.other.user.id, &films[0].id, true)
+        .await
+        .unwrap();
+    let (_, rows) = request(
+        &h,
+        "GET",
+        "/v/api/v1/play/list",
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    let items = rows["data"].as_array().unwrap();
+    assert_eq!(items.len(), 9, "原生列表不能套用首页六条的限制");
+    assert_eq!(items[0]["grand_guid"], films[2].id);
+    assert_eq!(items[0]["ts"], 2);
+    assert_eq!(
+        items[0]["episode_number"], 3,
+        "真实集号不能采用目录中的第二项"
+    );
+    let latest = text(&items[0], "guid");
+    let (status, grouped) =
+        request(&h, "GET", "/api/history", json!({}), Some(&h.member_raw)).await;
+    assert_eq!(status, 200);
+    assert_eq!(grouped["items"].as_array().unwrap().len(), 9);
+    assert_eq!(grouped["items"][0]["id"], films[2].id);
+    assert_eq!(
+        catalog::personal(&h.app, &h.other.user.id, "history")
+            .await
+            .unwrap()
+            .len(),
+        11
+    );
+    assert_eq!(
+        request(&h, "GET", "/v/api/v1/play/list", json!({}), Some(&h.raw))
+            .await
+            .1["data"],
+        json!([])
+    );
+    let own_episode = catalog::episode(&h.app, &latest).await.unwrap();
+    sqlx::query("INSERT INTO progress VALUES(?,?,?,?,?,?,?)")
+        .bind(&h.who.user.id)
+        .bind(&films[2].id)
+        .bind(&own_episode.id)
+        .bind(22.0)
+        .bind(120.0)
+        .bind(0)
+        .bind(at)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    let hits = h.hits.load(Ordering::Relaxed);
+    assert_eq!(
+        request(
+            &h,
+            "DELETE",
+            "/v/api/v1/play/record",
+            json!({"item_guid":latest}),
+            None
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        request(
+            &h,
+            "DELETE",
+            "/v/api/v1/play/record",
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        400
+    );
+    let (status, removed) = request(
+        &h,
+        "DELETE",
+        "/v/api/v1/play/record",
+        json!({"item_guid":latest}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(removed["data"], true);
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "删除已失效的个人记录无需请求媒体"
+    );
+    let history = catalog::personal(&h.app, &h.other.user.id, "history")
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 8);
+    assert!(history.iter().any(|item| item["id"] == different.id));
+    assert!(
+        films
+            .iter()
+            .all(|film| !history.iter().any(|item| item["id"] == film.id))
+    );
+    assert_eq!(
+        catalog::personal(&h.app, &h.who.user.id, "history")
+            .await
+            .unwrap()[0]["progress"]["position"],
+        22.0
+    );
+    assert_eq!(
+        catalog::personal(&h.app, &h.other.user.id, "favorites")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        request(
+            &h,
+            "DELETE",
+            "/v/api/v1/play/record",
+            json!({"item_guid":latest}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        200
+    );
+}
+
+async fn cached_native_media(h: &Harness, episode: &str, width: u64, height: u64) {
+    let streams = if width == 0 {
+        vec![]
+    } else {
+        vec![
+            json!({"index":0,"codec_type":"video","codec_name":"h264","width":width,"height":height,"avg_frame_rate":"24/1","bit_rate":"4200000"}),
+        ]
+    };
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(json!({"probe_version":1,"kind":"mp4","duration":120.0,"size":8,"streams":streams,"warning":""}).to_string())
+        .bind(now()).bind(episode).execute(&h.app.db).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_source_progress() {
+    let h = harness().await;
+    let primary = catalog::sources(&h.app).await.unwrap().remove(0);
+    let subscription = catalog::import(&h.app,&json!({"name":"原生候选订阅","content":json!({"api_site":{"b":{"name":"原生备用源","api":primary.api},"c":{"name":"原生未知源","api":primary.api}}}).to_string()})).await.unwrap();
+    let sources: Vec<_> = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|source| source.subscription_id == subscription)
+        .collect();
+    let secondary = sources
+        .iter()
+        .find(|source| source.name == "原生备用源")
+        .unwrap();
+    let unknown = sources
+        .iter()
+        .find(|source| source.name == "原生未知源")
+        .unwrap();
+    let reference = catalog::episode(&h.app, &h.episode).await.unwrap();
+    let url = reference.url;
+    let a = catalog::ingest(&h.app,&primary,&json!({"vod_id":6101,"vod_name":"原生换源剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"liangzi$$$lzm3u8","vod_play_url":format!("第01集${url}#第03集${url}$$$第01集${url}#第03集${url}")}),true).await.unwrap().unwrap();
+    let b = catalog::ingest(&h.app,secondary,&json!({"vod_id":6102,"vod_name":"原生换源剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"liangzi$$$lzm3u8","vod_play_url":format!("第一集${url}#第二集${url}#第三集${url}$$$第一集${url}#第二集${url}#第三集${url}")}),true).await.unwrap().unwrap();
+    let c = catalog::ingest(&h.app,unknown,&json!({"vod_id":6103,"vod_name":"原生换源剧集","vod_year":"2026","type_name":"电视剧","vod_remarks":"4K蓝光","vod_play_from":"lzm3u8","vod_play_url":format!("第三集${url}")}),true).await.unwrap().unwrap();
+    let wrong = catalog::ingest(&h.app,secondary,&json!({"vod_id":6104,"vod_name":"原生换源剧集","vod_year":"2025","type_name":"电视剧","vod_play_from":"line","vod_play_url":format!("第三集${url}")}),true).await.unwrap().unwrap();
+    let ambiguous = catalog::ingest(&h.app,unknown,&json!({"vod_id":6105,"vod_name":"原生换源剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"line","vod_play_url":format!("第01-03集${url}")}),true).await.unwrap().unwrap();
+    let hidden_subscription = catalog::import(&h.app,&json!({"name":"原生隐藏订阅","usage":{"mode":"admins","user_ids":[]},"content":json!({"api_site":{"hidden":{"name":"原生隐藏源","api":primary.api}}}).to_string()})).await.unwrap();
+    let hidden = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|source| source.subscription_id == hidden_subscription)
+        .unwrap();
+    catalog::ingest(&h.app,&hidden,&json!({"vod_id":6106,"vod_name":"原生换源剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"line","vod_play_url":format!("第三集${url}")}),true).await.unwrap();
+    let a_eps = catalog::episodes(&h.app, &a.id).await.unwrap();
+    let b_eps = catalog::episodes(&h.app, &b.id).await.unwrap();
+    for e in &a_eps {
+        cached_native_media(
+            &h,
+            &e.id,
+            if e.line_order == 0 { 640 } else { 1920 },
+            if e.line_order == 0 { 360 } else { 1080 },
+        )
+        .await;
+    }
+    for e in &b_eps {
+        cached_native_media(
+            &h,
+            &e.id,
+            if e.line_order == 0 { 640 } else { 1280 },
+            if e.line_order == 0 { 360 } else { 720 },
+        )
+        .await;
+    }
+    let c_ep = catalog::episodes(&h.app, &c.id).await.unwrap().remove(0);
+    cached_native_media(&h, &c_ep.id, 0, 0).await;
+    let a_third = a_eps
+        .iter()
+        .find(|e| e.title == "第03集" && e.line_order == 0)
+        .unwrap();
+    let b_third = b_eps
+        .iter()
+        .find(|e| e.title == "第三集" && e.line_order == 1)
+        .unwrap();
+    for (film, e, position) in [(&a, a_third, 12.0), (&b, b_third, 7.0)] {
+        sqlx::query("INSERT INTO progress VALUES(?,?,?,?,?,?,?)")
+            .bind(&h.other.user.id)
+            .bind(&film.id)
+            .bind(&e.id)
+            .bind(position)
+            .bind(120.0)
+            .bind(0)
+            .bind(now())
+            .execute(&h.app.db)
+            .await
+            .unwrap();
+    }
+    let (status, versions) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/stream/list/{}", a_third.id),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let files = versions["data"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 5);
+    let heights: Vec<_> = files
+        .iter()
+        .map(|file| file["quality"]["height"].as_f64().unwrap())
+        .collect();
+    assert_eq!(heights, vec![1080.0, 720.0, 360.0, 360.0, 0.0]);
+    assert!(
+        files[0]["file_name"]
+            .as_str()
+            .unwrap()
+            .contains("测试源 · 线路 2 · 第03集 · 1080p · 1920 × 1080")
+    );
+    assert!(
+        versions["data"]["video_streams"][0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("测试源 · 线路 2 · 1080p")
+    );
+    assert_eq!(
+        versions["data"]["video_streams"][0]["resolution_type"],
+        "1080p"
+    );
+    assert_eq!(versions["data"]["video_streams"][0]["color_range_type"], "");
+    assert!(
+        files[0]["path"]
+            .as_str()
+            .unwrap()
+            .contains("/测试源/线路 2 · 1080p")
+    );
+    assert!(
+        files.last().unwrap()["file_name"]
+            .as_str()
+            .unwrap()
+            .contains("画质待识别")
+    );
+    assert!(!versions.to_string().contains("原生隐藏源"));
+    assert!(!versions.to_string().contains(&url));
+    for file in files {
+        let e = catalog::episode(&h.app, &text(file, "guid")).await.unwrap();
+        assert!(e.title == "第03集" || e.title == "第三集");
+        assert_ne!(e.film_id, wrong.id);
+        assert_ne!(e.film_id, ambiguous.id);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM plays")
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap(),
+        0
+    );
+    let (status, seasons) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/season/list/{}", a.id),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let choices = seasons["data"].as_array().unwrap();
+    assert_eq!(choices.len(), 5);
+    let high_b = choices
+        .iter()
+        .find(|row| {
+            row["source_name"] == secondary.name && row["quality"]["height"].as_f64() == Some(720.0)
+        })
+        .unwrap();
+    let version_id = text(high_b, "guid");
+    assert!(text(high_b, "title").contains("原生备用源 · 线路 2 · 第三集：720p"));
+    assert_eq!(
+        high_b["season_number"], 1,
+        "多个来源是同一季的版本，不伪装成其他季"
+    );
+    let (_, selected_episodes) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/episode/list/{version_id}"),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    let eps = selected_episodes["data"].as_array().unwrap();
+    assert_eq!(eps.len(), 3);
+    assert!(eps.iter().all(|row| {
+        b_eps
+            .iter()
+            .any(|e| e.id == row["guid"] && e.line_order == 1)
+    }));
+    assert_eq!(eps[2]["episode_number"], 3);
+    assert_eq!(eps[2]["guid"], b_third.id);
+    let (_, version_info) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/info",
+        json!({"item_guid":version_id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(version_info["data"]["media_guid"], b_third.id);
+    assert_eq!(version_info["data"]["ts"], 7);
+    let body = json!({"item_guid":a_third.id,"media_guid":b_third.id});
+    let (status, play_info) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/info",
+        body.clone(),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(play_info["data"]["media_guid"], b_third.id);
+    assert_eq!(play_info["data"]["ts"], 7);
+    let (_, first) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":a_third.id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    let first_link = text(&first["data"]["direct_link_qualities"][0], "url");
+    let (_, selected) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        body.clone(),
+        Some(&h.member_raw),
+    )
+    .await;
+    let link = text(&selected["data"]["direct_link_qualities"][0], "url");
+    assert_eq!(selected["data"]["source_name"], secondary.name);
+    assert!(
+        selected["data"]["direct_link_qualities"][0]["resolution"]
+            .as_str()
+            .unwrap()
+            .contains("720p · 1280 × 720")
+    );
+    assert_eq!(
+        selected["data"]["direct_link_qualities"][0]["bitrate"],
+        4200000
+    );
+    assert_eq!(selected["data"]["header"], json!({}));
+    let native_url = url::Url::parse(&link).unwrap();
+    assert_eq!(
+        native_url.host_str(),
+        url::Url::parse(&url).unwrap().host_str()
+    );
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/play/record",
+            json!({"item_guid":a_third.id,"media_guid":b_third.id,"play_link":link,"ts":10}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        200
+    );
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        json!({"media_guid":a_third.id,"play_link":first_link,"ts":99}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(
+        catalog::view(&h.app, &h.other.user.id, &a.id, false)
+            .await
+            .unwrap()["progress"]["position"],
+        12.0
+    );
+    assert_eq!(
+        catalog::view(&h.app, &h.other.user.id, &b.id, false)
+            .await
+            .unwrap()["progress"]["position"],
+        10.0
+    );
+    let latest = request(
+        &h,
+        "GET",
+        "/v/api/v1/play/list",
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await
+    .1;
+    assert_eq!(latest["data"].as_array().unwrap().len(), 1);
+    assert_eq!(latest["data"][0]["media_guid"], b_third.id);
+    let b_second = b_eps.iter().find(|e| e.title == "第二集").unwrap();
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/play/info",
+            json!({"item_guid":a_third.id,"media_guid":b_second.id}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(request(&h,"POST","/v/api/v1/play/info",json!({"item_guid":a_third.id,"media_guid":catalog::episodes(&h.app,&wrong.id).await.unwrap()[0].id}),Some(&h.member_raw)).await.0,400);
+}
+
+#[tokio::test]
+async fn deleting_history_blocks_old_web_native_and_final_reports_but_allows_new_playback() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let original = catalog::episode(&h.app, &h.episode).await.unwrap();
+    let alternate=catalog::ingest(&h.app,&source,&json!({"vod_id":6200,"vod_name":"测试电影","vod_year":"2026","vod_play_from":"line","vod_play_url":format!("正片${}",original.url)}),true).await.unwrap().unwrap();
+    let alternate_ep = catalog::episodes(&h.app, &alternate.id)
+        .await
+        .unwrap()
+        .remove(0);
+    cached_native_media(&h, &alternate_ep.id, 1280, 720).await;
+    let web = playback::start(&h.app, &h.who, &h.episode).await.unwrap();
+    let p = playback::get(&h.app, &text(&web, "id")).await.unwrap();
+    playback::record(&h.app, &p, 12.0, 120.0, None)
+        .await
+        .unwrap();
+    catalog::favorite(&h.app, &h.who.user.id, &h.film, true)
+        .await
+        .unwrap();
+    let (native_token, _) = auth::login(&h.app, "admin", &hash("password-123"), true)
+        .await
+        .unwrap();
+    let (_, native) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":alternate_ep.id}),
+        Some(&native_token),
+    )
+    .await;
+    let link = text(&native["data"]["direct_link_qualities"][0], "url");
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        json!({"media_guid":alternate_ep.id,"play_link":link,"ts":7}),
+        Some(&native_token),
+    )
+    .await;
+    let other = playback::start(&h.app, &h.other, &h.episode).await.unwrap();
+    let other_p = playback::get(&h.app, &text(&other, "id")).await.unwrap();
+    playback::record(&h.app, &other_p, 43.0, 120.0, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            &h,
+            "DELETE",
+            &format!("/api/films/{}/history", h.film),
+            json!({}),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(
+        catalog::personal(&h.app, &h.who.user.id, "history")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let updated = playback::get(&h.app, &p.id).await.unwrap();
+    assert!(updated.recording_disabled);
+    assert!(!updated.ended, "删除记录不截断正在播放的媒体");
+    assert!(
+        !playback::record(&h.app, &p, 99.0, 120.0, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/play/record",
+            json!({"media_guid":alternate_ep.id,"play_link":link,"ts":99}),
+            Some(&native_token)
+        )
+        .await
+        .0,
+        200
+    );
+    playback::end_with_snapshot(&h.app, &p, Some((100.0, 120.0)))
+        .await
+        .unwrap();
+    assert!(
+        catalog::personal(&h.app, &h.who.user.id, "history")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        catalog::view(&h.app, &h.other.user.id, &h.film, false)
+            .await
+            .unwrap()["progress"]["position"],
+        43.0
+    );
+    assert_eq!(
+        catalog::personal(&h.app, &h.who.user.id, "favorites")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, fresh) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":alternate_ep.id}),
+        Some(&native_token),
+    )
+    .await;
+    let new_link = text(&fresh["data"]["direct_link_qualities"][0], "url");
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        json!({"media_guid":alternate_ep.id,"play_link":new_link,"ts":3}),
+        Some(&native_token),
+    )
+    .await;
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &alternate.id, false)
+            .await
+            .unwrap()["progress"]["position"],
+        3.0
+    );
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        json!({"media_guid":alternate_ep.id,"play_link":link,"ts":99}),
+        Some(&native_token),
+    )
+    .await;
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &alternate.id, false)
+            .await
+            .unwrap()["progress"]["position"],
+        3.0
+    );
+}
+
+#[tokio::test]
+async fn deleting_history_is_atomic_with_inflight_reports_and_rolls_back_on_failure() {
+    let h = harness().await;
+    let started = playback::start(&h.app, &h.who, &h.episode).await.unwrap();
+    let p = playback::get(&h.app, &text(&started, "id")).await.unwrap();
+    playback::record(&h.app, &p, 12.0, 120.0, None)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TRIGGER reject_history_deletion BEFORE DELETE ON progress BEGIN SELECT RAISE(ABORT,'controlled failure'); END;").execute(&h.app.db).await.unwrap();
+    assert!(
+        playback::remove_history(&h.app, &h.who.user.id, std::slice::from_ref(&h.film))
+            .await
+            .is_err()
+    );
+    assert!(
+        !playback::get(&h.app, &p.id)
+            .await
+            .unwrap()
+            .recording_disabled
+    );
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &h.film, false)
+            .await
+            .unwrap()["progress"]["position"],
+        12.0
+    );
+    sqlx::raw_sql("DROP TRIGGER reject_history_deletion;")
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let (removed, late, ended) = tokio::join!(
+        playback::remove_history(&h.app, &h.who.user.id, std::slice::from_ref(&h.film)),
+        playback::record(&h.app, &p, 55.0, 120.0, None),
+        playback::end_with_snapshot(&h.app, &p, Some((77.0, 120.0)))
+    );
+    removed.unwrap();
+    late.unwrap();
+    ended.unwrap();
+    assert!(
+        catalog::personal(&h.app, &h.who.user.id, "history")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        playback::get(&h.app, &p.id)
+            .await
+            .unwrap()
+            .recording_disabled
+    );
+}
+
+#[tokio::test]
+async fn native_source_labels_are_valid_png_and_recheck_authorization() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let url = catalog::episode(&h.app, &h.episode).await.unwrap().url;
+    let film=catalog::ingest(&h.app,&source,&json!({"vod_id":6300,"vod_name":"中文来源标签验收","vod_year":"2026","type_name":"电视剧","vod_play_from":"lzm3u8","vod_play_url":format!("第03集${url}")}),true).await.unwrap().unwrap();
+    let episode = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+    cached_native_media(&h, &episode.id, 1280, 720).await;
+    let (_, choices) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/season/list/{}", film.id),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    let poster = text(&choices["data"][0], "poster");
+    assert!(poster.starts_with("/fntv-source-poster/"));
+    let version = text(&choices["data"][0], "guid");
+    sqlx::query("DELETE FROM cache")
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let restarted = App::new(h._dir.path().into(), true, String::new())
+        .await
+        .unwrap();
+    let response = router(restarted, "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v/api/v1/item/{version}"))
+                .header("authorization", format!("Bearer {}", h.member_raw))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "来源版本身份不应依赖搜索缓存或进程生命周期"
+    );
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(&poster)
+                .header("authorization", format!("Bearer {}", h.member_raw))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "image/png");
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let reader = decoder.read_info().unwrap();
+    assert_eq!(reader.info().width, 300);
+    assert_eq!(reader.info().height, 450);
+    assert_eq!(request(&h, "GET", &poster, json!({}), None).await.0, 401);
+    let hits = h.hits.load(Ordering::Relaxed);
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    for path in [&poster, &format!("/v/api/v1/sys/img{poster}")] {
+        assert_eq!(
+            request(&h, "GET", path, json!({}), Some(&h.member_raw))
+                .await
+                .0,
+            403
+        );
+    }
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "撤权后的图片请求不能访问媒体或交付缓存标签"
+    );
+    assert_eq!(
+        request(&h, "GET", &poster, json!({}), Some(&h.raw)).await.0,
+        200
+    );
+    sqlx::query("UPDATE episodes SET active=0 WHERE id=?")
+        .bind(&episode.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/play/info",
+            json!({"item_guid":version}),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        400,
+        "参考单集失效后不能静默播放其他集"
+    );
 }

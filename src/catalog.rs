@@ -91,7 +91,7 @@ pub fn group_key(f: &Film) -> String {
     .to_string()
 }
 
-fn episode_number(label: &str) -> Option<u32> {
+pub(crate) fn episode_number(label: &str) -> Option<u32> {
     static LABEL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)^(?:第\s*([0-9零〇一二两三四五六七八九十百千]+)\s*[集话期]|(?:ep?|episode)\s*([0-9]+)|([0-9]+))$").unwrap()
     });
@@ -168,10 +168,11 @@ pub async fn switch_episode_hint(
     let source = source(app, &from.source_id).await?;
     let mut hint = json!({"matched":false,"from_episode":original.title,"from_position":position,"from_source":source.name,
         "message":"无法确认对应单集，请核对版本并重新选集。"});
-    if from.year.trim().is_empty()
-        || group_key(&from) != group_key(&target)
-        || !version_markers(&from).is_empty()
-        || !version_markers(&target).is_empty()
+    if from.id != target.id
+        && (from.year.trim().is_empty()
+            || group_key(&from) != group_key(&target)
+            || !version_markers(&from).is_empty()
+            || !version_markers(&target).is_empty())
     {
         hint["message"] = json!("标题、年份或版本无法确认一致，请在新来源重新选集。");
         return Ok(hint);
@@ -980,6 +981,58 @@ pub async fn personal(app: &App, user: &str, kind: &str) -> Result<Vec<Value>> {
 }
 
 pub async fn continue_watching(app: &App, user: &str) -> Result<Vec<Value>> {
+    continue_watching_with_limit(app, user, 6).await
+}
+
+pub async fn history(app: &App, user: &str) -> Result<Vec<Value>> {
+    continue_watching_with_limit(app, user, 1000).await
+}
+
+pub async fn history_film_ids(app: &App, user: &str, id: &str) -> Result<Vec<String>> {
+    let mut connection = app.db.acquire().await?;
+    history_film_ids_on(&mut connection, user, id).await
+}
+
+pub(crate) async fn history_film_ids_on(
+    connection: &mut sqlx::SqliteConnection,
+    user: &str,
+    id: &str,
+) -> Result<Vec<String>> {
+    let current: Film = sqlx::query_as("SELECT * FROM films WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(Error::missing)?;
+    let mut ids = vec![current.id.clone()];
+    if !known_year(current.year.trim()) {
+        return Ok(ids);
+    }
+    // 仅处理当前账号已有的观看记录或播放会话，包括已经失效的来源。
+    let films: Vec<Film> = sqlx::query_as(
+        "SELECT f.* FROM films f WHERE lower(trim(title))=? AND trim(year)=? AND kind=? \
+         AND (EXISTS(SELECT 1 FROM progress p WHERE p.user_id=? AND p.film_id=f.id) \
+         OR EXISTS(SELECT 1 FROM plays p WHERE p.user_id=? AND p.film_id=f.id))",
+    )
+    .bind(current.title.trim().to_lowercase())
+    .bind(current.year.trim())
+    .bind(&current.kind)
+    .bind(user)
+    .bind(user)
+    .fetch_all(&mut *connection)
+    .await?;
+    for f in films {
+        if f.id != current.id && group_key(&f) == group_key(&current) {
+            ids.push(f.id);
+        }
+    }
+    Ok(ids)
+}
+
+pub async fn continue_watching_with_limit(
+    app: &App,
+    user: &str,
+    limit: usize,
+) -> Result<Vec<Value>> {
     // 先按观看时间挑选每部作品最近使用的来源，再限制首页卡片数量。
     // 同一秒内的换源以播放会话序号判断先后，不能按位置大小挑选。
     let mut films = sqlx::query_as::<_, Film>(
@@ -999,7 +1052,7 @@ pub async fn continue_watching(app: &App, user: &str) -> Result<Vec<Value>> {
         };
         if seen.insert(key) {
             ids.push(film.id);
-            if ids.len() == 6 {
+            if ids.len() == limit.clamp(1, 1000) {
                 break;
             }
         }

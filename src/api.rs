@@ -206,7 +206,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         }
         ("GET", "/api/history") => {
             return Ok(json_response(
-                json!({"items":catalog::personal(app,&who.user.id,"history").await?}),
+                json!({"items":catalog::history(app,&who.user.id).await?}),
             ));
         }
         ("GET", "/api/continue-watching") => {
@@ -401,11 +401,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
             catalog::favorite(app, &who.user.id, id, method == Method::PUT).await?;
         }
         ["films", id, "history"] if method == Method::DELETE => {
-            sqlx::query("DELETE FROM progress WHERE user_id=? AND film_id=?")
-                .bind(&who.user.id)
-                .bind(id)
-                .execute(&app.db)
-                .await?;
+            playback::remove_history(app, &who.user.id, &[(*id).to_owned()]).await?;
         }
         ["posters", id] if method == Method::GET => return poster(app, &who.user.id, id).await,
         ["plays", id, "fallback"] if method == Method::POST => {

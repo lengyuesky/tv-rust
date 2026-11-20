@@ -266,7 +266,7 @@ async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
     }
     Ok(info)
 }
-fn cached(e: &Episode) -> Option<MediaInfo> {
+pub(crate) fn cached(e: &Episode) -> Option<MediaInfo> {
     let info = serde_json::from_str::<MediaInfo>(&e.probe).ok()?;
     (e.probed_at > now() - 21600
         && !(info.kind == "hls" && info.streams.is_empty() && info.probe_version == 0))

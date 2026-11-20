@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/lengyuesky/tv-rust"
 
 [dependencies]
+ab_glyph = "0.2"
 anyhow = "1"
 argon2 = "0.6"
 async-stream = "0.3"
@@ -14,6 +15,7 @@ axum = { version = "0.8", features = ["macros"] }
 bs58 = "0.5"
 bytes = "1"
 futures-util = "0.3"
+png = "0.18"
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream"] }
