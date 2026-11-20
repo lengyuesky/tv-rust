@@ -61,3 +61,7 @@ Rust **43 项测试**、Clippy、Rust 格式、前端 **13 项测试**、TypeScr
 Chrome **157.0.8103.80**、独立数据库和真实受控 MP4 完成 **5 组浏览器验收**：三个来源的 `0:02／0:53／0:12` 在首页只显示最近的 `0:12` 卡片；点击后实际播放来源 C 的 720p 视频并从 12 秒继续；换回来源 A 观看后首页仍为一张并更新到 A 的 6 秒，其他来源记录保留；390px 手机同样只有一张，点击到最新来源且无横向溢出；其他账号看不到这些继续观看和历史。无 JavaScript 异常，桌面和手机截图已人工核对。
 
 浏览器证据目录为 `tmp/continue-watching-20261120-CkKq4u/`，包括 `results.json`、首页桌面／手机截图、完整历史截图与隔离服务日志；检查日志为 `tmp/continue-watching-20261120/`，脚本为 `tmp/ui-regression-tools/continue-watching-check.mjs`。测试服务和浏览器已停止，本轮未修改用户实际数据库和部署，未进行真实飞牛客户端验收。
+
+[继续观看修正的发布工作流](https://github.com/lengyuesky/tv-rust/actions/runs/44702539666) 已成功，功能提交为 `8cae5119218f17c1b23fe01479e32c757dc9f941`。CI 检查及网页构建 1 分 16 秒，AMD64 原生构建与启动检查 1 分 35 秒，ARM64 1 分 28 秒，合并发布 27 秒，整条工作流 **3 分 26 秒**。
+
+已独立核验 GHCR `latest` 与 `sha-8cae5119218f17c1b23fe01479e32c757dc9f941` 指向同一索引，包含且仅包含 `linux/amd64`、`linux/arm64`，两个架构的修订标签均匹配本次功能提交；索引摘要为 `sha256:0a0ef65fdff479cfad205360e8aef166c2ee7411046ebac6b807e8f441f385a5`。发布与镜像证据为 `tmp/continue-watching-20261120/ci-run.json`、`image-verification.json` 和同目录的原始镜像信息。新版镜像已发布，用户实际部署尚未更新。
