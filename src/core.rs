@@ -203,6 +203,16 @@ impl App {
                 .await?;
             tx.commit().await?;
         }
+        if schema < 6 {
+            let mut tx = db.begin().await?;
+            sqlx::raw_sql(include_str!("../migrations/0006.sql"))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("PRAGMA user_version=6")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
         let blocked: String =
             sqlx::query_scalar("SELECT value FROM settings WHERE key='forbid_proxy'")
                 .fetch_one(&db)

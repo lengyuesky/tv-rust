@@ -277,6 +277,16 @@ pub async fn get(app: &App, e: &Episode) -> Result<MediaInfo> {
     get_inner(app, e, false).await
 }
 
+pub(crate) fn require_available(info: &MediaInfo) -> Result<()> {
+    if matches!(
+        info.warning.as_str(),
+        "媒体探测返回 HTTP 404" | "媒体探测返回 HTTP 410"
+    ) {
+        return Err(Error::bad("媒体地址已失效，请刷新来源或选择其他播放源"));
+    }
+    Ok(())
+}
+
 pub async fn source_quality(
     app: &App,
     user: &str,

@@ -51,6 +51,7 @@ async fn harness() -> Harness {
                 ([("content-type","application/vnd.apple.mpegurl")],body).into_response()
             },
             "/encrypted.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],include_str!("fixtures/hls-probe/media.m3u8")).into_response(),
+            "/gone.m3u8"=>StatusCode::GONE.into_response(),
             "/key.bin"=>include_bytes!("fixtures/hls-probe/key.bin").as_slice().into_response(),
             "/segment-0.ts"=>include_bytes!("fixtures/hls-probe/segment-0.ts").as_slice().into_response(),
             "/slow"=>Response::builder().header("content-type","video/mp4").body(Body::from_stream(async_stream::stream!{
@@ -562,7 +563,7 @@ async fn admins_only_subscriptions_support_import_edit_refresh_and_restart() {
             .fetch_one(&restarted.db)
             .await
             .unwrap(),
-        5
+        6
     );
 }
 
@@ -1124,7 +1125,7 @@ async fn legacy_removals_are_migrated_once_without_losing_favorites() {
             .fetch_one(&again.db)
             .await
             .unwrap(),
-        5
+        6
     );
 }
 
@@ -2647,7 +2648,7 @@ async fn media_resource_limit_is_atomic_and_existing_resources_remain_accessible
         .await
         .unwrap();
     let p = playback::get(&h.app, &id).await.unwrap();
-    sqlx::query("WITH RECURSIVE items(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM items WHERE n<11000) INSERT INTO media_assets SELECT 'bounded-'||n,?,'https://media.example/existing' FROM items")
+    sqlx::query("WITH RECURSIVE items(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM items WHERE n<11000) INSERT INTO media_assets(id,play_id,url) SELECT 'bounded-'||n,?,'https://media.example/existing' FROM items")
         .bind(&id).execute(&h.app.db).await.unwrap();
     let path = text(&fb, "url");
     let parts = path.split('/').collect::<Vec<_>>();
@@ -2661,7 +2662,7 @@ async fn media_resource_limit_is_atomic_and_existing_resources_remain_accessible
         .await
         .unwrap();
     assert_eq!(count, 11001, "超额清单不能留下部分分片映射");
-    sqlx::query("WITH RECURSIVE items(n) AS (VALUES(11001) UNION ALL SELECT n+1 FROM items WHERE n<11998) INSERT INTO media_assets SELECT 'bounded-'||n,?,'https://media.example/existing' FROM items")
+    sqlx::query("WITH RECURSIVE items(n) AS (VALUES(11001) UNION ALL SELECT n+1 FROM items WHERE n<11998) INSERT INTO media_assets(id,play_id,url) SELECT 'bounded-'||n,?,'https://media.example/existing' FROM items")
         .bind(&id).execute(&h.app.db).await.unwrap();
     let (first, second) = tokio::join!(
         playback::asset(&h.app, &p, "https://media.example/first"),
@@ -3844,5 +3845,787 @@ async fn native_work_and_episode_identities_survive_restart_and_recheck_access()
         .0,
         400,
         "参考单集失效后不能静默播放其他集"
+    );
+}
+
+async fn native_hls_fixture(h: &Harness, extensionless: bool) -> Vec<catalog::Episode> {
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let base = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url).unwrap();
+    let first = base
+        .join(if extensionless {
+            "/master"
+        } else {
+            "/encrypted.m3u8"
+        })
+        .unwrap();
+    let second = base.join("/encrypted.m3u8?variant=2").unwrap();
+    let film = catalog::ingest(&h.app, &source, &json!({
+        "vod_id":7100,"vod_name":"原生HLS交付验收","vod_year":"2026","type_name":"电影",
+        "vod_play_from":"lzm3u8$$$备用线路","vod_play_url":format!("正片${first}$$$正片${second}")
+    }), true).await.unwrap().unwrap();
+    let eps = catalog::episodes(&h.app, &film.id).await.unwrap();
+    for e in &eps {
+        sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+            .bind(json!({"probe_version":1,"kind":"hls","duration":120.0,"size":0,"streams":[
+                {"index":0,"codec_type":"video","codec_name":"h264","width":1280,"height":720,"avg_frame_rate":"24/1","bit_rate":"4200000"}
+            ],"warning":""}).to_string()).bind(now()).bind(&e.id).execute(&h.app.db).await.unwrap();
+    }
+    catalog::episodes(&h.app, &film.id).await.unwrap()
+}
+
+#[tokio::test]
+async fn native_hls_uses_a_ready_manifest_instead_of_the_strm_file_channel() {
+    let h = harness().await;
+    let eps = native_hls_fixture(&h, false).await;
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert!(
+        stream["data"]["cloud_storage_info"].is_null(),
+        "HLS不能作为网盘原文件直链交付"
+    );
+    assert!(
+        stream["data"]["direct_link_qualities"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    let qualities = stream["data"]["qualities"].as_array().unwrap();
+    assert_eq!(qualities.len(), 2);
+    assert!(
+        qualities
+            .iter()
+            .all(|quality| quality["progressive"] == true && quality["is_m3u8"] == false)
+    );
+    assert!(
+        qualities
+            .iter()
+            .any(|quality| text(quality, "resolution") == "测试源/1 · 720p")
+    );
+    let (_, played) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/play",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(played["data"]["wrapper"], "HLS");
+    let play_link = text(&played["data"], "play_link");
+    assert!(
+        play_link.starts_with("/v/native-menu/"),
+        "原生HLS换源交付同站相对清单地址"
+    );
+    let link = url::Url::parse("http://127.0.0.1:3000")
+        .unwrap()
+        .join(&play_link)
+        .unwrap();
+    assert!(
+        link.path().ends_with(".m3u8"),
+        "原生HLS媒体地址必须保留格式后缀"
+    );
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(link.path())
+                .header("range", "bytes=0-0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "入口直接交付HLS主清单，不能仅假设客户端跟随无后缀跳转"
+    );
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/vnd.apple.mpegurl"
+    );
+    let text = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.starts_with("#EXTM3U"));
+    assert!(text.contains("#EXT-X-STREAM-INF:"));
+    assert!(text.contains(&eps[0].url));
+    assert!(
+        text.contains("BANDWIDTH=4200000"),
+        "HLS带宽必须使用实际码率而非菜单选择码"
+    );
+}
+
+#[tokio::test]
+async fn native_menu_respects_https_reverse_proxy_and_media_extensions() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let url = catalog::episode(&h.app, &h.episode).await.unwrap().url;
+    let film = catalog::ingest(
+        &h.app,
+        &source,
+        &json!({"vod_id":7101,"vod_name":"HTTPS交付验收","vod_year":"2026",
+        "vod_play_from":"线路A$$$线路B","vod_play_url":format!("正片${url}$$$正片${url}")}),
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let eps = catalog::episodes(&h.app, &film.id).await.unwrap();
+    for e in &eps {
+        cached_native_media(&h, &e.id, 1280, 720).await;
+    }
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v/api/v1/stream")
+                .header("host", "127.0.0.1:3000")
+                .header("x-forwarded-host", "video.example:8443")
+                .header("x-forwarded-proto", "https")
+                .header("authorization", format!("Bearer {}", h.raw))
+                .body(Body::from(json!({"media_guid":eps[0].id}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let data: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    for choice in data["data"]["direct_link_qualities"].as_array().unwrap() {
+        let link = url::Url::parse(&text(choice, "url")).unwrap();
+        assert_eq!(
+            link.origin().ascii_serialization(),
+            "https://video.example:8443"
+        );
+        assert!(link.path().ends_with(".mp4"));
+        assert!(text(choice, "resolution").ends_with(" · 720p"));
+        assert!(!text(choice, "resolution").contains('\n'));
+    }
+    assert_eq!(
+        data["data"]["cloud_storage_info"]["cloud_storage_type"],
+        9001
+    );
+}
+
+#[tokio::test]
+async fn native_nas_retry_streams_media_and_honors_the_global_proxy_policy() {
+    let h = harness().await;
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":h.episode}),
+        Some(&h.raw),
+    )
+    .await;
+    let path = format!("/v/api/v1/media/range/{}", h.episode);
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header("host", "127.0.0.1:3000")
+                .header("authorization", format!("Bearer {}", h.raw))
+                .header("cookie", "Trim-MC-token=must-not-reach-source")
+                .header("range", "bytes=2-5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        206,
+        "原生NAS代理播放应就地建立当前会话的转发"
+    );
+    assert_eq!(response.headers()["content-range"], "bytes 2-5/8");
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "2345"
+    );
+    let p = playback::latest(&h.app, &h.who, &h.episode).await.unwrap();
+    assert_eq!(p.mode, "proxy");
+    let menus_before: i64 = sqlx::query_scalar("SELECT count(*) FROM fntv_playback_menus")
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap();
+    let (_, recorded) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        json!({
+            "media_guid":h.episode,"play_link":"12345678-1234-1234-1234-123456789abc","ts":15
+        }),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(recorded["data"], true);
+    assert_eq!(
+        request(&h, "GET", &path, json!({}), Some(&h.raw)).await.0,
+        200
+    );
+    let menus_after: i64 = sqlx::query_scalar("SELECT count(*) FROM fntv_playback_menus")
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap();
+    assert_eq!(menus_after, menus_before, "重复读取不能替换原生进度关联");
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &h.film, false)
+            .await
+            .unwrap()["progress"]["position"],
+        15.0
+    );
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    assert_eq!(
+        request(&h, "GET", &path, json!({}), Some(&h.raw)).await.0,
+        403
+    );
+}
+
+#[tokio::test]
+async fn native_hls_rpc_reuses_its_manifest_link_and_proxies_all_child_resources() {
+    let h = harness().await;
+    let eps = native_hls_fixture(&h, true).await;
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    let (_, played) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/play",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    let link = text(&played["data"], "play_link");
+    let current_code = &stream["data"]["video_stream"]["bps"];
+    let target_quality = stream["data"]["qualities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|quality| &quality["bitrate"] != current_code)
+        .unwrap();
+    let (_, rpc) = request(
+        &h,
+        "POST",
+        "/v/api/v1/media/p",
+        json!({"req":"media.resetQuality","reqid":"native-hls-switch",
+        "playLink":link,"quality":target_quality}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(rpc["data"]["result"], "succ");
+    assert_eq!(
+        rpc["data"]["play_link"], link,
+        "HLS在线换源要保持原播放清单地址有效"
+    );
+    let url = url::Url::parse("http://127.0.0.1:3000")
+        .unwrap()
+        .join(&link)
+        .unwrap();
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(url.path())
+                .header("authorization", format!("Bearer {}", h.raw))
+                .header("range", "bytes=0-0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let manifest = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(manifest.starts_with("#EXTM3U"));
+    assert!(
+        !manifest.contains("#EXT-X-KEY:"),
+        "原生转发交付原画解密分片"
+    );
+    assert!(!manifest.contains("secret=1"));
+    assert!(!manifest.contains("segment.ts"));
+    let segment = manifest
+        .lines()
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap();
+    assert!(
+        segment.starts_with("http://127.0.0.1:3000/media/"),
+        "原生分片地址须包含完整服务地址"
+    );
+    let segment_response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(segment)
+                .header("range", "bytes=0-")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(segment_response.status(), 200);
+    assert_eq!(segment_response.headers()["content-type"], "video/mp2t");
+    assert!(!segment_response.headers().contains_key("content-range"));
+    let data = segment_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(data.first(), Some(&0x47));
+    assert_eq!(data.len() % 188, 0, "解密后保留完整的 MPEG-TS 包");
+    let media = h._dir.path().join("native-decrypted.ts");
+    tokio::fs::write(&media, data).await.unwrap();
+    let probed = tokio::process::Command::new("ffprobe")
+        .args(["-v", "error", "-show_streams", "-of", "json"])
+        .arg(media)
+        .output()
+        .await
+        .unwrap();
+    assert!(probed.status.success());
+    let streams: Value = serde_json::from_slice(&probed.stdout).unwrap();
+    let video = streams["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .unwrap();
+    assert_eq!(video["codec_name"], "h264");
+    assert_eq!(video["width"], 64);
+    assert_eq!(video["height"], 64);
+    let active = playback::latest(&h.app, &h.who, &eps[1].id).await.unwrap();
+    assert_eq!(active.mode, "proxy");
+    assert!(playback::latest(&h.app, &h.who, &eps[0].id).await.is_err());
+    let (_, selected) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/play",
+        json!({"media_guid":eps[1].id,"bitrate":target_quality["bitrate"]}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(
+        selected["data"]["play_link"], link,
+        "换源后当前媒体仍解析同一菜单"
+    );
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let head = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(url.path())
+                .header("authorization", format!("Bearer {}", h.raw))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 403, "认证媒体HEAD同样服从禁止转发设置");
+}
+
+#[tokio::test]
+async fn expired_media_is_reported_before_playback_and_failed_switch_keeps_the_old_source() {
+    let h = harness().await;
+    let eps = native_hls_fixture(&h, false).await;
+    let gone = url::Url::parse(&eps[1].url)
+        .unwrap()
+        .join("/gone.m3u8")
+        .unwrap();
+    sqlx::query("UPDATE episodes SET url=?,probe='',probed_at=0 WHERE id=?")
+        .bind(gone.as_str())
+        .bind(&eps[1].id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    assert!(
+        playback::start(&h.app, &h.who, &eps[1].id)
+            .await
+            .unwrap_err()
+            .1
+            .contains("媒体地址已失效")
+    );
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    let (_, played) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/play",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    let target = stream["data"]["qualities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|quality| text(quality, "resolution").contains("画质待识别"))
+        .unwrap();
+    let (status, failed) = request(
+        &h,
+        "POST",
+        "/v/api/v1/media/p",
+        json!({"req":"media.resetQuality","reqid":"expired-switch",
+        "playLink":played["data"]["play_link"],"quality":target}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(text(&failed, "msg").contains("媒体地址已失效"));
+    assert!(
+        !playback::latest(&h.app, &h.who, &eps[0].id)
+            .await
+            .unwrap()
+            .ended
+    );
+    assert!(playback::latest(&h.app, &h.who, &eps[1].id).await.is_err());
+    for path in [
+        "/v/api/v1/play/info",
+        "/v/api/v1/stream",
+        "/v/api/v1/play/play",
+    ] {
+        let (status, response) = request(
+            &h,
+            "POST",
+            path,
+            json!({"media_guid":eps[1].id}),
+            Some(&h.raw),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(text(&response, "msg").contains("媒体地址已失效"));
+    }
+}
+
+#[tokio::test]
+async fn native_hls_api_switch_does_not_let_the_old_client_quit_end_the_new_playback() {
+    let h = harness().await;
+    let eps = native_hls_fixture(&h, false).await;
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    let code = stream["data"]["video_stream"]["bps"].as_u64().unwrap();
+    let target = stream["data"]["qualities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|quality| quality["bitrate"] != code)
+        .unwrap();
+    let sdk_id = "12345678-1234-1234-1234-123456789abc";
+    let old_report = |ts| json!({"media_guid":eps[0].id,"play_link":sdk_id,"ts":ts,"bitrate":code});
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        old_report(12),
+        Some(&h.raw),
+    )
+    .await;
+    let (_, switched) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/play",
+        json!({"media_guid":eps[0].id,"bitrate":target["bitrate"],"startTimestamp":12}),
+        Some(&h.raw),
+    )
+    .await;
+    let link = text(&switched["data"], "play_link");
+    let unbound_old = "12345678-1234-1234-1234-123456789abe";
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        json!({"media_guid":eps[0].id,"play_link":unbound_old,"ts":99,"bitrate":code}),
+        Some(&h.raw),
+    )
+    .await;
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/quit",
+        json!({"media_guid":eps[0].id,"play_link":unbound_old}),
+        Some(&h.raw),
+    )
+    .await;
+    let old_quit = json!({"media_guid":eps[0].id,"play_link":sdk_id});
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/play/quit",
+            old_quit.clone(),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(
+        !playback::latest(&h.app, &h.who, &eps[1].id)
+            .await
+            .unwrap()
+            .ended
+    );
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        old_report(99),
+        Some(&h.raw),
+    )
+    .await;
+    let path = url::Url::parse("http://127.0.0.1:3000")
+        .unwrap()
+        .join(&link)
+        .unwrap()
+        .path()
+        .to_owned();
+    assert_eq!(
+        request(&h, "GET", &path, json!({}), Some(&h.raw)).await.0,
+        200
+    );
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/play/record",
+            json!({"media_guid":eps[0].id,"play_link":link,"ts":20,"bitrate":target["bitrate"]}),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &eps[0].film_id, false)
+            .await
+            .unwrap()["progress"]["position"],
+        20.0
+    );
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/play",
+        json!({"media_guid":eps[1].id,"bitrate":code}),
+        Some(&h.raw),
+    )
+    .await;
+    request(&h, "POST", "/v/api/v1/play/quit", old_quit, Some(&h.raw)).await;
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        old_report(99),
+        Some(&h.raw),
+    )
+    .await;
+    let current = playback::latest(&h.app, &h.who, &eps[0].id).await.unwrap();
+    assert!(
+        !current.ended,
+        "换回相同集号与线路后也不能接受旧SDK退出通知"
+    );
+    assert_eq!(current.reports, 0);
+}
+
+#[tokio::test]
+async fn native_hls_client_record_ids_save_progress_and_remain_isolated_after_switch_delete_and_replay()
+ {
+    let h = harness().await;
+    let eps = native_hls_fixture(&h, false).await;
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    let code = stream["data"]["video_stream"]["bps"].as_u64().unwrap();
+    let other = stream["data"]["qualities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|quality| quality["bitrate"] != code)
+        .unwrap();
+    let sdk_id = "12345678-1234-1234-1234-123456789abc";
+    let (_, item) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/item/{}", eps[0].film_id),
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    let canonical = text(&item["data"], "guid");
+    let report = |ts, bitrate| json!({"item_guid":eps[0].id,"media_guid":eps[0].id,"play_link":sdk_id,"ts":ts,"bitrate":bitrate});
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/play/record",
+            json!({"item_guid":canonical,"play_link":sdk_id,"ts":12,"bitrate":code}),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &eps[0].film_id, false)
+            .await
+            .unwrap()["progress"]["position"],
+        12.0
+    );
+    let reset = |quality: Value| json!({"req":"media.resetQuality","reqid":"switch","playLink":sdk_id,"quality":quality});
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/media/p",
+            reset(other.clone()),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        200
+    );
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        report(99, code),
+        Some(&h.raw),
+    )
+    .await;
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        report(20, other["bitrate"].as_u64().unwrap()),
+        Some(&h.raw),
+    )
+    .await;
+    let switched = catalog::view(&h.app, &h.who.user.id, &eps[0].film_id, false)
+        .await
+        .unwrap();
+    assert_eq!(switched["progress"]["episode_id"], eps[1].id);
+    assert_eq!(switched["progress"]["position"], 20.0);
+    let original_quality = stream["data"]["qualities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|quality| quality["bitrate"] == code)
+        .unwrap();
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/media/p",
+        reset(original_quality.clone()),
+        Some(&h.raw),
+    )
+    .await;
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        report(27, code),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &eps[0].film_id, false)
+            .await
+            .unwrap()["progress"]["position"],
+        27.0,
+        "换回旧线路仍能记录，不能把清单地址当作重复播放身份"
+    );
+    assert!(
+        catalog::personal(&h.app, &h.other.user.id, "history")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    playback::remove_history(
+        &h.app,
+        &h.who.user.id,
+        std::slice::from_ref(&eps[0].film_id),
+    )
+    .await
+    .unwrap();
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        report(30, code),
+        Some(&h.raw),
+    )
+    .await;
+    assert!(
+        catalog::personal(&h.app, &h.who.user.id, "history")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        report(80, code),
+        Some(&h.raw),
+    )
+    .await;
+    assert!(
+        catalog::personal(&h.app, &h.who.user.id, "history")
+            .await
+            .unwrap()
+            .is_empty(),
+        "旧原生记录身份不能落入重新起播的菜单"
+    );
+    request(&h,"POST","/v/api/v1/play/record",json!({"media_guid":eps[0].id,"play_link":"12345678-1234-1234-1234-123456789abd","ts":10,"bitrate":code}),Some(&h.raw)).await;
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &eps[0].film_id, false)
+            .await
+            .unwrap()["progress"]["position"],
+        10.0
     );
 }

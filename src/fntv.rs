@@ -397,7 +397,7 @@ pub(crate) fn menu_label(file: &Value, duplicated: bool) -> String {
     } else {
         "画质待识别".to_owned()
     };
-    format!("{name}{line}\n{quality}")
+    format!("{name}{line} · {quality}")
 }
 
 pub(crate) async fn stream_list(
@@ -684,7 +684,7 @@ fn tracks(
                     _ => "",
                 });
                 v["wrapper"] = json!(if info.kind == "hls" {
-                    "hls"
+                    "HLS"
                 } else {
                     "mov,mp4,m4a,3gp,3g2,mj2"
                 });
@@ -977,19 +977,21 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 return Ok(response);
             }
             catalog::available(app, &who.user.id, &e.id).await?;
-            let p = playback::latest(app, &who, &e.id).await?;
+            let mut p = playback::latest(app, &who, &e.id).await?;
             if p.mode == "direct" {
-                playback::event(
-                    app,
-                    &p,
-                    "legacy_media_requested",
-                    "客户端请求文件传输入口；请启用播放器直链模式，或在播放日志选择转发重试",
-                )
-                .await?;
-                return Err(Error::bad(
-                    "请使用飞牛直链画质；需要转发时先在本项目播放日志选择转发重试",
-                ));
+                // 原生文件入口也是客户端“NAS 代理播放”的重试通道。
+                // 只为该会话建立安全转发，仍遵守全局禁止转发设置。
+                playback::fallback(app, &who, &p.id, "manual").await?;
+                p = playback::get(app, &p.id).await?;
             }
+            native_playback::proxy_menu(
+                app,
+                &who,
+                &e,
+                &native_playback::origin(app, &headers)?,
+                &p.id,
+            )
+            .await?;
             let id = playback::asset(app, &p, &e.url).await?;
             return playback::proxy_play(app, &p, None, &id, method, headers).await;
         }
@@ -1148,6 +1150,15 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
     catalog::available(app, &who.user.id, &e.id).await?;
     let f = catalog::film(app, &e.film_id).await?;
     let info = probe::get(app, &e).await?;
+    if matches!(
+        path.as_str(),
+        "/v/api/v1/play/info"
+            | "/v/api/v1/stream"
+            | "/v/api/v1/stream/directLink"
+            | "/v/api/v1/play/play"
+    ) {
+        probe::require_available(&info)?;
+    }
     catalog::available(app, &who.user.id, &e.id).await?;
     let source = catalog::source(app, &f.source_id).await?;
     let (video, audio, subtitle) = tracks(&e, &info, &source.name);
@@ -1219,15 +1230,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                         .execute(&app.db)
                         .await?;
                     let asset = playback::asset(app, p, &e.url).await?;
-                    let base = if !app.public_url.is_empty() {
-                        app.public_url.clone()
-                    } else {
-                        let host = headers
-                            .get("host")
-                            .and_then(|v| v.to_str().ok())
-                            .ok_or_else(|| Error::bad("缺少服务地址"))?;
-                        format!("http://{host}")
-                    };
+                    let base = native_playback::origin(app, &headers)?;
                     playback::event(app, p, "proxy_issued", "已为飞牛当前播放交付转发地址").await?;
                     (
                         format!("{}/media/{access}/{asset}", base.trim_end_matches('/')),
@@ -1280,7 +1283,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 let current = &menu["qualities"][selected];
                 response["video_stream"]["resolution_type"] = current["resolution"].clone();
                 response["video_stream"]["bps"] = current["bitrate"].clone();
-                if !*app.forbid_proxy.borrow() {
+                if info.kind == "hls" {
                     response["cloud_storage_info"] = Value::Null;
                 }
             }
@@ -1291,10 +1294,12 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 .map(|(_, link)| link)
                 .or(native_playback::current_link(app, &who, &e.id).await?)
             {
+                let link = native_playback::client_link(&link, &info.kind)?;
                 return Ok(ok(
                     json!({"play_link":link,"media_guid":e.id,"video_guid":video.first().map(|v|text(v,"guid")).unwrap_or_default(),
                     "video_index":0,"audio_guid":audio.first().map(|v|text(v,"guid")).unwrap_or_default(),"audio_index":0,
-                    "subtitle_guid":"","subtitle_index":-1,"subtitle_link":"","wrapper":if info.kind=="hls"{"HLS"}else{"MP4"},"hls_time":6,"is_subtitle_external":0}),
+                    "subtitle_guid":"","subtitle_index":-1,"subtitle_link":"","wrapper":if info.kind=="hls"{"HLS"}else{"MP4"},"hls_time":6,"is_subtitle_external":0,
+                    "non_fatal_errno":null,"video_encoder":"","not_supported_resolution":"","supported_highest_resolution":""}),
                 ));
             }
             let p = match playback::latest(app, &who, &e.id).await {

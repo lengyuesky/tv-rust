@@ -1,4 +1,4 @@
-use crate::{access, catalog, core::*, net, probe};
+use crate::{access, catalog, core::*, hls_crypto, net, probe};
 use axum::{
     body::Body,
     http::{HeaderMap, Method, StatusCode},
@@ -87,6 +87,15 @@ fn map_asset(
     resources: &mut BTreeMap<String, String>,
     key: bool,
 ) -> Result<String> {
+    map_asset_context(p, url, resources, key, "")
+}
+fn map_asset_context(
+    p: &Play,
+    url: &str,
+    resources: &mut BTreeMap<String, String>,
+    key: bool,
+    context: &str,
+) -> Result<String> {
     let parsed = net::valid_url(url)?;
     // FFmpeg HLS 会检查分片扩展名；仅保留格式后缀，不暴露上游路径和查询凭据。
     let extension = parsed
@@ -101,7 +110,12 @@ fn map_asset(
         | "webvtt" | "key" | "bin" => format!(".{extension}"),
         _ => String::new(),
     };
-    let id = format!("{}{suffix}", guid(&["asset", &p.id, url]));
+    let identity = if context.is_empty() {
+        guid(&["asset", &p.id, url])
+    } else {
+        guid(&["asset", &p.id, url, context])
+    };
+    let id = format!("{identity}{suffix}");
     resources
         .entry(id.clone())
         .or_insert_with(|| url.to_owned());
@@ -142,6 +156,7 @@ async fn register_assets(app: &App, p: &Play, resources: &BTreeMap<String, Strin
 pub async fn start(app: &App, who: &Identity, episode_id: &str) -> Result<Value> {
     let (e, f, source) = catalog::available(app, &who.user.id, episode_id).await?;
     let info = probe::get(app, &e).await?;
+    probe::require_available(&info)?;
     let id = guid(&[&random()]);
     let access = random();
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
@@ -464,10 +479,37 @@ async fn rewrite(app: &App, p: &Play, access: &str, base: &str, input: &str) -> 
     static URI: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r#"URI="([^"]+)""#).unwrap());
     let base = net::valid_url(base)?;
+    let native_origin: Option<String> = sqlx::query_scalar(
+        "SELECT origin FROM fntv_playback_menus WHERE active_play_id=? AND closed=0 ORDER BY rowid DESC LIMIT 1",
+    ).bind(&p.id).fetch_optional(&app.db).await?;
+    let native = native_origin.is_some();
+    let media_base = native_origin
+        .map(|origin| format!("{origin}/media/{access}"))
+        .unwrap_or_else(|| format!("/media/{access}"));
     let mut out = String::new();
     let mut resources = BTreeMap::new();
+    let mut cryptos = BTreeMap::new();
+    let mut encryption = None;
+    let mut sequence = 0_u64;
     for raw in input.lines() {
         let line = raw.trim();
+        if native && let Some(key) = line.strip_prefix("#EXT-X-KEY:") {
+            encryption = hls_crypto::Encryption::parse(key, base.as_str())?;
+            continue;
+        }
+        if native && line.starts_with("#EXT-X-SESSION-KEY:") {
+            continue;
+        }
+        if let Some(number) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            sequence = number.parse().map_err(|_| Error::bad("HLS 分片序号无效"))?;
+        }
+        if encryption.is_some()
+            && (line.starts_with("#EXT-X-BYTERANGE:") || line.contains("BYTERANGE="))
+        {
+            return Err(Error::bad(
+                "此加密 HLS 使用字节区间，暂无法原画转发，请换源",
+            ));
+        }
         if line.starts_with('#') {
             let mut rewritten = line.to_owned();
             for captures in URI.captures_iter(line) {
@@ -476,27 +518,85 @@ async fn rewrite(app: &App, p: &Play, access: &str, base: &str, input: &str) -> 
                 let target = base
                     .join(href)
                     .map_err(|_| Error::bad("HLS 资源地址无效"))?;
-                let id = map_asset(
+                let crypto = if line.starts_with("#EXT-X-MAP:") {
+                    encryption
+                        .as_ref()
+                        .map(hls_crypto::Encryption::initialization)
+                        .transpose()?
+                } else {
+                    None
+                };
+                let id = map_hls_resource(
                     p,
                     target.as_str(),
                     &mut resources,
+                    &mut cryptos,
                     line.starts_with("#EXT-X-KEY:") || line.starts_with("#EXT-X-SESSION-KEY:"),
+                    crypto,
                 )?;
                 rewritten =
-                    rewritten.replace(matched.as_str(), &format!("URI=\"/media/{access}/{id}\""));
+                    rewritten.replace(matched.as_str(), &format!("URI=\"{media_base}/{id}\""));
             }
             out.push_str(&rewritten);
         } else if !line.is_empty() {
             let target = base
                 .join(line)
                 .map_err(|_| Error::bad("HLS 资源地址无效"))?;
-            let id = map_asset(p, target.as_str(), &mut resources, false)?;
-            out.push_str(&format!("/media/{access}/{id}"));
+            let id = map_hls_resource(
+                p,
+                target.as_str(),
+                &mut resources,
+                &mut cryptos,
+                false,
+                encryption.as_ref().map(|key| key.segment(sequence)),
+            )?;
+            out.push_str(&format!("{media_base}/{id}"));
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::bad("HLS 分片序号无效"))?;
         }
         out.push('\n');
     }
     register_assets(app, p, &resources).await?;
+    if !cryptos.is_empty() {
+        let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+        let entries: Vec<_> = cryptos.iter().collect();
+        for chunk in entries.chunks(200) {
+            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO media_assets(id,play_id,url,crypto) ",
+            );
+            query.push_values(chunk.iter().copied(), |mut row, (id, crypto)| {
+                row.push_bind(id)
+                    .push_bind(&p.id)
+                    .push_bind(&resources[id])
+                    .push_bind(serde_json::to_string(crypto).unwrap());
+            });
+            query.push(" ON CONFLICT(play_id,id) DO UPDATE SET crypto=excluded.crypto");
+            query.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        sqlx::query("INSERT INTO play_events(play_id,at,mode,event,message) SELECT ?,?,?,'hls_decrypted','为飞牛解密 AES-128 分片，保留原始编码与画质' WHERE NOT EXISTS(SELECT 1 FROM play_events WHERE play_id=? AND event='hls_decrypted')")
+            .bind(&p.id).bind(now()).bind(&p.mode).bind(&p.id).execute(&app.db).await?;
+    }
     Ok(out)
+}
+fn map_hls_resource(
+    p: &Play,
+    url: &str,
+    resources: &mut BTreeMap<String, String>,
+    cryptos: &mut BTreeMap<String, hls_crypto::Crypto>,
+    key: bool,
+    crypto: Option<hls_crypto::Crypto>,
+) -> Result<String> {
+    match crypto {
+        Some(crypto) => {
+            let context = serde_json::to_string(&crypto).unwrap();
+            let id = map_asset_context(p, url, resources, false, &context)?;
+            cryptos.insert(id.clone(), crypto);
+            Ok(id)
+        }
+        None => map_asset(p, url, resources, key),
+    }
 }
 pub async fn proxy(
     app: &App,
@@ -525,19 +625,31 @@ pub async fn proxy_play(
     if p.mode != "proxy" {
         return Err(Error::denied("请先明确选择转发重试"));
     }
-    let url: String = sqlx::query_scalar("SELECT url FROM media_assets WHERE play_id=? AND id=?")
-        .bind(&p.id)
-        .bind(asset_id)
-        .fetch_optional(&app.db)
-        .await?
-        .ok_or_else(Error::missing)?;
+    let (url, crypto): (String, String) =
+        sqlx::query_as("SELECT url,crypto FROM media_assets WHERE play_id=? AND id=?")
+            .bind(&p.id)
+            .bind(asset_id)
+            .fetch_optional(&app.db)
+            .await?
+            .ok_or_else(Error::missing)?;
+    let crypto: Option<hls_crypto::Crypto> = if crypto.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&crypto).map_err(|_| Error::bad("HLS 解密关联已失效"))?)
+    };
     let mut upstream_request = headers.clone();
-    if net::valid_url(&url)?
-        .path()
-        .to_ascii_lowercase()
-        .ends_with(".m3u8")
+    let root = catalog::episode(app, &p.episode_id).await?;
+    let known_hls_root =
+        root.url == url && probe::cached(&root).is_some_and(|info| info.kind == "hls");
+    if crypto.is_some()
+        || asset_id.ends_with(".key")
+        || known_hls_root
+        || net::valid_url(&url)?
+            .path()
+            .to_ascii_lowercase()
+            .ends_with(".m3u8")
     {
-        // 重写后的清单长度与源不同，不能沿用源的字节区间。
+        // 重写后的清单不能沿用源区间；AES 密钥完整交付，避免分段密钥响应。
         upstream_request.remove("range");
         upstream_request.remove("if-range");
     }
@@ -564,6 +676,20 @@ pub async fn proxy_play(
         .header("cache-control", "no-store")
         .header("referrer-policy", "no-referrer");
     if method == Method::HEAD {
+        if crypto.is_some() {
+            return Ok(builder
+                .status(StatusCode::OK)
+                .header(
+                    "content-type",
+                    if asset_id.ends_with(".mp4") {
+                        "video/mp4"
+                    } else {
+                        "video/mp2t"
+                    },
+                )
+                .body(Body::empty())
+                .unwrap());
+        }
         for k in [
             "content-type",
             "content-length",
@@ -629,6 +755,24 @@ pub async fn proxy_play(
             .body(Body::from(body))
             .unwrap());
     }
+    let mut decryptor = if let Some(crypto) = &crypto {
+        let key = hls_crypto::key(app, p, crypto).await?;
+        proxy_allowed(app, p).await?;
+        valid(app, &get(app, &p.id).await?).await?;
+        Some(hls_crypto::Cbc::new(&key, crypto.iv))
+    } else {
+        None
+    };
+    if crypto.is_some() {
+        builder = builder.status(StatusCode::OK).header(
+            "content-type",
+            if asset_id.ends_with(".mp4") {
+                "video/mp4"
+            } else {
+                "video/mp2t"
+            },
+        );
+    }
     for k in [
         "content-type",
         "content-length",
@@ -637,7 +781,9 @@ pub async fn proxy_play(
         "etag",
         "last-modified",
     ] {
-        if let Some(v) = upstream_headers.get(k) {
+        if crypto.is_none()
+            && let Some(v) = upstream_headers.get(k)
+        {
             builder = builder.header(k, v);
         }
     }
@@ -650,7 +796,8 @@ pub async fn proxy_play(
         if blocked{Err::<(),std::io::Error>(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"禁止转发已开启"))?;}
         let current=get(&app,&p.id).await.map_err(|_|std::io::Error::other("播放会话失效"))?;
         valid(&app,&current).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::PermissionDenied,"播放授权已失效"))?;
-        yield first;
+        let first = if let Some(cipher) = decryptor.as_mut() {bytes::Bytes::from(cipher.push(&first))} else {first};
+        if !first.is_empty() { yield first; }
         let mut checked=std::time::Instant::now();
         loop {
             let next=tokio::select! {
@@ -675,10 +822,15 @@ pub async fn proxy_play(
                     valid(&app,&current).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::PermissionDenied,"播放授权已失效"))?;
                     checked=std::time::Instant::now();
                 }
-                yield chunk;
+                let chunk = if let Some(cipher) = decryptor.as_mut() {bytes::Bytes::from(cipher.push(&chunk))} else {chunk};
+                if !chunk.is_empty() { yield chunk; }
             }else{
                 break;
             }
+        }
+        if let Some(cipher) = decryptor {
+            let last = cipher.finish()?;
+            if !last.is_empty() {yield bytes::Bytes::from(last);}
         }
     };
     let body = body.map(|chunk: std::io::Result<bytes::Bytes>| chunk);
