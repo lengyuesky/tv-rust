@@ -36,4 +36,8 @@ Rust 集成测试 48 项、Clippy、格式及本地构建通过；前端测试 1
 
 ## 发布验证
 
-推送及双架构镜像发布完成后补充实际提交、工作流和镜像摘要。
+[GitHub Actions](https://github.com/lengyuesky/tv-rust/actions/runs/44916556597) 已成功，功能提交为 `12b02c0b964c9e4df98f5ccad923c3c924004f05`。检查与网页构建 1 分 15 秒，AMD64 原生构建及启动检查 4 分 24 秒，ARM64 3 分 37 秒，合并发布 29 秒；双架构并行，完整工作流 6 分 16 秒。继续使用原有免费标准 runner 原生构建及一次网页构建流程，本轮没有增加构建任务。
+
+独立检查 GHCR：`ghcr.io/lengyuesky/tv-rust:latest` 和 `sha-12b02c0b964c9e4df98f5ccad923c3c924004f05` 指向相同索引，包含且仅包含 `linux/amd64` 和 `linux/arm64`。两种架构的 OCI 源码修订标签均等于本次功能提交，索引摘要为 `sha256:041290bcb7e3a160cfa78ea89cd1054467d1462bd42c1da93984df99638a1418`。
+
+发布证据位于 `tmp/native-player-20261121/final/` 的 `ci-run.json`、`image-latest.json`、`image-sha.json`、`image-configs.json`、`image-inspect.txt` 和 `image-verification.json`。镜像已发布，用户运行中的部署尚未更新；验收文档的后续提交不触发镜像重建。
