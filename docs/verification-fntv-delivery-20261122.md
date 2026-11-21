@@ -43,3 +43,11 @@ Rust 集成测试 **55 项**、AES 标准向量及 IV 单元测试 **2 项**，�
 公开量子 API 能返回《午夜规则》2026 的条目，ID 为 `165790`；第五集 `liangzi` 分享页和 `lzm3u8` 地址均实查返回 **404**。此为上游地址失效，需刷新或换其他有效来源，播放器适配不能恢复这个地址。脱敏证据为 `tmp/fntv-delivery-20261121/real-source-check.json` 和 `real-line-check.json`。
 
 本轮未连接用户的 iPhone 或运行中的服务，不宣称全部外部源、其他编码、加密格式或硬件客户端已经验证。镜像发布与用户部署更新分别核对。
+
+## 发布验证
+
+功能提交 `5df8d30cec897bacc3fcbf22a7106cc0b4c295f5` 已推送 `main`。[GitHub Actions](https://github.com/lengyuesky/tv-rust/actions/runs/44935014202) 全部成功：检查与网页构建 1 分 14 秒，AMD64 原生构建及启动检查 3 分 22 秒，ARM64 3 分 54 秒，合并发布 17 秒，完整流程 **5 分 32 秒**。两个架构并行构建，运行日志分别确认 4 个 CPU 和约 15 GiB 内存，对应现有免费标准 runner 的 4 核、16 GB；本轮没有增加网页或镜像构建次数。
+
+独立核对 GHCR：`ghcr.io/lengyuesky/tv-rust:latest` 与 `sha-5df8d30cec897bacc3fcbf22a7106cc0b4c295f5` 指向相同索引，包含且仅包含 `linux/amd64`、`linux/arm64`。两架构的 OCI 源码修订标签均为该功能提交，镜像运行用户仍为 `tv`。索引摘要为 `sha256:5ac9e4408a07149ac2ffd51cc82796db647f3585b43088c97c41f48a1a89c446`。
+
+发布证据位于本次证据目录的 `ci-run.json`、`ci-timings.json`、`ci-amd64.log`、`ci-arm64.log`、`image-latest.json`、`image-sha.json`、`image-configs.json` 和 `image-verification.json`。临时服务和客户端已停止。镜像已发布，用户运行中的部署尚未更新；在现有 Compose 目录运行 `docker compose pull`、`docker compose up -d`，然后重新进入播放页面使用新版。验收文档的后续提交不触发镜像重建。
