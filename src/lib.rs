@@ -6,11 +6,12 @@ pub mod auth;
 pub mod catalog;
 pub mod core;
 pub mod fntv;
+mod fntv_identity;
+mod fntv_playback;
 pub mod net;
 pub mod playback;
 pub mod preferences;
 pub mod probe;
-mod source_poster;
 
 use axum::{
     Router,
@@ -25,6 +26,10 @@ pub fn router(app: App, web_dir: &str) -> Router {
         .route("/api/{*path}", any(api::handle))
         .route("/trimcon", any(fntv::handle))
         .route("/v/{*path}", any(fntv::handle))
+        .route(
+            "/v/native-menu/{access}/{choice}",
+            any(fntv_playback::media),
+        )
         .route("/tv-poster/{*path}", any(fntv::handle))
         .route("/fntv-source-poster/{*path}", any(fntv::handle))
         .route("/media/{access}/{asset}", any(media))
@@ -34,7 +39,9 @@ pub fn router(app: App, web_dir: &str) -> Router {
         )
         .layer(axum::middleware::from_fn(
             |req: Request, next: axum::middleware::Next| async move {
-                let path = if req.uri().path().starts_with("/media/") {
+                let path = if req.uri().path().starts_with("/v/native-menu/") {
+                    "/v/native-menu/{access}/{choice}".to_owned()
+                } else if req.uri().path().starts_with("/media/") {
                     "/media/{access}/{asset}".to_owned()
                 } else {
                     req.uri()

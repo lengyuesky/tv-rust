@@ -66,10 +66,13 @@ pub fn token(headers: &HeaderMap) -> Option<String> {
 pub async fn identity(app: &App, headers: &HeaderMap) -> Result<Identity> {
     let raw = token(headers).ok_or_else(Error::unauthorized)?;
     let digest = hash(raw);
+    identity_for_hash(app, &digest).await
+}
+pub(crate) async fn identity_for_hash(app: &App, digest: &str) -> Result<Identity> {
     let row: Option<(String, String)> = sqlx::query_as(
         "SELECT user_id,client FROM auth_sessions WHERE token_hash=? AND expires_at>?",
     )
-    .bind(&digest)
+    .bind(digest)
     .bind(now())
     .fetch_optional(&app.db)
     .await?;
@@ -83,7 +86,7 @@ pub async fn identity(app: &App, headers: &HeaderMap) -> Result<Identity> {
     .ok_or_else(Error::unauthorized)?;
     Ok(Identity {
         user,
-        auth_hash: digest,
+        auth_hash: digest.to_owned(),
         client,
     })
 }

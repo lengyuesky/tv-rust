@@ -1156,7 +1156,7 @@ pub async fn recommendations(app: &App, kind: &str) -> Result<Value> {
     app.cache_put(&key, &result, 21600).await?;
     Ok(result)
 }
-fn known_year(year: &str) -> bool {
+pub(crate) fn known_year(year: &str) -> bool {
     year.len() == 4
         && year
             .parse::<u16>()

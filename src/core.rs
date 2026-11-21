@@ -117,6 +117,7 @@ pub struct Inner {
     pub recommendation_slots: Semaphore,
     pub login_budget: Mutex<HashMap<String, (i64, usize)>>,
     pub refresh_lock: tokio::sync::Mutex<()>,
+    pub native_switch_lock: tokio::sync::Mutex<()>,
 }
 impl std::ops::Deref for App {
     type Target = Inner;
@@ -192,6 +193,16 @@ impl App {
                 .await?;
             tx.commit().await?;
         }
+        if schema < 5 {
+            let mut tx = db.begin().await?;
+            sqlx::raw_sql(include_str!("../migrations/0005.sql"))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("PRAGMA user_version=5")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
         let blocked: String =
             sqlx::query_scalar("SELECT value FROM settings WHERE key='forbid_proxy'")
                 .fetch_one(&db)
@@ -209,6 +220,7 @@ impl App {
             recommendation_slots: Semaphore::new(4),
             login_budget: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
+            native_switch_lock: tokio::sync::Mutex::new(()),
         })))
     }
     pub async fn cache_get(&self, key: &str) -> Result<Option<serde_json::Value>> {

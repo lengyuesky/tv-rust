@@ -374,6 +374,18 @@ pub async fn remove_history(app: &App, user: &str, film_ids: &[String]) -> Resul
     for id in film_ids {
         grouped.extend(catalog::history_film_ids_on(&mut tx, user, id).await?);
     }
+    let mut menus = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "UPDATE fntv_playback_menus SET recording_disabled=1 WHERE user_id=",
+    );
+    menus
+        .push_bind(user)
+        .push(" AND reference_episode_id IN (SELECT id FROM episodes WHERE film_id IN (");
+    let mut ids = menus.separated(",");
+    for id in &grouped {
+        ids.push_bind(id);
+    }
+    menus.push("))");
+    menus.build().execute(&mut *tx).await?;
     // 清除记录和禁用旧会话的进度写入共用一把写锁；正在播放的媒体仍可继续。
     for sql in [
         "UPDATE plays SET recording_disabled=1 WHERE user_id=",

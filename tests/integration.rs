@@ -562,7 +562,7 @@ async fn admins_only_subscriptions_support_import_edit_refresh_and_restart() {
             .fetch_one(&restarted.db)
             .await
             .unwrap(),
-        4
+        5
     );
 }
 
@@ -1124,7 +1124,7 @@ async fn legacy_removals_are_migrated_once_without_losing_favorites() {
             .fetch_one(&again.db)
             .await
             .unwrap(),
-        4
+        5
     );
 }
 
@@ -1193,7 +1193,7 @@ async fn search_filters_unrelated_rows_before_ingest_and_ranks_titles_for_both_c
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(native["data"]["list"][0]["title"], "你好 · 测试源");
+    assert_eq!(native["data"]["list"][0]["title"], "你好");
     assert!(
         native["data"]["list"]
             .as_array()
@@ -2780,7 +2780,7 @@ async fn fntv_search_and_strm_contract_avoid_redirecting_login_headers() {
     .await;
     assert_eq!(status, 200);
     assert!(v["data"].is_array());
-    assert_eq!(v["data"][0]["title"], "原生搜索结果 · 测试源");
+    assert_eq!(v["data"][0]["title"], "原生搜索结果");
     let (status, v) = request(
         &h,
         "POST",
@@ -3073,7 +3073,33 @@ async fn native_continue_watching_groups_works_and_deletes_all_sources_for_only_
     .await;
     let items = rows["data"].as_array().unwrap();
     assert_eq!(items.len(), 9, "原生列表不能套用首页六条的限制");
-    assert_eq!(items[0]["grand_guid"], films[2].id);
+    assert_ne!(items[0]["grand_guid"], films[2].id);
+    assert_eq!(items[0]["tv_title"], "原生继续观看");
+    let (_, library) = request(
+        &h,
+        "POST",
+        "/v/api/v1/item/list",
+        json!({"ancestor_guid":tv_rust::fntv::library("TV")}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(library["data"]["total"], 9);
+    let shows: Vec<_> = library["data"]["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["title"] == "原生继续观看")
+        .collect();
+    assert_eq!(
+        shows.len(),
+        2,
+        "只有不同年份可分别显示，同年三个来源合为一条"
+    );
+    assert!(
+        shows
+            .iter()
+            .any(|show| show["guid"] == items[0]["grand_guid"])
+    );
     assert_eq!(items[0]["ts"], 2);
     assert_eq!(
         items[0]["episode_number"], 3,
@@ -3098,7 +3124,9 @@ async fn native_continue_watching_groups_works_and_deletes_all_sources_for_only_
             .1["data"],
         json!([])
     );
-    let own_episode = catalog::episode(&h.app, &latest).await.unwrap();
+    let own_episode = catalog::episode(&h.app, &text(&items[0], "media_guid"))
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO progress VALUES(?,?,?,?,?,?,?)")
         .bind(&h.who.user.id)
         .bind(&films[2].id)
@@ -3293,50 +3321,18 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
     )
     .await;
     assert_eq!(status, 200);
-    let files = versions["data"]["files"].as_array().unwrap();
-    assert_eq!(files.len(), 5);
-    let heights: Vec<_> = files
-        .iter()
-        .map(|file| file["quality"]["height"].as_f64().unwrap())
-        .collect();
-    assert_eq!(heights, vec![1080.0, 720.0, 360.0, 360.0, 0.0]);
-    assert!(
-        files[0]["file_name"]
-            .as_str()
-            .unwrap()
-            .contains("测试源 · 线路 2 · 第03集 · 1080p · 1920 × 1080")
-    );
-    assert!(
-        versions["data"]["video_streams"][0]["title"]
-            .as_str()
-            .unwrap()
-            .contains("测试源 · 线路 2 · 1080p")
-    );
     assert_eq!(
-        versions["data"]["video_streams"][0]["resolution_type"],
-        "1080p"
+        versions["data"]["files"].as_array().unwrap().len(),
+        1,
+        "详情只展示当前媒体，来源属于播放菜单"
     );
-    assert_eq!(versions["data"]["video_streams"][0]["color_range_type"], "");
-    assert!(
-        files[0]["path"]
-            .as_str()
-            .unwrap()
-            .contains("/测试源/线路 2 · 1080p")
-    );
-    assert!(
-        files.last().unwrap()["file_name"]
-            .as_str()
-            .unwrap()
-            .contains("画质待识别")
-    );
+    let menu = versions["data"]["qualities"].as_array().unwrap();
+    assert_eq!(menu.len(), 5);
+    assert!(text(&menu[0], "resolution").contains("1080p"));
+    assert!(text(&menu[1], "resolution").contains("720p"));
+    assert!(text(menu.last().unwrap(), "resolution").contains("画质待识别"));
     assert!(!versions.to_string().contains("原生隐藏源"));
     assert!(!versions.to_string().contains(&url));
-    for file in files {
-        let e = catalog::episode(&h.app, &text(file, "guid")).await.unwrap();
-        assert!(e.title == "第03集" || e.title == "第三集");
-        assert_ne!(e.film_id, wrong.id);
-        assert_ne!(e.film_id, ambiguous.id);
-    }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM plays")
             .fetch_one(&h.app.db)
@@ -3344,7 +3340,7 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
             .unwrap(),
         0
     );
-    let (status, seasons) = request(
+    let (_, seasons) = request(
         &h,
         "GET",
         &format!("/v/api/v1/season/list/{}", a.id),
@@ -3352,60 +3348,39 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
         Some(&h.member_raw),
     )
     .await;
-    assert_eq!(status, 200);
-    let choices = seasons["data"].as_array().unwrap();
-    assert_eq!(choices.len(), 5);
-    let high_b = choices
-        .iter()
-        .find(|row| {
-            row["source_name"] == secondary.name && row["quality"]["height"].as_f64() == Some(720.0)
-        })
-        .unwrap();
-    let version_id = text(high_b, "guid");
-    assert!(text(high_b, "title").contains("原生备用源 · 线路 2 · 第三集：720p"));
+    let seasons = seasons["data"].as_array().unwrap();
+    assert_eq!(seasons.len(), 1);
+    assert_eq!(seasons[0]["title"], "第 1 季");
     assert_eq!(
-        high_b["season_number"], 1,
-        "多个来源是同一季的版本，不伪装成其他季"
+        seasons[0]["number_of_episodes"], 3,
+        "补齐其他来源确认为同作品的第二集"
     );
-    let (_, selected_episodes) = request(
+    let season = text(&seasons[0], "guid");
+    let (_, episodes) = request(
         &h,
         "GET",
-        &format!("/v/api/v1/episode/list/{version_id}"),
+        &format!("/v/api/v1/episode/list/{season}"),
         json!({}),
         Some(&h.member_raw),
     )
     .await;
-    let eps = selected_episodes["data"].as_array().unwrap();
+    let eps = episodes["data"].as_array().unwrap();
     assert_eq!(eps.len(), 3);
-    assert!(eps.iter().all(|row| {
-        b_eps
-            .iter()
-            .any(|e| e.id == row["guid"] && e.line_order == 1)
-    }));
     assert_eq!(eps[2]["episode_number"], 3);
-    assert_eq!(eps[2]["guid"], b_third.id);
-    let (_, version_info) = request(
+    let (_, native_directory) = request(
         &h,
         "POST",
-        "/v/api/v1/play/info",
-        json!({"item_guid":version_id}),
+        "/v/api/v1/item/list",
+        json!({"ancestor_guid":season}),
         Some(&h.member_raw),
     )
     .await;
-    assert_eq!(version_info["data"]["media_guid"], b_third.id);
-    assert_eq!(version_info["data"]["ts"], 7);
-    let body = json!({"item_guid":a_third.id,"media_guid":b_third.id});
-    let (status, play_info) = request(
-        &h,
-        "POST",
-        "/v/api/v1/play/info",
-        body.clone(),
-        Some(&h.member_raw),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(play_info["data"]["media_guid"], b_third.id);
-    assert_eq!(play_info["data"]["ts"], 7);
+    assert_eq!(
+        native_directory["data"]["list"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(native_directory["data"]["list"][1]["episode_number"], 2);
+    let canonical = text(&eps[2], "guid");
     let (_, first) = request(
         &h,
         "POST",
@@ -3414,39 +3389,77 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
         Some(&h.member_raw),
     )
     .await;
-    let first_link = text(&first["data"]["direct_link_qualities"][0], "url");
-    let (_, selected) = request(
+    let lines = first["data"]["direct_link_qualities"].as_array().unwrap();
+    assert_eq!(lines.len(), 5);
+    assert!(
+        lines
+            .iter()
+            .all(|line| line["progressive"] == true && line["is_m3u8"] == false)
+    );
+    let selected = lines
+        .iter()
+        .find(|line| {
+            text(line, "resolution").contains("原生备用源/2")
+                && text(line, "resolution").contains("720p")
+        })
+        .unwrap();
+    let selected_link = text(selected, "url");
+    let current_index = first["data"]["direct_link_quality_index"].as_u64().unwrap() as usize;
+    let first_link = text(&lines[current_index], "url");
+    assert_eq!(
+        first["data"]["video_stream"]["resolution_type"], lines[current_index]["resolution"],
+        "起播选择当前来源，不能误选画质排序的第一项"
+    );
+    assert_eq!(
+        first["data"]["video_stream"]["bps"],
+        lines[current_index]["bitrate"]
+    );
+    assert_ne!(
+        first["data"]["quality"]["bitrate"], lines[current_index]["bitrate"],
+        "菜单选择码不能用作实测码率"
+    );
+    assert_eq!(first["data"]["header"], json!({}));
+    let (status, play) = request(
         &h,
         "POST",
-        "/v/api/v1/stream",
-        body.clone(),
+        "/v/api/v1/play/play",
+        json!({"media_guid":a_third.id,"item_guid":canonical,"bitrate":selected["bitrate"]}),
         Some(&h.member_raw),
     )
     .await;
-    let link = text(&selected["data"]["direct_link_qualities"][0], "url");
-    assert_eq!(selected["data"]["source_name"], secondary.name);
-    assert!(
-        selected["data"]["direct_link_qualities"][0]["resolution"]
-            .as_str()
-            .unwrap()
-            .contains("720p · 1280 × 720")
-    );
-    assert_eq!(
-        selected["data"]["direct_link_qualities"][0]["bitrate"],
-        4200000
-    );
-    assert_eq!(selected["data"]["header"], json!({}));
-    let native_url = url::Url::parse(&link).unwrap();
-    assert_eq!(
-        native_url.host_str(),
-        url::Url::parse(&url).unwrap().host_str()
-    );
+    assert_eq!(status, 200);
+    assert_eq!(play["data"]["media_guid"], b_third.id);
+    assert_eq!(play["data"]["play_link"], selected_link);
+    let (_, info) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/info",
+        json!({"item_guid":canonical}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(info["data"]["media_guid"], b_third.id);
+    assert_eq!(info["data"]["ts"], 7, "跨源读取目标自己的进度");
+    let selected_url = url::Url::parse(&selected_link).unwrap();
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(selected_url.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 307);
+    assert_eq!(response.headers()["location"], url, "源地址与签名不被改写");
+    let record =
+        json!({"item_guid":canonical,"media_guid":a_third.id,"play_link":selected_link,"ts":10});
     assert_eq!(
         request(
             &h,
             "POST",
             "/v/api/v1/play/record",
-            json!({"item_guid":a_third.id,"media_guid":b_third.id,"play_link":link,"ts":10}),
+            record,
             Some(&h.member_raw)
         )
         .await
@@ -3465,7 +3478,8 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
         catalog::view(&h.app, &h.other.user.id, &a.id, false)
             .await
             .unwrap()["progress"]["position"],
-        12.0
+        12.0,
+        "旧源迟到回传不能覆盖切换结果"
     );
     assert_eq!(
         catalog::view(&h.app, &h.other.user.id, &b.id, false)
@@ -3473,15 +3487,14 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
             .unwrap()["progress"]["position"],
         10.0
     );
-    let latest = request(
+    let (_, latest) = request(
         &h,
         "GET",
         "/v/api/v1/play/list",
         json!({}),
         Some(&h.member_raw),
     )
-    .await
-    .1;
+    .await;
     assert_eq!(latest["data"].as_array().unwrap().len(), 1);
     assert_eq!(latest["data"][0]["media_guid"], b_third.id);
     let b_second = b_eps.iter().find(|e| e.title == "第二集").unwrap();
@@ -3490,14 +3503,60 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
             &h,
             "POST",
             "/v/api/v1/play/info",
-            json!({"item_guid":a_third.id,"media_guid":b_second.id}),
+            json!({"item_guid":canonical,"media_guid":b_second.id}),
             Some(&h.member_raw)
         )
         .await
         .0,
         400
     );
-    assert_eq!(request(&h,"POST","/v/api/v1/play/info",json!({"item_guid":a_third.id,"media_guid":catalog::episodes(&h.app,&wrong.id).await.unwrap()[0].id}),Some(&h.member_raw)).await.0,400);
+    assert_eq!(request(&h,"POST","/v/api/v1/play/info",json!({"item_guid":canonical,"media_guid":catalog::episodes(&h.app,&wrong.id).await.unwrap()[0].id}),Some(&h.member_raw)).await.0,400);
+    assert_eq!(
+        request(
+            &h,
+            "POST",
+            "/v/api/v1/play/play",
+            json!({"media_guid":a_third.id,"bitrate":99999999}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        400
+    );
+    playback::remove_history(&h.app, &h.other.user.id, std::slice::from_ref(&a.id))
+        .await
+        .unwrap();
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        json!({"media_guid":b_third.id,"play_link":selected_link,"ts":25}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert!(
+        catalog::personal(&h.app, &h.other.user.id, "history")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (_, other_plays) = request(&h, "GET", "/v/api/v1/play/list", json!({}), Some(&h.raw)).await;
+    assert_eq!(other_plays["data"], json!([]));
+    access::save_usage(
+        &h.app,
+        &subscription,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        request(&h, "GET", selected_url.path(), json!({}), None)
+            .await
+            .0,
+        403,
+        "已签发的菜单也检查最新权限"
+    );
+    let _ = (c_ep, ambiguous);
 }
 
 #[tokio::test]
@@ -3696,14 +3755,14 @@ async fn deleting_history_is_atomic_with_inflight_reports_and_rolls_back_on_fail
 }
 
 #[tokio::test]
-async fn native_source_labels_are_valid_png_and_recheck_authorization() {
+async fn native_work_and_episode_identities_survive_restart_and_recheck_access() {
     let h = harness().await;
     let source = catalog::sources(&h.app).await.unwrap().remove(0);
     let url = catalog::episode(&h.app, &h.episode).await.unwrap().url;
-    let film=catalog::ingest(&h.app,&source,&json!({"vod_id":6300,"vod_name":"中文来源标签验收","vod_year":"2026","type_name":"电视剧","vod_play_from":"lzm3u8","vod_play_url":format!("第03集${url}")}),true).await.unwrap().unwrap();
+    let film=catalog::ingest(&h.app,&source,&json!({"vod_id":6300,"vod_name":"统一作品验收","vod_year":"2026","type_name":"电视剧","vod_content":"单一作品简介","vod_pic":"https://example.com/poster.jpg","vod_play_from":"lzm3u8","vod_play_url":"第03集$".to_owned()+&url}),true).await.unwrap().unwrap();
     let episode = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
     cached_native_media(&h, &episode.id, 1280, 720).await;
-    let (_, choices) = request(
+    let (_, seasons) = request(
         &h,
         "GET",
         &format!("/v/api/v1/season/list/{}", film.id),
@@ -3711,9 +3770,20 @@ async fn native_source_labels_are_valid_png_and_recheck_authorization() {
         Some(&h.member_raw),
     )
     .await;
-    let poster = text(&choices["data"][0], "poster");
-    assert!(poster.starts_with("/fntv-source-poster/"));
-    let version = text(&choices["data"][0], "guid");
+    let season = text(&seasons["data"][0], "guid");
+    assert_eq!(seasons["data"][0]["title"], "第 1 季");
+    assert_eq!(seasons["data"][0]["overview"], "单一作品简介");
+    assert!(text(&seasons["data"][0], "poster").starts_with("/tv-poster/"));
+    let (_, eps) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/episode/list/{season}"),
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    let canonical = text(&eps["data"][0], "guid");
+    assert_ne!(canonical, episode.id);
     sqlx::query("DELETE FROM cache")
         .execute(&h.app.db)
         .await
@@ -3721,41 +3791,23 @@ async fn native_source_labels_are_valid_png_and_recheck_authorization() {
     let restarted = App::new(h._dir.path().into(), true, String::new())
         .await
         .unwrap();
-    let response = router(restarted, "/nonexistent")
-        .oneshot(
-            Request::builder()
-                .uri(format!("/v/api/v1/item/{version}"))
-                .header("authorization", format!("Bearer {}", h.member_raw))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        200,
-        "来源版本身份不应依赖搜索缓存或进程生命周期"
-    );
-    let response = router(h.app.clone(), "/nonexistent")
-        .oneshot(
-            Request::builder()
-                .uri(&poster)
-                .header("authorization", format!("Bearer {}", h.member_raw))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["content-type"], "image/png");
-    assert_eq!(response.headers()["cache-control"], "private, no-store");
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let reader = decoder.read_info().unwrap();
-    assert_eq!(reader.info().width, 300);
-    assert_eq!(reader.info().height, 450);
-    assert_eq!(request(&h, "GET", &poster, json!({}), None).await.0, 401);
-    let hits = h.hits.load(Ordering::Relaxed);
+    for guid in [&season, &canonical] {
+        let response = router(restarted.clone(), "/nonexistent")
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v/api/v1/item/{guid}"))
+                    .header("authorization", format!("Bearer {}", h.member_raw))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "作品与单集身份不依赖搜索缓存或进程生命周期"
+        );
+    }
     access::save_usage(
         &h.app,
         &source.subscription_id,
@@ -3763,22 +3815,17 @@ async fn native_source_labels_are_valid_png_and_recheck_authorization() {
     )
     .await
     .unwrap();
-    for path in [&poster, &format!("/v/api/v1/sys/img{poster}")] {
-        assert_eq!(
-            request(&h, "GET", path, json!({}), Some(&h.member_raw))
-                .await
-                .0,
-            403
-        );
-    }
     assert_eq!(
-        h.hits.load(Ordering::Relaxed),
-        hits,
-        "撤权后的图片请求不能访问媒体或交付缓存标签"
-    );
-    assert_eq!(
-        request(&h, "GET", &poster, json!({}), Some(&h.raw)).await.0,
-        200
+        request(
+            &h,
+            "GET",
+            &format!("/v/api/v1/item/{canonical}"),
+            json!({}),
+            Some(&h.member_raw)
+        )
+        .await
+        .0,
+        403
     );
     sqlx::query("UPDATE episodes SET active=0 WHERE id=?")
         .bind(&episode.id)
@@ -3790,7 +3837,7 @@ async fn native_source_labels_are_valid_png_and_recheck_authorization() {
             &h,
             "POST",
             "/v/api/v1/play/info",
-            json!({"item_guid":version}),
+            json!({"item_guid":canonical}),
             Some(&h.raw)
         )
         .await

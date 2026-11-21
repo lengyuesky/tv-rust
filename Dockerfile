@@ -19,7 +19,6 @@ RUN mkdir src && printf 'fn main() {}\n' > src/main.rs && touch src/lib.rs \
     && cargo build --release --locked --jobs "$(nproc)" \
     && rm -rf src
 COPY migrations/ ./migrations/
-COPY assets/source-label-font/ ./assets/source-label-font/
 COPY src/ ./src/
 # 仅清理占位项目的产物，确保始终编译真实源码并保留已构建的依赖。
 RUN cargo clean --release --package tv-rust \
@@ -36,7 +35,6 @@ RUN test "$(dpkg --print-architecture)" = "$TARGETARCH" \
 COPY --from=build /usr/local/bin/tv-rust /usr/local/bin/tv-rust
 COPY --from=web-output / /app/web/
 COPY LICENSE /usr/share/doc/tv-rust/LICENSE
-COPY assets/source-label-font/LICENSE.txt /usr/share/doc/tv-rust/source-label-font-LICENSE
 USER tv
 WORKDIR /app
 ENV TV_DATA_DIR=/data TV_WEB_DIR=/app/web TV_BIND=0.0.0.0:3000 RUST_LOG=tv_rust=info
