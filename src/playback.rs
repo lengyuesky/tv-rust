@@ -81,6 +81,20 @@ pub async fn asset(app: &App, p: &Play, url: &str) -> Result<String> {
     register_assets(app, p, &resources).await?;
     Ok(id)
 }
+pub(crate) fn direct_asset(
+    p: &Play,
+    url: &str,
+    extension: &'static str,
+    resources: &mut BTreeMap<String, String>,
+) -> Result<String> {
+    net::valid_url(url)?;
+    let id = format!(
+        "{}.{extension}",
+        guid(&["native-direct", &p.id, url, extension])
+    );
+    resources.insert(id.clone(), url.to_owned());
+    Ok(id)
+}
 fn map_asset(
     p: &Play,
     url: &str,
@@ -121,7 +135,11 @@ fn map_asset_context(
         .or_insert_with(|| url.to_owned());
     Ok(id)
 }
-async fn register_assets(app: &App, p: &Play, resources: &BTreeMap<String, String>) -> Result<()> {
+pub(crate) async fn register_assets(
+    app: &App,
+    p: &Play,
+    resources: &BTreeMap<String, String>,
+) -> Result<()> {
     if resources.is_empty() {
         return Ok(());
     }

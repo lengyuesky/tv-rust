@@ -17,7 +17,7 @@ bytes = "1"
 futures-util = "0.3"
 rand = "0.10"
 regex = "1"
-reqwest = { version = "0.13", features = ["json", "query", "stream"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "brotli", "deflate", "zstd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

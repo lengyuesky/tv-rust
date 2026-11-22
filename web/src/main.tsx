@@ -2406,6 +2406,7 @@ function SettingsPage({
     [removingSubscription, setRemovingSubscription] = useState<Obj | null>(
       null,
     ),
+    [removingUser, setRemovingUser] = useState<Obj | null>(null),
     [importing, setImporting] = useState(false),
     [mode, setMode] = useState("url");
   const [usage, setUsage] = useState<SubscriptionUsage>(allUsers),
@@ -2810,19 +2811,33 @@ function SettingsPage({
                   </small>
                 </div>
                 {u.id !== me.user.id && (
-                  <button
-                    className="ghost"
-                    disabled={busy}
-                    onClick={() =>
-                      action(() =>
-                        api("/users/" + u.id, "PATCH", {
-                          disabled: !u.disabled,
-                        }),
-                      )
-                    }
-                  >
-                    {u.disabled ? "启用" : "停用"}
-                  </button>
+                  <div className="user-actions">
+                    <button
+                      className="ghost"
+                      disabled={busy}
+                      onClick={() =>
+                        action(() =>
+                          api("/users/" + u.id, "PATCH", {
+                            disabled: !u.disabled,
+                          }),
+                        )
+                      }
+                    >
+                      {u.disabled ? "启用" : "停用"}
+                    </button>
+                    <button
+                      className="ghost"
+                      aria-label={`删除成员 ${u.username}`}
+                      disabled={busy}
+                      onClick={() => {
+                        setError("");
+                        setRemovingUser(u);
+                      }}
+                    >
+                      <Trash2 size={15} />
+                      删除
+                    </button>
+                  </div>
                 )}
               </div>
             ))}
@@ -3111,6 +3126,28 @@ function SettingsPage({
             </button>
           </form>
         </Modal>
+      )}
+      {removingUser && (
+        <Confirm
+          title="删除这位家庭成员？"
+          action="删除账号"
+          busy={busy}
+          onClose={() => setRemovingUser(null)}
+          onConfirm={() =>
+            void action(async () => {
+              await api("/users/" + removingUser.id, "DELETE", {});
+              setRemovingUser(null);
+            }, "成员已删除")
+          }
+        >
+          「{removingUser.username}
+          」的登录会话将立即失效，其收藏、观看进度、播放日志和账号设置将永久删除，无法恢复。
+          {error && (
+            <span className="delete-error" role="alert">
+              {error}
+            </span>
+          )}
+        </Confirm>
       )}
       {removingSubscription && (
         <Confirm

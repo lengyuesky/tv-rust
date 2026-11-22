@@ -51,9 +51,22 @@ async fn harness() -> Harness {
                 ([("content-type","application/vnd.apple.mpegurl")],body).into_response()
             },
             "/encrypted.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],include_str!("fixtures/hls-probe/media.m3u8")).into_response(),
+            "/compressed.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","zstd")],include_bytes!("fixtures/hls-probe/compressed-media.m3u8.zst").as_slice()).into_response(),
+            "/compressed-gzip.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","gzip")],include_bytes!("fixtures/hls-probe/compressed-media.m3u8.gz").as_slice()).into_response(),
+            "/compressed-master.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","zstd")],include_bytes!("fixtures/hls-probe/compressed-master.m3u8.zst").as_slice()).into_response(),
             "/image-prefixed.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nimage-prefixed.ts\n#EXT-X-ENDLIST\n").into_response(),
             "/image-only.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\npicture.png\n#EXT-X-ENDLIST\n").into_response(),
-            "/image-prefixed.ts"=>([("content-type","image/png")],include_bytes!("fixtures/hls-probe/image-prefixed.ts").as_slice()).into_response(),
+            "/image-no-range.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nimage-no-range.png\n#EXT-X-ENDLIST\n").into_response(),
+            "/image-no-range.png"=>([("content-type","image/png")],include_bytes!("fixtures/hls-probe/image-prefixed.ts").as_slice()).into_response(),
+            "/image-prefixed.ts" | "/image-prefixed.png"=>{
+                let bytes=include_bytes!("fixtures/hls-probe/image-prefixed.ts");
+                let span=req.headers().get("range").and_then(|value|value.to_str().ok()).and_then(|value|value.strip_prefix("bytes=")).and_then(|value|value.split_once('-'));
+                if let Some((start,end))=span{
+                    let start=start.parse::<usize>().unwrap_or(0);
+                    let end=end.parse::<usize>().unwrap_or(bytes.len()-1).min(bytes.len()-1);
+                    Response::builder().status(206).header("content-type","image/png").header("content-range",format!("bytes {start}-{end}/{}",bytes.len())).body(Body::from(&bytes[start..=end])).unwrap()
+                }else{([("content-type","image/png")],bytes.as_slice()).into_response()}
+            },
             "/picture.png"=>([("content-type","image/png")],&include_bytes!("fixtures/hls-probe/image-prefixed.ts")[..112]).into_response(),
             "/gone.m3u8"=>StatusCode::GONE.into_response(),
             "/key.bin"=>include_bytes!("fixtures/hls-probe/key.bin").as_slice().into_response(),
@@ -190,6 +203,286 @@ async fn extra_member(h: &Harness) -> User {
         .fetch_one(&h.app.db)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn user_deletion_requires_an_admin_and_protects_the_current_account() {
+    let h = harness().await;
+    let member = format!("/api/users/{}", h.other.user.id);
+    assert_eq!(
+        request(&h, "DELETE", &member, json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        403
+    );
+    let (status, error) = request(
+        &h,
+        "DELETE",
+        &format!("/api/users/{}", h.who.user.id),
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(text(&error, "error").contains("当前管理员"));
+    assert_eq!(
+        request(&h, "DELETE", "/api/users/missing", json!({}), Some(&h.raw))
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        request(&h, "GET", "/api/me", json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        request(&h, "PATCH", &member, json!({"disabled":true}), Some(&h.raw))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        request(&h, "DELETE", &member, json!({}), Some(&h.raw))
+            .await
+            .0,
+        200
+    );
+    assert!(
+        auth::login(&h.app, "member", "password-456", false)
+            .await
+            .is_err()
+    );
+    let (_, users) = request(&h, "GET", "/api/users", json!({}), Some(&h.raw)).await;
+    assert_eq!(users.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn deleting_a_user_removes_personal_data_and_stops_active_playback() {
+    use futures_util::StreamExt;
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"selected","user_ids":[h.other.user.id]}),
+    )
+    .await
+    .unwrap();
+    for user in [&h.who.user.id, &h.other.user.id] {
+        catalog::favorite(&h.app, user, &h.film, true)
+            .await
+            .unwrap();
+        preferences::save(
+            &h.app,
+            user,
+            &json!({"douban_image_source":"cmliussss-cdn-ali","douban_image_custom_url":""}),
+        )
+        .await
+        .unwrap();
+    }
+    let slow = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url)
+        .unwrap()
+        .join("/slow")
+        .unwrap();
+    sqlx::query("UPDATE episodes SET url=? WHERE id=?")
+        .bind(slow.as_str())
+        .bind(&h.episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let admin_play = playback::start(&h.app, &h.who, &h.episode).await.unwrap();
+    playback::record(
+        &h.app,
+        &playback::get(&h.app, &text(&admin_play, "id"))
+            .await
+            .unwrap(),
+        33.0,
+        120.0,
+        None,
+    )
+    .await
+    .unwrap();
+    let episodes = native_hls_fixture(&h, false).await;
+    let (_, native) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":episodes[0].id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    let (status, recorded) = request(&h, "POST", "/v/api/v1/play/record", json!({"media_guid":episodes[0].id,"play_link":"22345678-1234-1234-1234-123456789abc","ts":17,"bitrate":native["data"]["video_stream"]["bps"]}), Some(&h.member_raw)).await;
+    assert_eq!(status, 200);
+    assert_eq!(recorded["data"], true);
+    assert!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM fntv_record_links WHERE auth_hash=?")
+            .bind(&h.other.auth_hash)
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap()
+            > 0
+    );
+    let started = playback::start(&h.app, &h.other, &h.episode).await.unwrap();
+    let selected = playback::fallback(&h.app, &h.other, &text(&started, "id"), "manual")
+        .await
+        .unwrap();
+    let path = text(&selected, "url");
+    let parts: Vec<_> = path.trim_matches('/').split('/').collect();
+    let response = playback::proxy(&h.app, parts[1], parts[2], Method::GET, HeaderMap::new())
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(body.next().await.unwrap().unwrap(), "first-chunk");
+    let play_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM plays WHERE user_id=?")
+        .bind(&h.other.user.id)
+        .fetch_all(&h.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            &h,
+            "DELETE",
+            &format!("/api/users/{}", h.other.user.id),
+            json!({}),
+            Some(&h.raw)
+        )
+        .await
+        .0,
+        200
+    );
+    let next = tokio::time::timeout(Duration::from_secs(2), body.next())
+        .await
+        .unwrap();
+    assert!(!matches!(next, Some(Ok(_))), "删除用户后不再交付媒体字节");
+    for (table, query) in [
+        ("users", "SELECT count(*) FROM users WHERE id=?"),
+        (
+            "auth_sessions",
+            "SELECT count(*) FROM auth_sessions WHERE user_id=?",
+        ),
+        (
+            "favorites",
+            "SELECT count(*) FROM favorites WHERE user_id=?",
+        ),
+        ("progress", "SELECT count(*) FROM progress WHERE user_id=?"),
+        (
+            "preferences",
+            "SELECT count(*) FROM preferences WHERE user_id=?",
+        ),
+        (
+            "subscription_users",
+            "SELECT count(*) FROM subscription_users WHERE user_id=?",
+        ),
+        ("plays", "SELECT count(*) FROM plays WHERE user_id=?"),
+        (
+            "fntv_playback_menus",
+            "SELECT count(*) FROM fntv_playback_menus WHERE user_id=?",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(&h.other.user.id)
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "已清理 {table}");
+    }
+    for play in play_ids {
+        for (table, query) in [
+            (
+                "media_assets",
+                "SELECT count(*) FROM media_assets WHERE play_id=?",
+            ),
+            (
+                "play_events",
+                "SELECT count(*) FROM play_events WHERE play_id=?",
+            ),
+            (
+                "fntv_record_links",
+                "SELECT count(*) FROM fntv_record_links WHERE play_id=?",
+            ),
+        ] {
+            let count: i64 = sqlx::query_scalar(query)
+                .bind(&play)
+                .fetch_one(&h.app.db)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "已清理 {table}");
+        }
+    }
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&h.app.db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        request(&h, "GET", "/api/me", json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        401
+    );
+    let old_resource = router(h.app.clone(), "/nonexistent")
+        .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(old_resource.status().is_client_error());
+    assert_eq!(
+        catalog::personal(&h.app, &h.who.user.id, "favorites")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        catalog::view(&h.app, &h.who.user.id, &h.film, false)
+            .await
+            .unwrap()["progress"]["position"],
+        33.0
+    );
+    assert!(catalog::film(&h.app, &h.film).await.is_ok());
+    assert_eq!(
+        request(&h, "GET", "/api/me", json!({}), Some(&h.raw))
+            .await
+            .0,
+        200
+    );
+}
+
+#[tokio::test]
+async fn concurrent_admin_deletions_keep_one_authenticated_admin() {
+    let h = harness().await;
+    auth::create_user(
+        &h.app,
+        &h.who,
+        &json!({"username":"admin-two","password":"second-admin-password","admin":true}),
+    )
+    .await
+    .unwrap();
+    let (raw, user) = auth::login(&h.app, "admin-two", "second-admin-password", false)
+        .await
+        .unwrap();
+    let second = Identity {
+        user,
+        auth_hash: hash(&raw),
+        client: "web".into(),
+    };
+    let (first, other) = tokio::join!(
+        auth::delete_user(&h.app, &h.who, &second.user.id),
+        auth::delete_user(&h.app, &second, &h.who.user.id)
+    );
+    assert_ne!(first.is_ok(), other.is_ok());
+    let error = first.err().or_else(|| other.err()).unwrap();
+    assert_eq!(error.0, 401);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE admin=1 AND disabled=0")
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1957,6 +2250,243 @@ async fn image_prefixed_hls_replaces_cached_picture_metadata_with_real_video() {
     assert!(file_name.contains("64p · 64 × 64 · H.264"));
     assert!(!file_name.contains("28p"));
     assert!(!file_name.contains("PNG"));
+}
+
+#[tokio::test]
+async fn compressed_hls_replaces_an_unrecognized_file_cache_and_enforces_decoded_limits() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let url = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url)
+        .unwrap()
+        .join("/compressed.m3u8")
+        .unwrap();
+    let film = catalog::ingest(&h.app, &source, &json!({"vod_id":7203,"vod_name":"压缩清单识别验收","vod_year":"2026","vod_play_from":"lzm3u8","vod_play_url":format!("正片${url}")}), true).await.unwrap().unwrap();
+    let e = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?").bind(json!({"probe_version":2,"kind":"video","duration":0.0,"size":10415,"warning":"","streams":[]}).to_string()).bind(now()).bind(&e.id).execute(&h.app.db).await.unwrap();
+    let info = tv_rust::probe::get(&h.app, &catalog::episode(&h.app, &e.id).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(info.kind, "hls");
+    assert_eq!(info.duration, 1.0);
+    assert_eq!(tv_rust::probe::quality(&info)["codec"], "h264");
+    assert_eq!(
+        tv_rust::probe::quality(&info)["height"].as_f64(),
+        Some(64.0)
+    );
+    let response = tv_rust::net::request(&h.app, Method::GET, url.as_str(), &HeaderMap::new())
+        .await
+        .unwrap();
+    assert!(!response.headers().contains_key("content-encoding"));
+    let limit = include_bytes!("fixtures/hls-probe/compressed-media.m3u8.zst").len();
+    assert!(
+        tv_rust::net::bytes(response, limit, false)
+            .await
+            .unwrap_err()
+            .1
+            .contains("大小限制")
+    );
+    let gzip_url = url.join("/compressed-gzip.m3u8").unwrap();
+    sqlx::query("UPDATE episodes SET url=?,probe='{}',probed_at=0 WHERE id=?")
+        .bind(gzip_url.as_str())
+        .bind(&e.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let info = tv_rust::probe::get(&h.app, &catalog::episode(&h.app, &e.id).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(info.kind, "hls");
+    assert_eq!(tv_rust::probe::quality(&info)["codec"], "h264");
+}
+
+#[tokio::test]
+async fn direct_hls_delivers_decoded_nested_playlists_with_upstream_media_urls() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let base = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url).unwrap();
+    let url = base.join("/compressed-master.m3u8").unwrap();
+    let film = catalog::ingest(&h.app, &source, &json!({"vod_id":7204,"vod_name":"压缩主清单直连验收","vod_year":"2026","vod_play_from":"lzm3u8","vod_play_url":format!("正片${url}")}), true).await.unwrap().unwrap();
+    let e = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":e.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(stream["data"]["playback_mode"], "direct");
+    assert_eq!(stream["data"]["header"], json!({}));
+    assert!(text(&stream["data"]["file_stream"], "path").ends_with(".m3u8"));
+    let path = url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url"))
+        .unwrap()
+        .path()
+        .to_owned();
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header("range", "bytes=0-0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!response.headers().contains_key("content-encoding"));
+    let master = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(master.starts_with("#EXTM3U\n#EXT-X-STREAM-INF:"));
+    let child = master
+        .lines()
+        .find(|line| !line.starts_with('#') && !line.is_empty())
+        .unwrap();
+    let child = url::Url::parse(child).unwrap();
+    assert!(child.path().ends_with(".m3u8"));
+    assert!(child.path().contains("/playlist-"));
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(child.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let manifest = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(manifest.starts_with("#EXTM3U\n"));
+    assert!(manifest.contains("#EXT-X-KEY:METHOD=NONE"));
+    assert!(manifest.contains("#EXT-X-VERSION:4"));
+    assert!(manifest.contains("#EXT-X-BYTERANGE:10340@112"));
+    let segment = url::Url::parse(
+        manifest
+            .lines()
+            .find(|line| !line.starts_with('#') && !line.is_empty())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(segment.path().ends_with(".ts"));
+    let hits = h.hits.load(Ordering::Relaxed);
+    for method in ["GET", "HEAD"] {
+        let response = router(h.app.clone(), "/nonexistent")
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(segment.path())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 307);
+        assert_eq!(
+            response.headers()["location"],
+            base.join("/image-prefixed.png").unwrap().as_str()
+        );
+    }
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "分片地址只重定向，不读取或转发媒体字节"
+    );
+    let repeated = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(child.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), 200);
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits + 1,
+        "再次请求只读清单，区间识别命中缓存"
+    );
+    assert_eq!(
+        request(&h, "GET", segment.path(), json!({}), Some(&h.raw))
+            .await
+            .0,
+        403
+    );
+    assert!(!manifest.contains("/media/"));
+    assert_eq!(
+        request(&h, "GET", child.path(), json!({}), Some(&h.raw))
+            .await
+            .0,
+        403
+    );
+    let unknown = format!(
+        "{}/playlist-missing.m3u8",
+        child.path().rsplit_once('/').unwrap().0
+    );
+    assert_eq!(request(&h, "GET", &unknown, json!({}), None).await.0, 404);
+    let play = playback::latest(&h.app, &h.who, &e.id).await.unwrap();
+    assert_eq!(play.mode, "direct");
+    assert_eq!(
+        request(&h, "POST", "/api/logout", json!({}), Some(&h.raw))
+            .await
+            .0,
+        200
+    );
+    assert!(
+        request(&h, "GET", child.path(), json!({}), None)
+            .await
+            .0
+            .is_client_error()
+    );
+}
+
+#[tokio::test]
+async fn image_hls_without_range_support_is_not_silently_forwarded() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let url = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url)
+        .unwrap()
+        .join("/image-no-range.m3u8")
+        .unwrap();
+    let film = catalog::ingest(&h.app, &source, &json!({"vod_id":7206,"vod_name":"不支持区间的图片头来源","vod_year":"2026","vod_play_from":"lzm3u8","vod_play_url":format!("正片${url}")}), true).await.unwrap().unwrap();
+    let e = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":e.id}),
+        Some(&h.raw),
+    )
+    .await;
+    let path = url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url"))
+        .unwrap()
+        .path()
+        .to_owned();
+    let (status, error) = request(&h, "GET", &path, json!({}), None).await;
+    assert_eq!(status, 400);
+    assert!(text(&error, "error").contains("换源"));
+    assert_eq!(
+        playback::latest(&h.app, &h.who, &e.id).await.unwrap().mode,
+        "direct"
+    );
 }
 
 #[tokio::test]
@@ -4150,15 +4680,19 @@ async fn native_hls_forbidden_proxy_uses_strm_without_media_authentication_heade
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         if method == "GET" {
             let manifest = std::str::from_utf8(&bytes).unwrap();
-            assert!(manifest.starts_with("#EXTM3U\n#EXT-X-STREAM-INF:"));
-            assert!(manifest.contains(&eps[0].url));
+            assert!(manifest.starts_with("#EXTM3U\n"));
+            assert!(manifest.contains("#EXTINF:"));
+            assert!(manifest.contains("/segment-0.ts"));
             assert!(!manifest.contains("/media/"));
-            assert!(manifest.contains("BANDWIDTH=4200000"));
         } else {
             assert!(bytes.is_empty());
         }
     }
-    assert_eq!(h.hits.load(Ordering::Relaxed), hits, "直链清单不转发源资源");
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits + 1,
+        "本站仅读取清单，未读取媒体分片"
+    );
     let play = playback::latest(&h.app, &h.who, &eps[0].id).await.unwrap();
     assert_eq!(play.mode, "direct");
     let (_, recorded) = request(

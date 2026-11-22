@@ -9,6 +9,7 @@ pub mod fntv;
 mod fntv_identity;
 mod fntv_playback;
 mod hls_crypto;
+mod hls_direct;
 pub mod net;
 pub mod playback;
 pub mod preferences;

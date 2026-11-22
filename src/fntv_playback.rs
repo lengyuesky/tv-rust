@@ -1,5 +1,5 @@
 //! 飞牛播放中的清晰度菜单承载来源选择，菜单快照与实际播放会话分开。
-use crate::{access, auth, catalog, core::*, fntv, net, playback, probe};
+use crate::{access, auth, catalog, core::*, fntv, hls_direct, net, playback, probe};
 use axum::{
     extract::{Path, Request, State},
     http::{HeaderMap, Method},
@@ -8,6 +8,7 @@ use axum::{
 use catalog::Episode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Choice {
@@ -889,6 +890,142 @@ pub(crate) async fn media(
         .unwrap_or_else(IntoResponse::into_response)
 }
 
+fn playlist_link(
+    p: &playback::Play,
+    menu: &Menu,
+    token: &str,
+    url: &str,
+    resources: &mut BTreeMap<String, String>,
+) -> Result<String> {
+    let asset = playback::direct_asset(p, url, "m3u8", resources)?;
+    Ok(format!(
+        "{}/v/native-menu/{token}/playlist-{asset}",
+        menu.origin.trim_end_matches('/')
+    ))
+}
+
+async fn direct_manifest(
+    app: &App,
+    p: &playback::Play,
+    menu: &Menu,
+    token: &str,
+    url: &str,
+) -> Result<String> {
+    static URI: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"URI="([^"]+)""#).unwrap());
+    // 只读取并解压有界清单。视频、音频、密钥和初始化分片仍由客户端直接读取上游。
+    let response = net::request(app, Method::GET, url, &HeaderMap::new()).await?;
+    if !response.status().is_success() {
+        return Err(Error::bad(format!(
+            "HLS 清单返回 HTTP {}，请刷新来源或换源",
+            response.status().as_u16()
+        )));
+    }
+    let base = net::valid_url(response.url().as_str())?;
+    let bytes = net::bytes(response, 4 * 1024 * 1024, false).await?;
+    if !probe::is_hls(&bytes) {
+        return Err(Error::bad("播放地址未返回有效 HLS 清单，请刷新来源或换源"));
+    }
+    let input = String::from_utf8(bytes).map_err(|_| Error::bad("HLS 清单编码无效"))?;
+    let ranges = hls_direct::ranges(app, &base, &input).await?;
+    let mut resources = BTreeMap::new();
+    let has_version = input
+        .lines()
+        .any(|line| line.trim().starts_with("#EXT-X-VERSION:"));
+    let mut out = String::new();
+    let mut next_playlist = false;
+    let mut ranged = false;
+    let mut encrypted = false;
+    for raw in input.trim_start_matches('\u{feff}').lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            if let Some(key) = line.strip_prefix("#EXT-X-KEY:") {
+                encrypted = !key.split(',').any(|part| part.trim() == "METHOD=NONE");
+            }
+            if line.starts_with("#EXT-X-BYTERANGE:") {
+                ranged = true;
+            }
+            if !ranges.is_empty() {
+                if line == "#EXTM3U" && !has_version {
+                    out.push_str("#EXTM3U\n#EXT-X-VERSION:4\n");
+                    continue;
+                }
+                if let Some(version) = line.strip_prefix("#EXT-X-VERSION:") {
+                    let version = version
+                        .parse::<u64>()
+                        .map_err(|_| Error::bad("HLS 版本字段无效"))?;
+                    out.push_str(&format!("#EXT-X-VERSION:{}\n", version.max(4)));
+                    continue;
+                }
+            }
+            let playlist_attribute = [
+                "#EXT-X-MEDIA:",
+                "#EXT-X-I-FRAME-STREAM-INF:",
+                "#EXT-X-RENDITION-REPORT:",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix));
+            let mut previous = 0;
+            for capture in URI.captures_iter(line) {
+                let value = capture.get(1).unwrap();
+                out.push_str(&line[previous..value.start()]);
+                let resolved = base
+                    .join(value.as_str())
+                    .map_err(|_| Error::bad("HLS 资源地址无效"))?;
+                net::valid_url(resolved.as_str())?;
+                let link = if playlist_attribute {
+                    playlist_link(p, menu, token, resolved.as_str(), &mut resources)?
+                } else {
+                    resolved.to_string()
+                };
+                out.push_str(&link);
+                previous = value.end();
+            }
+            out.push_str(&line[previous..]);
+            if line.starts_with("#EXT-X-STREAM-INF:") {
+                next_playlist = true;
+            }
+        } else if !line.is_empty() {
+            let resolved = base
+                .join(line)
+                .map_err(|_| Error::bad("HLS 资源地址无效"))?;
+            net::valid_url(resolved.as_str())?;
+            if next_playlist || resolved.path().to_ascii_lowercase().ends_with(".m3u8") {
+                out.push_str(&playlist_link(
+                    p,
+                    menu,
+                    token,
+                    resolved.as_str(),
+                    &mut resources,
+                )?);
+            } else if hls_direct::image_segment(&resolved) {
+                // HLS 解复用器会拒绝图片扩展名。此地址只做重定向，媒体字节仍从上游直读。
+                if !ranged
+                    && !encrypted
+                    && let Some(range) = ranges.get(resolved.as_str())
+                {
+                    out.push_str(&format!(
+                        "#EXT-X-BYTERANGE:{}@{}\n",
+                        range.length, range.offset
+                    ));
+                }
+                let asset = playback::direct_asset(p, resolved.as_str(), "ts", &mut resources)?;
+                out.push_str(&format!(
+                    "{}/v/native-menu/{token}/segment-{asset}",
+                    menu.origin.trim_end_matches('/')
+                ));
+            } else {
+                out.push_str(resolved.as_str());
+            }
+            next_playlist = false;
+            ranged = false;
+        }
+        out.push('\n');
+    }
+    playback::register_assets(app, p, &resources).await?;
+    Ok(out)
+}
+
 async fn media_inner(
     app: &App,
     token: &str,
@@ -901,7 +1038,9 @@ async fn media_inner(
     }
     let menu = get(app, token).await?;
     let who = identity(app, &menu).await?;
-    let choice = if selector == "stream.m3u8" {
+    let child_asset = selector.strip_prefix("playlist-");
+    let segment_asset = selector.strip_prefix("segment-");
+    let choice = if selector == "stream.m3u8" || child_asset.is_some() || segment_asset.is_some() {
         let choice = menu.current_choice(app).await?;
         if !choice.is_hls() {
             return Err(Error::bad("播放来源格式已变更，请重新播放"));
@@ -914,6 +1053,20 @@ async fn media_inner(
             .ok_or_else(|| Error::bad("播放来源序号无效"))?
     };
     let e = validate_choice(app, &who, &menu, &choice).await?;
+    let media_url = if let Some(asset) = child_asset.or(segment_asset) {
+        sqlx::query_scalar::<_, String>(
+            "SELECT a.url FROM media_assets a JOIN plays p ON p.id=a.play_id \
+             WHERE a.id=? AND p.id=? AND p.episode_id=?",
+        )
+        .bind(asset)
+        .bind(menu.active_play_id.as_deref().unwrap_or(""))
+        .bind(&e.id)
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or_else(Error::missing)?
+    } else {
+        e.url.clone()
+    };
     let carries_auth = ["authorization", "cookie", "authx"]
         .iter()
         .any(|name| request.headers().contains_key(*name));
@@ -928,6 +1081,9 @@ async fn media_inner(
                 .ok_or_else(|| Error::bad("播放来源关联已失效"))?,
         )
         .await?;
+        if segment_asset.is_some() && play.mode == "direct" && !carries_auth && !force_proxy {
+            return Ok(Redirect::temporary(&media_url).into_response());
+        }
         if play.mode == "direct" && !carries_auth && !force_proxy && info.kind != "hls" {
             return Ok(Redirect::temporary(&e.url).into_response());
         }
@@ -954,22 +1110,13 @@ async fn media_inner(
     let mut p = activate(app, &who, &menu, &choice).await?;
     // 认证头只留在本站。原生 STRM 空头请求可直接跟随到源，其他端安全地同源转发。
     if p.mode == "direct" && !carries_auth && !force_proxy {
+        if segment_asset.is_some() {
+            return Ok(Redirect::temporary(&media_url).into_response());
+        }
         if choice.is_hls() {
-            let info = probe::get(app, &e).await?;
-            let quality = probe::quality(&info);
-            let bandwidth = quality["bitrate"].as_f64().unwrap_or(0.0) as u64;
-            let width = quality["width"].as_f64().unwrap_or(0.0) as u64;
-            let height = quality["height"].as_f64().unwrap_or(0.0) as u64;
-            let resolution = if width > 0 && height > 0 {
-                format!(",RESOLUTION={width}x{height}")
-            } else {
-                String::new()
-            };
-            let source = net::valid_url(&e.url)?;
-            let manifest = format!(
-                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH={}{resolution}\n{source}\n",
-                bandwidth.max(1)
-            );
+            let manifest = direct_manifest(app, &p, &menu, token, &media_url).await?;
+            let fresh_who = identity(app, &menu).await?;
+            validate_choice(app, &fresh_who, &menu, &choice).await?;
             return Ok(Response::builder()
                 .header("cache-control", "no-store")
                 .header("content-type", "application/vnd.apple.mpegurl")
@@ -988,7 +1135,7 @@ async fn media_inner(
         .bind(&p.id)
         .execute(&app.db)
         .await?;
-    let root = playback::asset(app, &p, &e.url).await?;
+    let root = playback::asset(app, &p, &media_url).await?;
     playback::proxy(
         app,
         &access,

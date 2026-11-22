@@ -193,6 +193,38 @@ pub async fn create_user(app: &App, who: &Identity, v: &Value) -> Result<()> {
         .map_err(|_| Error::bad("创建失败，用户名可能已存在"))?;
     Ok(())
 }
+pub async fn delete_user(app: &App, who: &Identity, id: &str) -> Result<()> {
+    who.admin()?;
+    if id == who.user.id {
+        return Err(Error::bad("不能删除当前管理员"));
+    }
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    // 在写事务内重新验证操作者，避免两个管理员同时删除彼此后留下无管理员的实例。
+    let authorized: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users u JOIN auth_sessions s ON s.user_id=u.id \
+         WHERE u.id=? AND u.admin=1 AND u.disabled=0 AND s.token_hash=? AND s.expires_at>?)",
+    )
+    .bind(&who.user.id)
+    .bind(&who.auth_hash)
+    .bind(now())
+    .fetch_one(&mut *tx)
+    .await?;
+    if !authorized {
+        return Err(Error::unauthorized());
+    }
+    // 外键级联删除会话、个人记录、播放资源与飞牛菜单，整个删除在同一事务中完成。
+    let deleted = sqlx::query("DELETE FROM users WHERE id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if deleted.rows_affected() == 0 {
+        return Err(Error::missing());
+    }
+    tx.commit().await?;
+    app.access_changes
+        .send_modify(|revision| *revision = revision.wrapping_add(1));
+    Ok(())
+}
 pub async fn change_password(app: &App, who: &Identity, v: &Value) -> Result<()> {
     let old = text(v, "current_password");
     let pass = text(v, "password");

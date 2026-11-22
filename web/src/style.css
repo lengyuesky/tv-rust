@@ -1578,6 +1578,23 @@ section {
 }
 .user-row > div {
   flex: 1;
+  min-width: 0;
+}
+.user-row .user-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+.user-actions .ghost {
+  padding: 8px;
+}
+.delete-error {
+  display: block;
+  margin-top: 12px;
+  color: #ff9a85;
+}
+.user-row strong {
+  overflow-wrap: anywhere;
 }
 .user-row strong {
   font-size: 13px;

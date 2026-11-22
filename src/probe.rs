@@ -303,9 +303,16 @@ pub(crate) fn cached(e: &Episode) -> Option<MediaInfo> {
             .streams
             .iter()
             .any(|video| is_video_stream(video) && video["codec_name"] != "png");
+    let unrecognized_hls = info.kind != "hls"
+        && info.streams.is_empty()
+        && (e.line_name.to_ascii_lowercase().contains("m3u8")
+            || net::valid_url(&e.url)
+                .ok()
+                .is_some_and(|url| url.path().to_ascii_lowercase().ends_with(".m3u8")));
     (e.probed_at > now() - 21600
         && !(info.kind == "hls" && info.streams.is_empty() && info.probe_version == 0)
-        && !(image_only && info.probe_version < 2))
+        && !(image_only && info.probe_version < 2)
+        && !unrecognized_hls)
         .then_some(info)
 }
 

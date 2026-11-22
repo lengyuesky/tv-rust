@@ -320,6 +320,9 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 .await?,
             ));
         }
+        ["users", id] if method == Method::DELETE => {
+            auth::delete_user(app, &who, id).await?;
+        }
         ["users", id] if method == Method::PATCH => {
             who.admin()?;
             if *id == who.user.id {
