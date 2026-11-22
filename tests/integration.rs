@@ -51,6 +51,10 @@ async fn harness() -> Harness {
                 ([("content-type","application/vnd.apple.mpegurl")],body).into_response()
             },
             "/encrypted.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],include_str!("fixtures/hls-probe/media.m3u8")).into_response(),
+            "/image-prefixed.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nimage-prefixed.ts\n#EXT-X-ENDLIST\n").into_response(),
+            "/image-only.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\npicture.png\n#EXT-X-ENDLIST\n").into_response(),
+            "/image-prefixed.ts"=>([("content-type","image/png")],include_bytes!("fixtures/hls-probe/image-prefixed.ts").as_slice()).into_response(),
+            "/picture.png"=>([("content-type","image/png")],&include_bytes!("fixtures/hls-probe/image-prefixed.ts")[..112]).into_response(),
             "/gone.m3u8"=>StatusCode::GONE.into_response(),
             "/key.bin"=>include_bytes!("fixtures/hls-probe/key.bin").as_slice().into_response(),
             "/segment-0.ts"=>include_bytes!("fixtures/hls-probe/segment-0.ts").as_slice().into_response(),
@@ -1920,6 +1924,105 @@ async fn playback_reports_measured_quality_without_fabricating_unknown_streams()
 }
 
 #[tokio::test]
+async fn image_prefixed_hls_replaces_cached_picture_metadata_with_real_video() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let url = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url)
+        .unwrap()
+        .join("/image-prefixed.m3u8")
+        .unwrap();
+    let film = catalog::ingest(&h.app, &source, &json!({"vod_id":7200,"vod_name":"图片头媒体识别验收","vod_year":"2026","vod_play_from":"lzm3u8","vod_play_url":format!("正片${url}")}), true).await.unwrap().unwrap();
+    let e = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(json!({"probe_version":1,"kind":"hls","duration":4.0,"size":0,"warning":"","streams":[{"index":0,"codec_type":"video","codec_name":"png","width":28,"height":28,"avg_frame_rate":"25/1"}]}).to_string())
+        .bind(now()).bind(&e.id).execute(&h.app.db).await.unwrap();
+    let e = catalog::episode(&h.app, &e.id).await.unwrap();
+    let info = tv_rust::probe::get(&h.app, &e).await.unwrap();
+    let quality = tv_rust::probe::quality(&info);
+    assert_eq!(info.probe_version, 2);
+    assert_eq!(quality["codec"], "h264");
+    assert_eq!(quality["width"].as_f64(), Some(64.0));
+    assert_eq!(quality["height"].as_f64(), Some(64.0));
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":e.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let file_name = text(&stream["data"]["file_stream"], "file_name");
+    assert!(file_name.contains("64p · 64 × 64 · H.264"));
+    assert!(!file_name.contains("28p"));
+    assert!(!file_name.contains("PNG"));
+}
+
+#[tokio::test]
+async fn image_only_addresses_and_hls_samples_fail_before_native_playback() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let base = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url).unwrap();
+    for (id, path) in [(7201, "/image-only.m3u8"), (7202, "/picture.png")] {
+        let url = base.join(path).unwrap();
+        let film = catalog::ingest(&h.app, &source, &json!({"vod_id":id,"vod_name":format!("图片误用验收{id}"),"vod_year":"2026","vod_play_from":"line","vod_play_url":format!("正片${url}")}), true).await.unwrap().unwrap();
+        let e = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+        let error = playback::start(&h.app, &h.who, &e.id).await.unwrap_err();
+        assert!(error.1.contains("返回图片"));
+        let (status, response) = request(
+            &h,
+            "POST",
+            "/v/api/v1/stream",
+            json!({"media_guid":e.id}),
+            Some(&h.raw),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(text(&response, "msg").contains("返回图片"));
+    }
+}
+
+#[tokio::test]
+async fn attached_cover_images_are_not_selected_as_video_quality_or_native_tracks() {
+    let h = harness().await;
+    let info = json!({"probe_version":2,"kind":"mp4","duration":120.0,"size":8,"warning":"","streams":[
+        {"index":0,"codec_type":"video","codec_name":"png","width":28,"height":28,"disposition":{"attached_pic":1}},
+        {"index":1,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"24/1"}
+    ]});
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(info.to_string())
+        .bind(now())
+        .bind(&h.episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let started = playback::start(&h.app, &h.who, &h.episode).await.unwrap();
+    assert_eq!(started["quality"]["codec"], "h264");
+    assert_eq!(started["quality"]["height"].as_f64(), Some(1080.0));
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":h.episode}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(stream["data"]["video_stream"]["index"], 1);
+    assert_eq!(stream["data"]["video_stream"]["codec_name"], "h264");
+    let (_, files) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/stream/list/{}", h.episode),
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(files["data"]["video_streams"].as_array().unwrap().len(), 1);
+    assert_eq!(files["data"]["video_streams"][0]["codec_name"], "h264");
+}
+
+#[tokio::test]
 async fn source_quality_uses_the_matching_episode_and_selects_its_measured_best_line() {
     let h = harness().await;
     let source = catalog::sources(&h.app).await.unwrap().remove(0);
@@ -2694,7 +2797,7 @@ async fn encrypted_hls_metadata_is_probed_from_bounded_local_resources() {
     let e = catalog::episode(&h.app, &e.id).await.unwrap();
     let info = tv_rust::probe::get(&h.app, &e).await.unwrap();
     assert_eq!(info.kind, "hls");
-    assert_eq!(info.probe_version, 1);
+    assert_eq!(info.probe_version, 2);
     assert!(info.duration >= 1.0);
     assert!(
         info.streams
@@ -3967,12 +4070,268 @@ async fn native_hls_uses_a_ready_manifest_instead_of_the_strm_file_channel() {
     )
     .unwrap();
     assert!(text.starts_with("#EXTM3U"));
-    assert!(text.contains("#EXT-X-STREAM-INF:"));
-    assert!(text.contains(&eps[0].url));
+    assert!(text.contains("/media/"));
+    assert!(!text.contains(&eps[0].url));
+    assert_eq!(stream["data"]["playback_mode"], "proxy");
     assert!(
-        text.contains("BANDWIDTH=4200000"),
-        "HLS带宽必须使用实际码率而非菜单选择码"
+        stream["data"]["file_stream"]["file_name"]
+            .as_str()
+            .unwrap()
+            .starts_with("转发 · ")
     );
+}
+
+#[tokio::test]
+async fn native_hls_forbidden_proxy_uses_strm_without_media_authentication_headers() {
+    let h = harness().await;
+    let eps = native_hls_fixture(&h, false).await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (_, pending) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/stream/list/{}", eps[0].id),
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(pending["data"]["playback_mode_pending"], true);
+    assert_eq!(pending["data"]["playback_mode_label"], "直链（待播放）");
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        stream["data"]["cloud_storage_info"]["cloud_storage_type"],
+        9001
+    );
+    assert_eq!(stream["data"]["header"], json!({}));
+    assert_eq!(stream["data"]["playback_mode"], "direct");
+    assert_eq!(stream["data"]["playback_mode_pending"], false);
+    assert!(text(&stream["data"]["file_stream"], "file_name").starts_with("直链 · "));
+    assert!(text(&stream["data"]["file_stream"], "path").starts_with("/播放方式/直链/"));
+    assert!(text(&stream["data"]["video_stream"], "title").starts_with("直链 · "));
+    let choices = stream["data"]["direct_link_qualities"].as_array().unwrap();
+    assert_eq!(choices.len(), 2);
+    assert!(choices.iter().all(|choice| choice["is_m3u8"] == true));
+    let selected = stream["data"]["direct_link_quality_index"]
+        .as_u64()
+        .unwrap() as usize;
+    assert_eq!(selected, 0, "STRM 首次读取必须使用本次选择的源");
+    assert_eq!(
+        choices[0]["bitrate"], stream["data"]["video_stream"]["bps"],
+        "来源标签、选择码和首次媒体读取必须对应同一个来源"
+    );
+    let link = text(&choices[selected], "url");
+    let path = url::Url::parse(&link).unwrap().path().to_owned();
+    assert!(path.ends_with(".m3u8"));
+    let hits = h.hits.load(Ordering::Relaxed);
+    for method in ["GET", "HEAD"] {
+        let response = router(h.app.clone(), "/nonexistent")
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header("range", "bytes=0-0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "正常 HLS 读取不能误报转发被禁");
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/vnd.apple.mpegurl"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        if method == "GET" {
+            let manifest = std::str::from_utf8(&bytes).unwrap();
+            assert!(manifest.starts_with("#EXTM3U\n#EXT-X-STREAM-INF:"));
+            assert!(manifest.contains(&eps[0].url));
+            assert!(!manifest.contains("/media/"));
+            assert!(manifest.contains("BANDWIDTH=4200000"));
+        } else {
+            assert!(bytes.is_empty());
+        }
+    }
+    assert_eq!(h.hits.load(Ordering::Relaxed), hits, "直链清单不转发源资源");
+    let play = playback::latest(&h.app, &h.who, &eps[0].id).await.unwrap();
+    assert_eq!(play.mode, "direct");
+    let (_, recorded) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/record",
+        json!({"media_guid":eps[0].id,"play_link":link,"ts":15,
+            "bitrate":stream["data"]["video_stream"]["bps"]}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(recorded["data"], true);
+    assert_eq!(
+        playback::get(&h.app, &play.id).await.unwrap().position,
+        15.0
+    );
+    assert!(
+        playback::fallback(&h.app, &h.who, &play.id, "manual")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        playback::get(&h.app, &play.id).await.unwrap().mode,
+        "direct"
+    );
+    for method in ["GET", "HEAD"] {
+        assert_eq!(
+            request(&h, method, &path, json!({}), Some(&h.raw)).await.0,
+            403
+        );
+        assert_eq!(
+            request(
+                &h,
+                method,
+                &format!("/v/api/v1/media/range/{}", eps[0].id),
+                json!({}),
+                Some(&h.raw)
+            )
+            .await
+            .0,
+            403
+        );
+    }
+    let (_, files) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/stream/list/{}", eps[0].id),
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(files["data"]["playback_mode"], "direct");
+    assert!(text(&files["data"]["files"][0], "file_name").starts_with("直链 · "));
+
+    let (status, switched) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream/directLink",
+        json!({"media_guid":eps[0].id,"direct_link_quality_index":1}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(switched["data"]["file_stream"]["guid"], eps[1].id);
+    assert_eq!(
+        switched["data"]["video_stream"]["bps"],
+        choices[1]["bitrate"]
+    );
+    assert_eq!(switched["data"]["direct_link_quality_index"], 1);
+    let (status, restored) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream/directLink",
+        json!({"media_guid":eps[1].id,"direct_link_quality_index":0}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(restored["data"]["file_stream"]["guid"], eps[0].id);
+    assert_eq!(
+        restored["data"]["video_stream"]["bps"],
+        choices[0]["bitrate"]
+    );
+}
+
+#[tokio::test]
+async fn native_hls_binds_the_sdk_link_before_the_first_authenticated_media_read() {
+    let h = harness().await;
+    let eps = native_hls_fixture(&h, false).await;
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    let sdk = "12345678-1234-1234-1234-123456789abc";
+    let path = format!("/v/api/v1/media/range/{}?playlink={sdk}", eps[0].id);
+    assert_eq!(
+        request(&h, "GET", &path, json!({}), Some(&h.raw)).await.0,
+        200
+    );
+    let play = playback::latest(&h.app, &h.who, &eps[0].id).await.unwrap();
+    let binding: String = sqlx::query_scalar(
+        "SELECT play_id FROM fntv_record_links WHERE auth_hash=? AND link_hash=?",
+    )
+    .bind(&h.who.auth_hash)
+    .bind(hash(sdk))
+    .fetch_one(&h.app.db)
+    .await
+    .unwrap();
+    assert_eq!(binding, play.id);
+    assert_eq!(play.mode, "proxy");
+    let (_, recorded) = request(&h, "POST", "/v/api/v1/play/record", json!({"media_guid":eps[0].id,"play_link":sdk,"ts":15,"bitrate":stream["data"]["video_stream"]["bps"]}), Some(&h.raw)).await;
+    assert_eq!(recorded["data"], true);
+    assert_eq!(
+        playback::get(&h.app, &play.id).await.unwrap().position,
+        15.0
+    );
+    let (_, files) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/stream/list/{}", eps[0].id),
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(files["data"]["playback_mode"], "proxy");
+    assert!(text(&files["data"]["files"][0], "file_name").starts_with("转发 · "));
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    for method in ["GET", "HEAD"] {
+        assert_eq!(
+            request(&h, method, &path, json!({}), Some(&h.raw)).await.0,
+            403
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_hls_new_play_does_not_reuse_a_pending_proxy_retry_after_forbidding_proxy() {
+    let h = harness().await;
+    let eps = native_hls_fixture(&h, false).await;
+    request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    let old = playback::latest(&h.app, &h.who, &eps[0].id).await.unwrap();
+    playback::fallback(&h.app, &h.who, &old.id, "manual")
+        .await
+        .unwrap();
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":eps[0].id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        stream["data"]["cloud_storage_info"]["cloud_storage_type"],
+        9001
+    );
+    let current = playback::latest(&h.app, &h.who, &eps[0].id).await.unwrap();
+    assert_ne!(current.id, old.id);
+    assert_eq!(current.mode, "direct");
+    assert!(playback::get(&h.app, &old.id).await.unwrap().ended);
 }
 
 #[tokio::test]

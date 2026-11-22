@@ -395,6 +395,32 @@ pub(crate) fn menu_label(file: &Value, duplicated: bool) -> String {
     format!("{name}{line}")
 }
 
+fn playback_mode_label(mode: &str, pending: bool) -> String {
+    let label = if mode == "proxy" { "转发" } else { "直链" };
+    if pending {
+        format!("{label}（待播放）")
+    } else {
+        label.to_owned()
+    }
+}
+
+fn show_file_playback_mode(file: &mut Value, mode: &str, pending: bool) {
+    let label = playback_mode_label(mode, pending);
+    file["file_name"] = json!(format!("{label} · {}", text(file, "file_name")));
+    file["path"] = json!(format!("/播放方式/{label}{}", text(file, "path")));
+    file["playback_mode"] = json!(mode);
+    file["playback_mode_label"] = json!(label);
+    file["playback_mode_pending"] = json!(pending);
+}
+
+fn show_video_playback_mode(video: &mut Value, mode: &str, pending: bool) {
+    video["title"] = json!(format!(
+        "{} · {}",
+        playback_mode_label(mode, pending),
+        text(video, "title")
+    ));
+}
+
 pub(crate) async fn stream_list(
     app: &App,
     who: &Identity,
@@ -418,6 +444,29 @@ pub(crate) async fn stream_list(
             streams.retain(|stream| stream["media_guid"] == e.id);
         }
     }
+    let play = playback::latest(app, who, &e.id).await.ok();
+    let hls = text(&result["files"][0], "path").ends_with(".m3u8");
+    let mode = play.as_ref().map(|play| play.mode.as_str()).unwrap_or(
+        if hls && !*app.forbid_proxy.borrow() {
+            "proxy"
+        } else {
+            "direct"
+        },
+    );
+    let pending = play.is_none();
+    if let Some(files) = result["files"].as_array_mut() {
+        for file in files {
+            show_file_playback_mode(file, mode, pending);
+        }
+    }
+    if let Some(videos) = result["video_streams"].as_array_mut() {
+        for video in videos {
+            show_video_playback_mode(video, mode, pending);
+        }
+    }
+    result["playback_mode"] = json!(mode);
+    result["playback_mode_label"] = json!(playback_mode_label(mode, pending));
+    result["playback_mode_pending"] = json!(pending);
     result["cloud_storage_info"] = Value::Null;
     Ok(result)
 }
@@ -642,7 +691,7 @@ fn tracks(
     source_name: &str,
 ) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
     let mut streams = info.streams.clone();
-    if !streams.iter().any(|v| v["codec_type"] == "video") {
+    if !streams.iter().any(probe::is_video_stream) {
         streams.push(probe::video(info));
     }
     let mut video = Vec::new();
@@ -651,6 +700,9 @@ fn tracks(
     for mut v in streams {
         let index = v["index"].as_i64().unwrap_or(0);
         let kind = text(&v, "codec_type");
+        if kind == "video" && !probe::is_video_stream(&v) {
+            continue;
+        }
         v["guid"] = json!(guid(&["track", &e.id, &index.to_string()]));
         v["media_guid"] = json!(e.id);
         v["duration"] = json!(info.duration as u64);
@@ -1209,10 +1261,10 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 "飞牛播放协商字段"
             );
             // 手动为当前飞牛会话选择的转发只应用于该次播放；普通新播放仍优先直链。
-            let previous = playback::latest(app, &who, &e.id)
-                .await
-                .ok()
-                .filter(|p| selection.is_some() || p.mode == "proxy" && p.state == "fallback");
+            let previous = playback::latest(app, &who, &e.id).await.ok().filter(|p| {
+                selection.is_some()
+                    || p.mode == "proxy" && p.state == "fallback" && !*app.forbid_proxy.borrow()
+            });
             let (delivered, play_id) = if let Some(ref p) = previous {
                 if let Some((_, link)) = &selection {
                     (link.clone(), p.id.clone())
@@ -1274,14 +1326,30 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 response["direct_link_quality_index"] = menu["selected_quality_index"].clone();
                 // 飞牛用视频流的清晰度和选择码定位当前菜单项；实测码率仍由
                 // quality 和详情的 stream/list 提供，不将选择码当成媒体码率。
-                let selected = menu["selected_quality_index"].as_u64().unwrap_or(0) as usize;
-                let current = &menu["qualities"][selected];
+                let current = &menu["selected_quality"];
                 response["video_stream"]["resolution_type"] = current["resolution"].clone();
                 response["video_stream"]["bps"] = current["bitrate"].clone();
-                if info.kind == "hls" {
+                if info.kind == "hls" && !*app.forbid_proxy.borrow() {
                     response["cloud_storage_info"] = Value::Null;
                 }
             }
+            let mut play = playback::get(app, &play_id).await?;
+            if info.kind == "hls" && !*app.forbid_proxy.borrow() && play.mode == "direct" {
+                // 原生 HLS 通道需要携带本站认证读取同源资源；在协商时记录所选方式，
+                // 客户端的文件信息与后续实际媒体交付保持一致。
+                playback::fallback(app, &who, &play_id, "headers").await?;
+                play = playback::get(app, &play_id).await?;
+                sqlx::query("UPDATE plays SET state='issued' WHERE id=? AND mode='proxy'")
+                    .bind(&play_id)
+                    .execute(&app.db)
+                    .await?;
+                playback::event(app, &play, "proxy_issued", "已为飞牛原生 HLS 准备转发").await?;
+            }
+            show_file_playback_mode(&mut response["file_stream"], &play.mode, false);
+            show_video_playback_mode(&mut response["video_stream"], &play.mode, false);
+            response["playback_mode"] = json!(play.mode);
+            response["playback_mode_label"] = json!(playback_mode_label(&play.mode, false));
+            response["playback_mode_pending"] = json!(false);
             Ok(ok(response))
         }
         "/v/api/v1/play/play" => {
@@ -1289,7 +1357,8 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 .map(|(_, link)| link)
                 .or(native_playback::current_link(app, &who, &e.id).await?)
             {
-                let link = native_playback::client_link(&link, &info.kind)?;
+                let link =
+                    native_playback::client_link(&link, &info.kind, *app.forbid_proxy.borrow())?;
                 return Ok(ok(
                     json!({"play_link":link,"media_guid":e.id,"video_guid":video.first().map(|v|text(v,"guid")).unwrap_or_default(),
                     "video_index":0,"audio_guid":audio.first().map(|v|text(v,"guid")).unwrap_or_default(),"audio_index":0,

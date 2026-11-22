@@ -56,6 +56,12 @@ async fn chunk(app: &App, url: &str, range: &str) -> Result<(Vec<u8>, String, He
     Ok((net::bytes(r, 512 * 1024, true).await?, url, headers))
 }
 async fn local_probe(prefix: Vec<u8>, tail: Option<(u64, Vec<u8>)>) -> Result<Value> {
+    // 部分 HLS 分片前置 PNG 图片头，自动识别会只看到小图片。
+    // 连续五个 TS 同步字节确认媒体容器后，交给 MPEG-TS 解复用器识别实际视频。
+    let image_ts = prefix.starts_with(b"\x89PNG\r\n\x1a\n")
+        && prefix
+            .windows(188 * 4 + 1)
+            .any(|data| (0..5).all(|index| data[index * 188] == 0x47));
     let mut file = tempfile::Builder::new()
         .prefix("tv-probe-")
         .suffix(".media")
@@ -66,13 +72,28 @@ async fn local_probe(prefix: Vec<u8>, tail: Option<(u64, Vec<u8>)>) -> Result<Va
         file.write_all(&bytes)?;
     }
     file.flush()?;
-    probe_file(file.path(), "file").await
+    let value = probe_file(file.path(), "file", image_ts.then_some("mpegts")).await?;
+    let format = text(&value["format"], "format_name");
+    if matches!(
+        format.as_str(),
+        "png_pipe" | "jpeg_pipe" | "gif" | "webp_pipe" | "bmp_pipe" | "image2" | "image2pipe"
+    ) {
+        return Err(Error::bad("媒体地址或分片返回图片，请刷新来源或换源"));
+    }
+    Ok(value)
 }
-async fn probe_file(path: &std::path::Path, protocols: &str) -> Result<Value> {
+async fn probe_file(
+    path: &std::path::Path,
+    protocols: &str,
+    format: Option<&str>,
+) -> Result<Value> {
     // 仅探测已经经过网络校验的有界本地数据，ffprobe 不接触远端 URL。
     let mut command = tokio::process::Command::new("ffprobe");
     if protocols == "file,crypto" {
         command.args(["-allowed_extensions", "key,ts,m3u8"]);
+    }
+    if let Some(format) = format {
+        command.args(["-f", format]);
     }
     let output = tokio::time::timeout(
         Duration::from_secs(6),
@@ -160,7 +181,7 @@ async fn encrypted_hls_probe(app: &App, base: &str, manifest: &str) -> Result<Va
     );
     let path = dir.path().join("probe.m3u8");
     std::fs::write(&path, local)?;
-    probe_file(&path, "file,crypto").await
+    probe_file(&path, "file,crypto", None).await
 }
 fn media_duration(v: &Value) -> f64 {
     text(&v["format"], "duration")
@@ -172,7 +193,7 @@ fn media_duration(v: &Value) -> f64 {
 async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
     let (prefix, mut base, headers) = chunk(app, &e.url, "bytes=0-524287").await?;
     let mut info = MediaInfo {
-        probe_version: 1,
+        probe_version: 2,
         size: total_size(&headers),
         ..Default::default()
     };
@@ -229,8 +250,10 @@ async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
             {
                 data.extend(b);
             }
-            if let Ok(v) = local_probe(data, None).await {
-                info.streams = v["streams"].as_array().cloned().unwrap_or_default();
+            match local_probe(data, None).await {
+                Ok(v) => info.streams = v["streams"].as_array().cloned().unwrap_or_default(),
+                Err(error) if error.1.contains("返回图片") => info.warning = error.1,
+                _ => {}
             }
         }
     } else {
@@ -259,17 +282,30 @@ async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
                 }
             }
         }
-        if let Ok(v) = local_probe(prefix, tail).await {
-            info.duration = media_duration(&v);
-            info.streams = v["streams"].as_array().cloned().unwrap_or_default();
+        match local_probe(prefix, tail).await {
+            Ok(v) => {
+                info.duration = media_duration(&v);
+                info.streams = v["streams"].as_array().cloned().unwrap_or_default();
+            }
+            Err(error) if error.1.contains("返回图片") => return Err(error),
+            _ => {}
         }
     }
     Ok(info)
 }
 pub(crate) fn cached(e: &Episode) -> Option<MediaInfo> {
     let info = serde_json::from_str::<MediaInfo>(&e.probe).ok()?;
+    let image_only = info
+        .streams
+        .iter()
+        .any(|video| video["codec_name"] == "png")
+        && !info
+            .streams
+            .iter()
+            .any(|video| is_video_stream(video) && video["codec_name"] != "png");
     (e.probed_at > now() - 21600
-        && !(info.kind == "hls" && info.streams.is_empty() && info.probe_version == 0))
+        && !(info.kind == "hls" && info.streams.is_empty() && info.probe_version == 0)
+        && !(image_only && info.probe_version < 2))
         .then_some(info)
 }
 
@@ -283,6 +319,9 @@ pub(crate) fn require_available(info: &MediaInfo) -> Result<()> {
         "媒体探测返回 HTTP 404" | "媒体探测返回 HTTP 410"
     ) {
         return Err(Error::bad("媒体地址已失效，请刷新来源或选择其他播放源"));
+    }
+    if info.warning == "媒体地址或分片返回图片，请刷新来源或换源" {
+        return Err(Error::bad(&info.warning));
     }
     Ok(())
 }
@@ -331,7 +370,9 @@ async fn get_inner(app: &App, e: &Episode, refresh: bool) -> Result<MediaInfo> {
     let result = tokio::time::timeout(Duration::from_secs(14), inspect(app, &fresh)).await;
     let info = match result {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) if e.1.contains("网页播放器") => return Err(e),
+        Ok(Err(e)) if e.1.contains("网页播放器") || e.1.contains("返回图片") => {
+            return Err(e);
+        }
         other => {
             let warning = match other {
                 Ok(Err(e)) => e.1,
@@ -339,7 +380,7 @@ async fn get_inner(app: &App, e: &Episode, refresh: bool) -> Result<MediaInfo> {
             };
             let path = net::valid_url(&fresh.url)?.path().to_lowercase();
             MediaInfo {
-                probe_version: 1,
+                probe_version: 2,
                 kind: if path.ends_with(".m3u8") || fresh.line_name.to_lowercase().contains("m3u8")
                 {
                     "hls"
@@ -366,12 +407,18 @@ async fn get_inner(app: &App, e: &Episode, refresh: bool) -> Result<MediaInfo> {
     Ok(info)
 }
 pub fn video(info: &MediaInfo) -> Value {
-    info.streams.iter().find(|v|v["codec_type"]=="video").cloned().unwrap_or(json!({"index":0,"codec_type":"video","codec_name":"h264","width":0,"height":0,"level":0,"pix_fmt":"yuv420p"}))
+    info.streams.iter().find(|v|is_video_stream(v)).cloned().unwrap_or(json!({"index":0,"codec_type":"video","codec_name":"h264","width":0,"height":0,"level":0,"pix_fmt":"yuv420p"}))
+}
+
+pub(crate) fn is_video_stream(stream: &Value) -> bool {
+    stream["codec_type"] == "video"
+        && stream["disposition"]["attached_pic"] != 1
+        && stream["disposition"]["attached_pic"] != true
 }
 
 pub fn quality(info: &MediaInfo) -> Value {
     // 网页只展示实际探测字段，不采用协议适配中的缺省 H.264 占位。
-    let video = info.streams.iter().find(|v| v["codec_type"] == "video");
+    let video = info.streams.iter().find(|v| is_video_stream(v));
     let number = |key: &str| {
         video
             .and_then(|v| match &v[key] {

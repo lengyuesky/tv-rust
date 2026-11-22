@@ -35,6 +35,13 @@ impl Choice {
             self.link.clone()
         }
     }
+    fn delivery_link(&self, direct_hls: bool) -> String {
+        if direct_hls {
+            self.link.clone()
+        } else {
+            self.play_link()
+        }
+    }
     fn quality(&self) -> Value {
         // 此字段是原生菜单选择码；HLS 清单的带宽仍来自真实探测字段。
         json!({"resolution":self.resolution,"bitrate":self.bitrate,"progressive":true,"is_m3u8":false})
@@ -50,8 +57,8 @@ fn choice_index(selector: &str) -> Result<usize> {
     index.parse().map_err(|_| Error::bad("播放来源序号无效"))
 }
 
-pub(crate) fn client_link(link: &str, kind: &str) -> Result<String> {
-    if kind == "hls" {
+pub(crate) fn client_link(link: &str, kind: &str, direct_hls: bool) -> Result<String> {
+    if kind == "hls" && !direct_hls {
         // 原生 HLS 的 play/play 通道由客户端补上服务地址，参考 fnmedia-ext。
         // STRM 的 MP4 直链通道仍交付绝对地址。
         Ok(net::valid_url(link)?.path().to_owned())
@@ -538,24 +545,52 @@ async fn create_menu(
         .bind(current_play)
         .execute(&app.db)
         .await?;
-    Ok(Some(menu_payload(&choices, selected)))
+    Ok(Some(menu_payload(
+        &choices,
+        selected,
+        selected,
+        *app.forbid_proxy.borrow(),
+    )))
 }
 
-fn menu_payload(choices: &[Choice], selected: usize) -> Value {
-    let direct = if choices[selected].is_hls() {
+fn direct_order(choices: &[Choice], reference: usize, direct_hls: bool) -> Vec<usize> {
+    // STRM 默认读取第一项。HLS 直链先放本次选择的来源，避免悄悄改源并串用续播位置。
+    // 原生 qualities 保持画质排序，其他直链来源也沿用原顺序；顺序由初始参考集固定。
+    let mut order: Vec<_> = (0..choices.len()).collect();
+    if direct_hls && choices[reference].is_hls() {
+        order.remove(reference);
+        order.insert(0, reference);
+    }
+    order
+}
+
+fn menu_payload(choices: &[Choice], selected: usize, reference: usize, direct_hls: bool) -> Value {
+    let order = direct_order(choices, reference, direct_hls);
+    let direct = if choices[selected].is_hls() && !direct_hls {
         Vec::new()
     } else {
-        choices
+        order
             .iter()
-            .map(|choice| {
+            .map(|index| {
+                let choice = &choices[*index];
                 let mut quality = choice.quality();
                 quality["url"] = json!(choice.link);
+                if choice.is_hls() {
+                    quality["is_m3u8"] = json!(true);
+                    quality["progressive"] = json!(false);
+                }
                 quality
             })
             .collect()
     };
+    let selected_index = if direct.is_empty() {
+        selected
+    } else {
+        order.iter().position(|index| *index == selected).unwrap()
+    };
     json!({"qualities":choices.iter().map(Choice::quality).collect::<Vec<_>>(),
-        "direct_link_qualities":direct,"selected_quality_index":selected})
+        "direct_link_qualities":direct,"selected_quality_index":selected_index,
+        "selected_quality":choices[selected].quality()})
 }
 
 pub(crate) async fn current_link(
@@ -566,7 +601,11 @@ pub(crate) async fn current_link(
     let menu: Option<Menu> = sqlx::query_as("SELECT * FROM fntv_playback_menus WHERE auth_hash=? AND (reference_episode_id=? OR active_play_id IN (SELECT id FROM plays WHERE episode_id=?)) AND closed=0 AND expires_at>? ORDER BY rowid DESC LIMIT 1")
         .bind(&who.auth_hash).bind(episode).bind(episode).bind(now()).fetch_optional(&app.db).await?;
     match menu {
-        Some(menu) => Ok(Some(menu.current_choice(app).await?.play_link())),
+        Some(menu) => Ok(Some(
+            menu.current_choice(app)
+                .await?
+                .delivery_link(*app.forbid_proxy.borrow()),
+        )),
         None => Ok(None),
     }
 }
@@ -589,6 +628,11 @@ pub(crate) async fn payload_for_link(
             .iter()
             .position(|choice| choice.episode_id == selected.episode_id)
             .unwrap_or(0),
+        choices
+            .iter()
+            .position(|choice| choice.episode_id == menu.reference_episode_id)
+            .ok_or_else(|| Error::bad("播放来源菜单已失效，请重新播放"))?,
+        *app.forbid_proxy.borrow(),
     )))
 }
 
@@ -670,7 +714,14 @@ pub(crate) async fn range(
                 .and_then(|value| value.to_str().ok())
         });
     let menu = if let Some(link) = linked {
-        for_link(app, who, link).await?.map(|(menu, _)| menu)
+        let resolved = match for_link(app, who, link).await? {
+            Some(known) => Some(known),
+            None => {
+                // SDK 在首次媒体读取时已经附带独立 UUID，进度回传尚未绑定它。
+                bind_native_record_link(app, who, link, &json!({"media_guid":e.id}), true).await?
+            }
+        };
+        resolved.map(|(menu, _)| menu)
     } else {
         sqlx::query_as("SELECT * FROM fntv_playback_menus WHERE auth_hash=? AND (reference_episode_id=? OR active_play_id IN (SELECT id FROM plays WHERE episode_id=?)) AND closed=0 AND expires_at>? ORDER BY rowid DESC LIMIT 1")
             .bind(&who.auth_hash).bind(&e.id).bind(&e.id).bind(now()).fetch_optional(&app.db).await?
@@ -736,7 +787,13 @@ pub(crate) async fn selected(
             .as_u64()
             .or_else(|| index.as_str()?.parse().ok())
             .ok_or_else(|| Error::bad("播放来源序号无效"))?;
-        choices.get(number as usize)
+        let reference = choices
+            .iter()
+            .position(|choice| choice.episode_id == menu.reference_episode_id)
+            .ok_or_else(|| Error::bad("播放来源菜单已失效，请重新播放"))?;
+        direct_order(&choices, reference, *app.forbid_proxy.borrow())
+            .get(number as usize)
+            .and_then(|index| choices.get(*index))
     } else {
         let number = code.ok_or_else(|| Error::bad("播放来源选择无效"))?;
         choices.iter().find(|choice| choice.bitrate == number)
@@ -744,7 +801,10 @@ pub(crate) async fn selected(
     .ok_or_else(|| Error::bad("播放来源选择已失效，请刷新来源"))?;
     let target = validate_choice(app, who, &menu, choice).await?;
     activate(app, who, &menu, choice).await?;
-    Ok(Some((target, choice.play_link())))
+    Ok(Some((
+        target,
+        choice.delivery_link(*app.forbid_proxy.borrow()),
+    )))
 }
 
 pub(crate) async fn quit(app: &App, who: &Identity, link: &str) -> Result<bool> {
@@ -808,7 +868,7 @@ pub(crate) async fn rpc(app: &App, who: &Identity, body: &Value) -> Result<Optio
                     .execute(&app.db).await?;
             }
             return Ok(Some(
-                json!({"reqid":body["reqid"],"result":"succ","play_link":client_link(&target.play_link(),if target.is_hls(){"hls"}else{"video"})?}),
+                json!({"reqid":body["reqid"],"result":"succ","play_link":client_link(&target.delivery_link(*app.forbid_proxy.borrow()),if target.is_hls(){"hls"}else{"video"},*app.forbid_proxy.borrow())?}),
             ));
         }
         "media.quit" => {
@@ -860,18 +920,18 @@ async fn media_inner(
     if request.method() == Method::HEAD {
         let info = probe::get(app, &e).await?;
         probe::require_available(&info)?;
-        if !carries_auth && !force_proxy && info.kind != "hls" {
+        let play = playback::owned(
+            app,
+            &who,
+            menu.active_play_id
+                .as_deref()
+                .ok_or_else(|| Error::bad("播放来源关联已失效"))?,
+        )
+        .await?;
+        if play.mode == "direct" && !carries_auth && !force_proxy && info.kind != "hls" {
             return Ok(Redirect::temporary(&e.url).into_response());
         }
-        if carries_auth || force_proxy {
-            let play = playback::owned(
-                app,
-                &who,
-                menu.active_play_id
-                    .as_deref()
-                    .ok_or_else(|| Error::bad("播放来源关联已失效"))?,
-            )
-            .await?;
+        if play.mode == "proxy" || force_proxy || carries_auth {
             playback::proxy_allowed(app, &play).await?;
         }
         let mut builder = Response::builder()
