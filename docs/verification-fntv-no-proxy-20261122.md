@@ -46,4 +46,17 @@ Rust 集成测试 **61 项**、AES 单元测试 **2 项**，合计 **63 项**通
 
 ## 交付状态
 
-本次修复通过 `main` 分支的“检查与原生双架构镜像发布”工作流检查并构建镜像；实际 Git 提交、工作流及镜像结果在远端核验后补充。用户部署未更新。使用新版时需取得包含本次修复的构建，退出旧播放并重新进入，以生成新的来源菜单。需要解密转发而客户端不能原生直连的来源，仍需换源或允许必要转发。
+功能提交 `487ff5be2f43337730bf8cd19a0d5bf98e3f8fd0` 已推送 `main`。[GitHub Actions](https://github.com/lengyuesky/tv-rust/actions/runs/45000112939) 全部成功：格式、Rust 测试与网页构建 1 分 3 秒，AMD64 原生构建及启动检查 2 分 19 秒，ARM64 1 分 38 秒，合并发布 23 秒，完整流程 **3 分 52 秒**。
+
+独立核对 GHCR：`ghcr.io/lengyuesky/tv-rust:latest` 与 `sha-487ff5be2f43337730bf8cd19a0d5bf98e3f8fd0` 指向相同镜像索引，仅包含 `linux/amd64`、`linux/arm64`。两架构的 OCI 源码修订标签均为本次功能提交，镜像运行用户均为 `tv`。索引摘要为 `sha256:eff6320d2f1f14ef1a5d424eeecdd77f9489790f404adadf976e8f4e7b437787`。
+
+上述证据目录已补充 `ci-run.json`、`ci-verification.json`、`ci.log`、`image-latest.json`、`image-sha.json`、`image-configs.json` 和 `image-verification.json`。镜像已发布，用户运行中的部署尚未更新；本验收文档的后续提交不触发镜像重建。
+
+在现有 Compose 目录执行以下命令，随后退出旧播放并重新进入，生成新的来源菜单：
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+需要解密转发而客户端不能原生直连的来源，仍需换源或允许必要转发。
