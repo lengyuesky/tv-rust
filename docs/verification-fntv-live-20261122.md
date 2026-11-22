@@ -32,7 +32,7 @@ Rust 集成测试 **67 项**、AES 单元测试 **2 项**，合计 **69 项**通
 - 用户同一真实来源的完整第一集实际显示剧集画面，识别为 **1920 × 1080、H.264、25 fps、AAC**。完整清单生成 **853 个分片区间**，实际播放会话保持 `direct`，进度持续回传，未出现媒体转发事件。
 - 首次识别 853 个区间的实测加载约 **15.1 秒**；缓存后约 **0.45 秒**。这是本机到该上游的单次观测，其他服务网络和来源会不同。
 
-2026-11-23 继续核验原会话的中断重试：客户端最终到达播放结束页；重试后的新会话保持 `direct`，取得 **49 次进度回传**，最后保存到 **3414 秒（56 分 54 秒）**，总时长约 **3444 秒**。此前重试的分片实查返回 `206`、`Content-Range: bytes 181-403816/403817`，视频区间以 TS 同步字节开始。此结果确认重试后能够继续读取和播放，不将前面的中断计作整集连续播放通过。续核数据为 `resumption-evidence.json`，分片检查为 `late-segment-check.json`。
+2026-11-23 继续核验原会话的中断重试：客户端最终到达播放结束页；重试后的新会话保持 `direct`，取得 **49 次进度回传**，最后保存到 **3414 秒（56 分 54 秒）**，总时长约 **3444 秒**。此前重试的分片实查返回 `206`、`Content-Range: bytes 181-403816/403817`，视频区间以 TS 同步字节开始。续核阶段记录到 **174 次媒体入口请求**，失败响应与携带本站登录头的请求均为 **0**。本轮确认了中断后重试恢复，整集连续播放仍需单独验收。续核数据为 `resumption-evidence.json`，分片检查为 `late-segment-check.json`。
 
 证据保存在忽略的 `tmp/fntv-live-20261122/`：`native-live-error.jpg`、`native-final-real-frame.jpg`、`final-native-evidence.json`、`cold-range-timing.json`、`warm-range-timing.json`、原始响应与受控媒体请求日志。真实地址、登录会话、数据库及影片截图不提交到仓库。
 
@@ -50,4 +50,17 @@ Rust 集成测试 **67 项**、AES 单元测试 **2 项**，合计 **69 项**通
 
 ## 交付
 
-代码和回归已完成，Git 与镜像发布结果在远端核验后补充。用户部署需更新到包含本次修复的镜像，退出旧播放并重新进入，生成新清单与来源菜单。
+功能提交 `5c953f505173ee4745f5b69dddb6012342554bf5` 已推送 `main`。[GitHub Actions](https://github.com/lengyuesky/tv-rust/actions/runs/45042145222) 全部成功：格式、Rust 测试与网页构建 **1 分 14 秒**，AMD64 原生构建及启动检查 **4 分 44 秒**，ARM64 **3 分 45 秒**，合并发布 **21 秒**，完整流程 **6 分 27 秒**。远端同样通过 **69 项 Rust 测试**和 **13 项网页测试**。
+
+独立核对 GHCR：`ghcr.io/lengyuesky/tv-rust:latest` 与 `sha-5c953f505173ee4745f5b69dddb6012342554bf5` 指向相同镜像索引，仅包含 `linux/amd64`、`linux/arm64`。两架构的 OCI 源码修订均为本次功能提交，镜像运行用户均为 `tv`。索引摘要为 `sha256:8059c1d9123cbba0bf48af9f498be4f7a2312ead07940d11375a25d7ce72b423`。
+
+发布证据保存在上述临时目录的 `ci-run.json`、`ci-verification.json`、`ci.log`、`image-latest.json`、`image-sha.json`、`image-configs.json` 和 `image-verification.json`。后续仅更新验收文档的提交不触发镜像重建。
+
+本次没有更新用户服务器容器。在现有 Compose 目录拉取新版镜像并重建容器：
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+更新后退出旧播放并重新进入，生成新清单与来源菜单。管理员删除成员的入口在“设置 → 家庭账号”。实体 iPhone、所有外部来源及整集连续无中断播放仍需分别验收。
