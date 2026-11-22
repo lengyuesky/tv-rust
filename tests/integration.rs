@@ -7,8 +7,9 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeSet, HashMap},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -2487,6 +2488,233 @@ async fn image_hls_without_range_support_is_not_silently_forwarded() {
         playback::latest(&h.app, &h.who, &e.id).await.unwrap().mode,
         "direct"
     );
+    let logs = playback::logs(&h.app, &h.who, 0).await.unwrap();
+    assert!(logs["items"].as_array().unwrap().iter().any(|item| {
+        item["events"].as_array().unwrap().iter().any(|event| {
+            event["event"] == "manifest_error"
+                && text(event, "message").contains("HLS 分片区间识别失败")
+        })
+    }));
+}
+
+#[tokio::test]
+async fn upstream_requests_reuse_connections_without_forwarding_site_credentials() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+    let h = harness().await;
+    let peers = Arc::new(Mutex::new(BTreeSet::new()));
+    let observations = peers.clone();
+    let upstream = Router::new().fallback(
+        move |ConnectInfo(peer): ConnectInfo<SocketAddr>, req: Request<Body>| {
+            let observations = observations.clone();
+            async move {
+                observations.lock().unwrap().insert(peer);
+                for header in ["cookie", "authorization", "authx"] {
+                    assert!(!req.headers().contains_key(header));
+                }
+                "upstream-body"
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/media", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            upstream.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert("cookie", "tv_session=site-secret".parse().unwrap());
+    headers.insert("authorization", "Bearer site-secret".parse().unwrap());
+    headers.insert("authx", "site-secret".parse().unwrap());
+    for _ in 0..4 {
+        let response = tv_rust::net::request(&h.app, Method::GET, &url, &headers)
+            .await
+            .unwrap();
+        assert_eq!(
+            tv_rust::net::bytes(response, 100, false).await.unwrap(),
+            b"upstream-body"
+        );
+    }
+    server.abort();
+    assert_eq!(peers.lock().unwrap().len(), 1, "完整读取后复用同一连接");
+}
+
+#[tokio::test]
+async fn concurrent_direct_manifests_limit_pressure_and_retry_a_transient_segment() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+    let h = harness().await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+    let peers = Arc::new(Mutex::new(BTreeSet::new()));
+    let observed_active = active.clone();
+    let observed_maximum = maximum.clone();
+    let observed_attempts = attempts.clone();
+    let observed_peers = peers.clone();
+    let upstream = Router::new().fallback(
+        move |ConnectInfo(peer): ConnectInfo<SocketAddr>, req: Request<Body>| {
+            let active = observed_active.clone();
+            let maximum = observed_maximum.clone();
+            let attempts = observed_attempts.clone();
+            let peers = observed_peers.clone();
+            async move {
+                peers.lock().unwrap().insert(peer);
+                let path = req.uri().path().to_owned();
+                if path == "/many.m3u8" || path == "/permanent.m3u8" {
+                    let mut manifest =
+                        String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n");
+                    if path == "/permanent.m3u8" {
+                        for index in 0..4 {
+                            manifest.push_str(&format!("#EXTINF:1,\nextra-{index:03}.png\n"));
+                        }
+                        manifest.push_str("#EXTINF:1,\nzz-gone.png\n");
+                    } else {
+                        for index in 0..600 {
+                            manifest.push_str(&format!("#EXTINF:1,\nsegment-{index:03}.png\n"));
+                        }
+                    }
+                    manifest.push_str("#EXT-X-ENDLIST\n");
+                    return (
+                        [("content-type", "application/vnd.apple.mpegurl")],
+                        manifest,
+                    )
+                        .into_response();
+                }
+                for header in ["cookie", "authorization", "authx"] {
+                    assert!(!req.headers().contains_key(header));
+                }
+                assert_eq!(req.headers()["range"], "bytes=0-4095");
+                let count = {
+                    let mut attempts = attempts.lock().unwrap();
+                    let count = attempts.entry(path.clone()).or_default();
+                    *count += 1;
+                    *count
+                };
+                if path == "/zz-gone.png" {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    return StatusCode::GONE.into_response();
+                }
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                if current > 32 || (path == "/segment-000.png" && count == 1) {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "temporary overload").into_response();
+                }
+                let bytes = include_bytes!("fixtures/hls-probe/image-prefixed.ts");
+                Response::builder()
+                    .status(206)
+                    .header("content-type", "image/png")
+                    .header("content-range", format!("bytes 0-4095/{}", bytes.len()))
+                    .body(Body::from(&bytes[..4096]))
+                    .unwrap()
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/many.m3u8", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            upstream.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    sqlx::query("UPDATE episodes SET url=?,probe=?,probed_at=? WHERE id=?")
+        .bind(url)
+        .bind(json!({"probe_version":2,"kind":"hls","duration":600.0,"size":0,"warning":"","streams":[]}).to_string())
+        .bind(now())
+        .bind(&h.episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":h.episode}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let path = url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url"))
+        .unwrap()
+        .path()
+        .to_owned();
+    let load = || {
+        router(h.app.clone(), "/nonexistent")
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+    };
+    let (first, second) = tokio::join!(load(), load());
+    for response in [first.unwrap(), second.unwrap()] {
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let manifest = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(manifest.matches("#EXT-X-BYTERANGE:10340@112").count(), 600);
+    }
+    let upstream_hits: usize = attempts.lock().unwrap().values().sum();
+    let response = load().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        attempts.lock().unwrap().values().sum::<usize>(),
+        upstream_hits,
+        "重新读取清单使用已识别区间"
+    );
+    assert!(attempts.lock().unwrap()["/segment-000.png"] >= 2);
+    assert!(maximum.load(Ordering::SeqCst) <= 32);
+    assert!(peers.lock().unwrap().len() < 96, "批量识别复用上游连接");
+    assert_eq!(
+        playback::latest(&h.app, &h.who, &h.episode)
+            .await
+            .unwrap()
+            .mode,
+        "direct"
+    );
+    let unavailable_url = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url)
+        .unwrap()
+        .join("/permanent.m3u8")
+        .unwrap();
+    sqlx::query("UPDATE episodes SET url=? WHERE id=?")
+        .bind(unavailable_url.as_str())
+        .bind(&h.episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let (_, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":h.episode}),
+        Some(&h.raw),
+    )
+    .await;
+    let unavailable_path =
+        url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url"))
+            .unwrap()
+            .path()
+            .to_owned();
+    for _ in 0..2 {
+        let (status, error) = request(&h, "GET", &unavailable_path, json!({}), None).await;
+        assert_eq!(status, 400);
+        assert!(text(&error, "error").contains("HTTP 410"));
+    }
+    let attempts = attempts.lock().unwrap();
+    assert_eq!(attempts["/zz-gone.png"], 2, "失效地址不自动重试");
+    for index in 0..4 {
+        assert_eq!(
+            attempts[&format!("/extra-{index:03}.png")],
+            1,
+            "失败后仍缓存已完成的区间"
+        );
+    }
+    server.abort();
 }
 
 #[tokio::test]

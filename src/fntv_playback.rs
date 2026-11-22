@@ -914,7 +914,9 @@ async fn direct_manifest(
     static URI: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r#"URI="([^"]+)""#).unwrap());
     // 只读取并解压有界清单。视频、音频、密钥和初始化分片仍由客户端直接读取上游。
-    let response = net::request(app, Method::GET, url, &HeaderMap::new()).await?;
+    let response = net::request(app, Method::GET, url, &HeaderMap::new())
+        .await
+        .map_err(|error| Error(error.0, format!("HLS 清单读取失败：{}", error.1)))?;
     if !response.status().is_success() {
         return Err(Error::bad(format!(
             "HLS 清单返回 HTTP {}，请刷新来源或换源",
@@ -922,7 +924,9 @@ async fn direct_manifest(
         )));
     }
     let base = net::valid_url(response.url().as_str())?;
-    let bytes = net::bytes(response, 4 * 1024 * 1024, false).await?;
+    let bytes = net::bytes(response, 4 * 1024 * 1024, false)
+        .await
+        .map_err(|error| Error(error.0, format!("HLS 清单读取失败：{}", error.1)))?;
     if !probe::is_hls(&bytes) {
         return Err(Error::bad("播放地址未返回有效 HLS 清单，请刷新来源或换源"));
     }
@@ -1114,7 +1118,13 @@ async fn media_inner(
             return Ok(Redirect::temporary(&media_url).into_response());
         }
         if choice.is_hls() {
-            let manifest = direct_manifest(app, &p, &menu, token, &media_url).await?;
+            let manifest = match direct_manifest(app, &p, &menu, token, &media_url).await {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    playback::event(app, &p, "manifest_error", &error.1).await?;
+                    return Err(error);
+                }
+            };
             let fresh_who = identity(app, &menu).await?;
             validate_choice(app, &fresh_who, &menu, &choice).await?;
             return Ok(Response::builder()

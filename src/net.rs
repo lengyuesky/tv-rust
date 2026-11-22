@@ -3,10 +3,54 @@ use crate::core::*;
 use axum::http::{HeaderMap, Method};
 use futures_util::StreamExt;
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    time::Duration,
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 use url::Url;
+
+type ClientKey = (String, u16, Vec<SocketAddr>);
+
+#[derive(Default)]
+pub(crate) struct Clients(Mutex<HashMap<ClientKey, (Instant, reqwest::Client)>>);
+
+impl Clients {
+    fn get(&self, host: &str, port: u16, addrs: &[SocketAddr]) -> Result<reqwest::Client> {
+        // 调用方每次先重新解析、验证地址；只有 DNS 结果相同时才复用固定地址的连接池。
+        let mut addresses = addrs.to_vec();
+        addresses.sort_unstable();
+        addresses.dedup();
+        let key = (host.to_owned(), port, addresses);
+        let mut clients = self.0.lock().unwrap();
+        clients.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(60));
+        if let Some((at, client)) = clients.get_mut(&key) {
+            *at = Instant::now();
+            return Ok(client.clone());
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, addrs)
+            .connect_timeout(Duration::from_secs(7))
+            .read_timeout(Duration::from_secs(20))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(32)
+            .user_agent("TV-Rust/0.1 (+source-subscription)")
+            .build()
+            .map_err(|_| Error::bad("无法建立上游连接"))?;
+        if clients.len() >= 32
+            && let Some(oldest) = clients
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| key.clone())
+        {
+            clients.remove(&oldest);
+        }
+        clients.insert(key, (Instant::now(), client.clone()));
+        Ok(client)
+    }
+}
 
 fn public_v4(ip: Ipv4Addr) -> bool {
     !ip.is_private()
@@ -72,31 +116,40 @@ pub async fn request(
                 "上游地址指向受限网络；内网源需在部署时显式启用 TV_ALLOW_PRIVATE_UPSTREAM",
             ));
         }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(&host, &addrs)
-            .connect_timeout(Duration::from_secs(7))
-            .read_timeout(Duration::from_secs(20))
-            .user_agent("TV-Rust/0.1 (+source-subscription)")
-            .build()
-            .map_err(|_| Error::bad("无法建立上游连接"))?;
-        let mut req = client.request(method.clone(), url.clone());
-        for key in [
-            "range",
-            "if-range",
-            "if-none-match",
-            "if-modified-since",
-            "accept",
-        ] {
-            if let Some(v) = headers.get(key) {
-                req = req.header(key, v);
+        let client = app.upstream_clients.get(&host, port, &addrs)?;
+        let mut attempt = 0;
+        let started = Instant::now();
+        let response = loop {
+            let mut req = client.request(method.clone(), url.clone());
+            for key in [
+                "range",
+                "if-range",
+                "if-none-match",
+                "if-modified-since",
+                "accept",
+            ] {
+                if let Some(v) = headers.get(key) {
+                    req = req.header(key, v);
+                }
             }
-        }
-        let response = req
-            .send()
-            .await
-            .map_err(|_| Error::bad("上游连接、读取或证书验证失败"))?;
+            match req.send().await {
+                Ok(response) => break response,
+                Err(error)
+                    if attempt == 0
+                        && matches!(method, Method::GET | Method::HEAD)
+                        && (error.is_connect() || error.is_timeout())
+                        && started.elapsed() < Duration::from_secs(8) =>
+                {
+                    tracing::debug!(host, port, error = %error.without_url(), "上游连接失败，重试一次");
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(host, port, error = %error.without_url(), "上游请求失败");
+                    return Err(Error::bad("上游连接、读取或证书验证失败"));
+                }
+            }
+        };
         if response.status().is_redirection() {
             let location = response
                 .headers()
