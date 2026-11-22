@@ -84,4 +84,12 @@ docker compose up -d
 
 本机飞牛 **1.13.0 / 1130013** 在全新数据库、起播前分片缓存为 **0** 时实际显示同一真实来源的剧集画面。记录到 **15 次进度回传**及 **21 次媒体入口请求**，方式保持 `direct`，失败与携带本站登录头的媒体请求均为 **0**。最终缓存实现对同一来源的独立实测：清空 **853 条**区间缓存后，完整清单返回 **200**，生成 **853 个真实区间**，约 **10.7 秒**；再次读取约 **0.24 秒**。独立 FFprobe 读取最终直链，确认 **1920×1080 H.264、AAC、约 3444 秒**。时间为本机单次观测；排查中还出现过上游较慢、45 秒才完成的请求，不能保证其他部署环境有相同加载速度。
 
-后续证据位于忽略的 `tmp/fntv-followup-20261123/`：公网响应、强制画质探测、逐分片检查、旧版对照日志、`native-cold-evidence.json`、`final-cold-range-timing.json`、`final-warm-range-timing.json` 和 `final-direct-ffprobe.json`。本轮没有直接更新用户容器；发布及公网复查结果随后补充。
+后续证据位于忽略的 `tmp/fntv-followup-20261123/`：公网响应、强制画质探测、逐分片检查、旧版对照日志、`native-cold-evidence.json`、`final-cold-range-timing.json`、`final-warm-range-timing.json` 和 `final-direct-ffprobe.json`。
+
+功能提交 `de717d280c7b725c1b76250fd0211e2b08cfd8f6` 已推送 `main`。[本轮 GitHub Actions](https://github.com/lengyuesky/tv-rust/actions/runs/45052371903) 全部成功，完整流程 **4 分钟**：检查和网页构建 **1 分 11 秒**，AMD64 构建及启动检查 **2 分 26 秒**，ARM64 **1 分 43 秒**，合并发布 **15 秒**。远端通过同样的 **71 项 Rust 测试**及 **13 项网页测试**。
+
+独立核对 `latest` 与 `sha-de717d280c7b725c1b76250fd0211e2b08cfd8f6` 索引相同，仅有 `linux/amd64`、`linux/arm64`，两架构的源码修订均为功能提交，运行用户为 `tv`。索引摘要为 `sha256:028d4fe04dff82b42a049ca1d9795885d868b6bfd4010af1b9a4013d9a96546e`。CI 和镜像证据为本轮目录的 `ci-run.json`、`ci-verification.json`、`ci.log` 和 `image-*.json`。
+
+发布后的公网复查：同一爱奇艺第一集入口返回 **200**，完整 **853 个区间**，约 **10.7 秒**；状态为 `direct`。进一步将本机飞牛直接连接 `https://tv.187886.xyz` 复验：测试账号起初恢复了此前排查留下的红牛来源，清单包含 **AES-128**，实际复现同样的 `-99985`。将**测试账号**的起始来源切回爱奇艺、初始位置设为 0，并重新连接客户端后，实际显示剧集画面，取得 **7 次进度回传，位置 117 秒（1 分 57 秒）**；播放日志保持 `direct`，服务的禁止转发仍开启。
+
+公网证据为 `post-release-online-result.json`、`public-native-play-logs.json`、`public-source-preparation.json` 和 `final-public-native-evidence.json`。测试账号的来源准备与实际客户端进度分别记录；停止验收后，爱奇艺来源的实际保存位置为 **383 秒（6 分 23 秒）**，其他成员的进度未改动。红牛 AES-128 直连失败仍属已验证的客户端限制，需选择可直链的来源或允许必要解密转发。本轮未连接实体 iPhone，也未直接重建用户容器；当前公网链路与镜像发布分别验证。本地夹具与后端已停止，本机客户端已退出本次播放。
