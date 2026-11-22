@@ -385,19 +385,14 @@ async fn source_file(app: &App, user: &str, e: &Episode, info: &probe::MediaInfo
 
 pub(crate) fn menu_label(file: &Value, duplicated: bool) -> String {
     let name = text(file, "source_name");
+    // 飞牛的三列按钮不会自动换行，菜单只保留来源和必要的线路编号。
+    let name = name.trim().trim_start_matches('🎬').trim();
     let line = if duplicated {
         format!("/{}", text(file, "line_name").trim_start_matches("线路 "))
     } else {
         String::new()
     };
-    let width = file["quality"]["width"].as_f64().unwrap_or(0.0);
-    let height = file["quality"]["height"].as_f64().unwrap_or(0.0);
-    let quality = if width > 0.0 && height > 0.0 {
-        format!("{}p", height as u64)
-    } else {
-        "画质待识别".to_owned()
-    };
-    format!("{name}{line} · {quality}")
+    format!("{name}{line}")
 }
 
 pub(crate) async fn stream_list(

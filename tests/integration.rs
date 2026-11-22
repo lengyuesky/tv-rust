@@ -3240,7 +3240,7 @@ async fn cached_native_media(h: &Harness, episode: &str, width: u64, height: u64
 async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_source_progress() {
     let h = harness().await;
     let primary = catalog::sources(&h.app).await.unwrap().remove(0);
-    let subscription = catalog::import(&h.app,&json!({"name":"原生候选订阅","content":json!({"api_site":{"b":{"name":"原生备用源","api":primary.api},"c":{"name":"原生未知源","api":primary.api}}}).to_string()})).await.unwrap();
+    let subscription = catalog::import(&h.app,&json!({"name":"原生候选订阅","content":json!({"api_site":{"b":{"name":"🎬红牛资源","api":primary.api},"c":{"name":"🎬金鹰点播","api":primary.api}}}).to_string()})).await.unwrap();
     let sources: Vec<_> = catalog::sources(&h.app)
         .await
         .unwrap()
@@ -3249,11 +3249,11 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
         .collect();
     let secondary = sources
         .iter()
-        .find(|source| source.name == "原生备用源")
+        .find(|source| source.name == "🎬红牛资源")
         .unwrap();
     let unknown = sources
         .iter()
-        .find(|source| source.name == "原生未知源")
+        .find(|source| source.name == "🎬金鹰点播")
         .unwrap();
     let reference = catalog::episode(&h.app, &h.episode).await.unwrap();
     let url = reference.url;
@@ -3329,9 +3329,21 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
     );
     let menu = versions["data"]["qualities"].as_array().unwrap();
     assert_eq!(menu.len(), 5);
-    assert!(text(&menu[0], "resolution").contains("1080p"));
-    assert!(text(&menu[1], "resolution").contains("720p"));
-    assert!(text(menu.last().unwrap(), "resolution").contains("画质待识别"));
+    assert_eq!(menu[0]["resolution"], format!("{}/2", primary.name));
+    assert_eq!(menu[1]["resolution"], "红牛资源/2");
+    assert_eq!(menu.last().unwrap()["resolution"], "金鹰点播");
+    assert!(menu.iter().all(|choice| {
+        let label = text(choice, "resolution");
+        !label.contains('🎬') && !label.contains("画质") && !label.contains('·')
+    }));
+    assert_eq!(
+        versions["data"]["files"][0]["quality"]["width"].as_f64(),
+        Some(640.0)
+    );
+    assert_eq!(
+        versions["data"]["files"][0]["quality"]["height"].as_f64(),
+        Some(360.0)
+    );
     assert!(!versions.to_string().contains("原生隐藏源"));
     assert!(!versions.to_string().contains(&url));
     assert_eq!(
@@ -3399,10 +3411,7 @@ async fn native_source_versions_match_the_actual_episode_sort_quality_and_keep_s
     );
     let selected = lines
         .iter()
-        .find(|line| {
-            text(line, "resolution").contains("原生备用源/2")
-                && text(line, "resolution").contains("720p")
-        })
+        .find(|line| text(line, "resolution") == "红牛资源/2")
         .unwrap();
     let selected_link = text(selected, "url");
     let current_index = first["data"]["direct_link_quality_index"].as_u64().unwrap() as usize;
@@ -3904,7 +3913,7 @@ async fn native_hls_uses_a_ready_manifest_instead_of_the_strm_file_channel() {
     assert!(
         qualities
             .iter()
-            .any(|quality| text(quality, "resolution") == "测试源/1 · 720p")
+            .any(|quality| text(quality, "resolution") == "测试源/1")
     );
     let (_, played) = request(
         &h,
@@ -4009,7 +4018,8 @@ async fn native_menu_respects_https_reverse_proxy_and_media_extensions() {
             "https://video.example:8443"
         );
         assert!(link.path().ends_with(".mp4"));
-        assert!(text(choice, "resolution").ends_with(" · 720p"));
+        assert!(text(choice, "resolution").starts_with("测试源/线路"));
+        assert!(!text(choice, "resolution").contains('·'));
         assert!(!text(choice, "resolution").contains('\n'));
     }
     assert_eq!(
@@ -4286,7 +4296,7 @@ async fn expired_media_is_reported_before_playback_and_failed_switch_keeps_the_o
         .as_array()
         .unwrap()
         .iter()
-        .find(|quality| text(quality, "resolution").contains("画质待识别"))
+        .find(|quality| quality["bitrate"] != stream["data"]["video_stream"]["bps"])
         .unwrap();
     let (status, failed) = request(
         &h,
