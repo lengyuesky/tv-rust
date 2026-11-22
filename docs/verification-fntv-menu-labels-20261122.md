@@ -29,6 +29,14 @@ Rust 集成测试 **55 项**、AES 单元测试 **2 项**，共 **57 项**通过
 
 证据目录为 `tmp/fntv-menu-labels-20261122-E5nHz8/`，包含 `native-menu-short-labels.jpg`、对应的界面文本、`verification.json`、`native-requests.jsonl` 和 `media-requests.jsonl`。检查日志在 `tmp/fntv-menu-labels-20261122/`。临时客户端与服务在发布前停止。
 
+## 发布验证
+
+功能提交 `1301612941f42b6f70e64e7a7b673099bf135c45` 已推送 `main`。[GitHub Actions](https://github.com/lengyuesky/tv-rust/actions/runs/44979985784) 全部成功：检查与网页构建 1 分 11 秒，AMD64 原生构建及启动检查 1 分 36 秒，ARM64 1 分 52 秒，合并发布 20 秒，完整流程 **3 分 31 秒**。沿用免费标准 runner 的双架构并行构建流程。
+
+独立核对 GHCR：`ghcr.io/lengyuesky/tv-rust:latest` 与 `sha-1301612941f42b6f70e64e7a7b673099bf135c45` 指向相同索引，仅包含 `linux/amd64`、`linux/arm64`。两架构的 OCI 源码修订标签均为本次功能提交，镜像运行用户为 `tv`。索引摘要为 `sha256:091daaff03ebf23304dfa12852af535138c22a6912d40f61e6a9767dba329b88`。
+
+发布证据为 `tmp/fntv-menu-labels-20261122/` 下的 `ci-run.json`、`ci-verification.json`、`ci.log`、`image-latest.json`、`image-sha.json`、`image-configs.json` 和 `image-verification.json`。镜像已发布，用户运行中的部署尚未更新；本验收文档的后续提交不触发镜像重建。
+
 ## 更新后使用
 
 在现有 Compose 目录运行 `docker compose pull` 和 `docker compose up -d`，退出旧播放并重新进入，生成新版来源菜单。画质菜单按真实画质排序，点击源名即可换源；完整画质在“文件位置／视频信息”查看。
