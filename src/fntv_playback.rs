@@ -177,7 +177,7 @@ async fn prepare_direct_hls_shared(app: &App, user: &str, e: &Episode) -> Result
             tokio::spawn(async move {
                 let result = async {
                     let result = {
-                        let _slot = app.probe_slots.acquire().await.unwrap();
+                        let _slot = app.direct_ready_slots.acquire().await.unwrap();
                         let fresh = direct_episode(&app, &user, &e).await?;
                         if let Some(info) = probe::last_known(&fresh) {
                             probe::require_available(&info)?;
@@ -235,6 +235,22 @@ pub(crate) fn warm_direct_hls(app: &App, who: &Identity, e: &Episode, hls: bool)
 }
 
 async fn direct_ready(app: &App, user: &str, e: &Episode, info: &probe::MediaInfo) -> Result<()> {
+    direct_ready_within(app, user, e, info, Duration::from_secs(3)).await
+}
+
+/// 这条来源的预检是否已经在后台进行。上一次起播没等到它，说明它准备得慢。
+fn direct_ready_pending(app: &App, e: &Episode) -> bool {
+    let key = format!("native-direct-ready:v1:{}", hash(&e.url));
+    app.direct_ready_jobs.lock().unwrap().contains_key(&key)
+}
+
+async fn direct_ready_within(
+    app: &App,
+    user: &str,
+    e: &Episode,
+    info: &probe::MediaInfo,
+    wait: Duration,
+) -> Result<()> {
     probe::require_available(info)?;
     if info.kind != "hls" {
         // STRM 直链只能交付真实的媒体文件。既没有识别出视频、地址也不是媒体文件形态的
@@ -249,12 +265,9 @@ async fn direct_ready(app: &App, user: &str, e: &Episode, info: &probe::MediaInf
     if info.encrypted {
         return Err(Error::bad(ENCRYPTED));
     }
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        prepare_direct_hls_shared(app, user, e),
-    )
-    .await
-    .unwrap_or_else(|_| Err(Error::bad("当前来源未能及时完成直链准备")))
+    tokio::time::timeout(wait, prepare_direct_hls_shared(app, user, e))
+        .await
+        .unwrap_or_else(|_| Err(Error::bad("当前来源未能及时完成直链准备")))
 }
 
 pub(crate) async fn prepare_start(
@@ -327,9 +340,19 @@ pub(crate) async fn prepare_start(
     }
     let mut selected = None;
     for (candidate, info, source) in measured {
-        if tokio::time::timeout_at(deadline, direct_ready(app, &who.user.id, &candidate, &info))
-            .await
-            .is_ok_and(|result| result.is_ok())
+        // 预检还在后台进行的备选只短暂等待：它上次就没赶上，不让每次起播都为它
+        // 再等满三秒；后台完成后下一次起播直接命中结果。
+        let wait = if direct_ready_pending(app, &candidate) {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(3)
+        };
+        if tokio::time::timeout_at(
+            deadline,
+            direct_ready_within(app, &who.user.id, &candidate, &info, wait),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
         {
             selected = Some((candidate, info, source));
             break;
