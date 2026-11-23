@@ -20,6 +20,10 @@ use std::{
 };
 use tokio::time::{Instant, timeout_at};
 
+/// 带来源菜单的直链交付所报的存储类型。实测 1.13.0 对 9001 之外未登记的类型按通用
+/// 直连处理：不显示任何网盘品牌，保留画质菜单。
+const DIRECT_MENU_STORAGE_TYPE: u64 = 9000;
+
 fn ok(v: Value) -> Response {
     let mut response = Json(json!({"code":0,"msg":"","data":v})).into_response();
     response
@@ -1497,6 +1501,12 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 response["video_stream"]["bps"] = current["bitrate"].clone();
                 if info.kind == "hls" && !*app.forbid_proxy.borrow() {
                     response["cloud_storage_info"] = Value::Null;
+                } else {
+                    // 飞牛 1.13.0 在 STRM（9001）界面不显示画质按钮，来源菜单无从打开。
+                    // 直链菜单改报通用的直连类型：播放器显示当前来源和“视频质量”菜单，
+                    // 起播失败时也提供“播放其他画质”；媒体仍按空请求头直接读取。
+                    response["cloud_storage_info"]["cloud_storage_type"] =
+                        json!(DIRECT_MENU_STORAGE_TYPE);
                 }
             }
             let mut play = playback::get(app, &play_id).await?;

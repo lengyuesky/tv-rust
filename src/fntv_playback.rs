@@ -1326,7 +1326,11 @@ pub(crate) async fn media(
 ) -> Response {
     media_inner(&app, &token, &selector, request, false)
         .await
-        .unwrap_or_else(IntoResponse::into_response)
+        .unwrap_or_else(|error| {
+            // 播放器只显示状态码。记录原因（不含地址和令牌），便于从服务日志判断起播失败在哪一步。
+            tracing::warn!(status = error.0.as_u16(), reason = %error.1, "飞牛媒体入口未能交付");
+            error.into_response()
+        })
 }
 
 fn playlist_link(
@@ -1484,6 +1488,64 @@ async fn direct_manifest(
     Ok(out)
 }
 
+/// 飞牛会沿用同一媒体上一次起播时取得的清单，其中的子清单与分片地址属于已经结束的
+/// 菜单或播放会话。这些地址只用于空认证头的直读：登录仍然有效、来源仍获准使用且播放
+/// 地址没有变化时照常交付，不激活来源，也不改变当前播放和进度归属。
+async fn stale_direct_asset(
+    app: &App,
+    menu: &Menu,
+    token: &str,
+    asset: &str,
+    segment: bool,
+) -> Result<Option<Response>> {
+    let who = auth::identity_for_hash(app, &menu.auth_hash).await?;
+    if menu.user_id != who.user.id {
+        return Ok(None);
+    }
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT a.url,p.id FROM media_assets a JOIN plays p ON p.id=a.play_id \
+         WHERE a.id=? AND p.user_id=? AND p.auth_hash=?",
+    )
+    .bind(asset)
+    .bind(&who.user.id)
+    .bind(&who.auth_hash)
+    .fetch_optional(&app.db)
+    .await?;
+    let Some((url, play_id)) = row else {
+        return Ok(None);
+    };
+    let p = playback::get(app, &play_id).await?;
+    let Some(choice) = menu
+        .choices()?
+        .into_iter()
+        .find(|choice| choice.episode_id == p.episode_id)
+    else {
+        return Ok(None);
+    };
+    // 兜底直连与转发会话沿用原有的严格路径。
+    if p.mode != "direct" || !choice.is_hls() || choice.client_only {
+        return Ok(None);
+    }
+    let (e, _, _) = catalog::available(app, &who.user.id, &choice.episode_id).await?;
+    if e.url != choice.media_url {
+        return Err(Error::bad("播放地址已更新，请刷新来源"));
+    }
+    if segment {
+        return Ok(Some(Redirect::temporary(&url).into_response()));
+    }
+    let manifest = direct_manifest(app, &p, menu, token, &url)
+        .await
+        .map_err(|error| error.error)?;
+    catalog::available(app, &who.user.id, &choice.episode_id).await?;
+    Ok(Some(
+        Response::builder()
+            .header("cache-control", "no-store")
+            .header("content-type", "application/vnd.apple.mpegurl")
+            .body(axum::body::Body::from(manifest))
+            .unwrap(),
+    ))
+}
+
 async fn media_inner(
     app: &App,
     token: &str,
@@ -1495,9 +1557,32 @@ async fn media_inner(
         return Err(Error::bad("媒体仅支持 GET/HEAD"));
     }
     let menu = get(app, token).await?;
-    let who = identity(app, &menu).await?;
     let child_asset = selector.strip_prefix("playlist-");
     let segment_asset = selector.strip_prefix("segment-");
+    let unauthenticated = !["authorization", "cookie", "authx"]
+        .iter()
+        .any(|name| request.headers().contains_key(*name));
+    if let Some(asset) = child_asset.or(segment_asset)
+        && request.method() == Method::GET
+        && unauthenticated
+        && !force_proxy
+        && (menu.closed || menu.expires_at <= now() || {
+            // 同一菜单内换源后，播放器也可能读取先前来源的清单。
+            let current = menu.active_play_id.as_deref().unwrap_or("");
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM media_assets WHERE id=? AND play_id=?)",
+            )
+            .bind(asset)
+            .bind(current)
+            .fetch_one(&app.db)
+            .await?
+        })
+        && let Some(response) =
+            stale_direct_asset(app, &menu, token, asset, segment_asset.is_some()).await?
+    {
+        return Ok(response);
+    }
+    let who = identity(app, &menu).await?;
     let choice = if selector == "stream.m3u8" || child_asset.is_some() || segment_asset.is_some() {
         let choice = menu.current_choice(app).await?;
         if !choice.is_hls() {

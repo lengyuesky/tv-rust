@@ -2496,6 +2496,128 @@ async fn direct_hls_delivers_decoded_nested_playlists_with_upstream_media_urls()
 }
 
 #[tokio::test]
+async fn direct_hls_keeps_serving_playlists_the_player_reuses_from_an_earlier_start() {
+    let h = harness().await;
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    let base = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url).unwrap();
+    let url = base.join("/compressed-master.m3u8").unwrap();
+    let film = catalog::ingest(&h.app, &source, &json!({"vod_id":7207,"vod_name":"旧清单地址直读验收","vod_year":"2026","vod_play_from":"lzm3u8","vod_play_url":format!("正片${url}")}), true).await.unwrap().unwrap();
+    let e = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    async fn read(h: &Harness, path: &str) -> (StatusCode, String, String) {
+        let response = router(h.app.clone(), "/nonexistent")
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            String::from_utf8_lossy(&body).into_owned(),
+            location,
+        )
+    }
+    fn first(manifest: &str) -> String {
+        let line = manifest
+            .lines()
+            .find(|line| !line.starts_with('#') && !line.is_empty())
+            .unwrap();
+        url::Url::parse(line).unwrap().path().to_owned()
+    }
+    let mut starts = Vec::new();
+    for _ in 0..2 {
+        let (status, stream) = request(
+            &h,
+            "POST",
+            "/v/api/v1/stream",
+            json!({"media_guid":e.id}),
+            Some(&h.member_raw),
+        )
+        .await;
+        assert_eq!(status, 200, "{stream}");
+        let top = url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url"))
+            .unwrap()
+            .path()
+            .to_owned();
+        let (status, master, _) = read(&h, &top).await;
+        assert_eq!(status, 200);
+        let child = first(&master);
+        let (status, manifest, _) = read(&h, &child).await;
+        assert_eq!(status, 200);
+        starts.push((top, child, first(&manifest)));
+    }
+    let (old_top, old_child, old_segment) = starts[0].clone();
+    assert_ne!(old_child, starts[1].1, "每次起播签发新的子清单地址");
+    // 飞牛再次起播同一来源时沿用上一次取得的主清单，继续请求旧的子清单与分片地址。
+    let hits = h.hits.load(Ordering::Relaxed);
+    let (status, manifest, _) = read(&h, &old_child).await;
+    assert_eq!(status, 200, "旧子清单地址在登录有效时仍可直读");
+    assert!(manifest.contains("#EXT-X-BYTERANGE:"));
+    assert_eq!(first(&manifest), old_segment);
+    let (status, _, location) = read(&h, &old_segment).await;
+    assert_eq!(status, 307);
+    assert_eq!(location, base.join("/image-prefixed.png").unwrap().as_str());
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits + 1,
+        "旧地址只重新读取清单，分片仍只重定向"
+    );
+    assert_eq!(
+        read(&h, &old_top).await.0,
+        400,
+        "已结束的菜单不能再用来起播或换源"
+    );
+    assert_eq!(
+        request(&h, "GET", &old_child, json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        400,
+        "携带本站登录头的请求不走旧地址直读"
+    );
+    let current = playback::latest(&h.app, &h.other, &e.id).await.unwrap();
+    assert!(!current.ended, "读取旧地址不结束也不替换当前播放");
+    let plays: i64 = sqlx::query_scalar("SELECT count(*) FROM plays WHERE episode_id=?")
+        .bind(&e.id)
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap();
+    assert_eq!(plays, 2, "读取旧地址不建立新的播放会话");
+    // 来源使用范围收回后，旧地址与当前地址一样失效。
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(&h, &old_child).await.0, 403);
+    assert_eq!(read(&h, &old_segment).await.0, 403);
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"all","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(&h, &old_segment).await.0, 307);
+    // 退出登录后旧地址不再可用。
+    assert_eq!(
+        request(&h, "POST", "/api/logout", json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(read(&h, &old_child).await.0, 401);
+    assert_eq!(read(&h, &old_segment).await.0, 401);
+}
+
+#[tokio::test]
 async fn image_hls_without_range_support_is_not_silently_forwarded() {
     let h = harness().await;
     let source = catalog::sources(&h.app).await.unwrap().remove(0);
@@ -6941,8 +7063,8 @@ async fn native_hls_forbidden_proxy_uses_strm_without_media_authentication_heade
     .await;
     assert_eq!(status, 200);
     assert_eq!(
-        stream["data"]["cloud_storage_info"]["cloud_storage_type"],
-        9001
+        stream["data"]["cloud_storage_info"]["cloud_storage_type"], 9000,
+        "带来源菜单的直链不报 STRM 类型，播放器才显示画质菜单"
     );
     assert_eq!(stream["data"]["header"], json!({}));
     assert_eq!(stream["data"]["playback_mode"], "direct");
@@ -7164,8 +7286,8 @@ async fn native_hls_new_play_does_not_reuse_a_pending_proxy_retry_after_forbiddi
     .await;
     assert_eq!(status, 200);
     assert_eq!(
-        stream["data"]["cloud_storage_info"]["cloud_storage_type"],
-        9001
+        stream["data"]["cloud_storage_info"]["cloud_storage_type"], 9000,
+        "带来源菜单的直链不报 STRM 类型，播放器才显示画质菜单"
     );
     let current = playback::latest(&h.app, &h.who, &eps[0].id).await.unwrap();
     assert_ne!(current.id, old.id);
@@ -7222,7 +7344,7 @@ async fn native_menu_respects_https_reverse_proxy_and_media_extensions() {
     }
     assert_eq!(
         data["data"]["cloud_storage_info"]["cloud_storage_type"],
-        9001
+        9000
     );
 }
 
