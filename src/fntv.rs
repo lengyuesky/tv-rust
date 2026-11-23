@@ -490,6 +490,7 @@ pub(crate) async fn stream_list(
     }
     let play = playback::latest(app, who, &e.id).await.ok();
     let hls = text(&result["files"][0], "path").ends_with(".m3u8");
+    native_playback::warm_direct_hls(app, who, &e, hls);
     let mode = play.as_ref().map(|play| play.mode.as_str()).unwrap_or(
         if hls && !*app.forbid_proxy.borrow() {
             "proxy"

@@ -28,6 +28,7 @@ struct Harness {
     episode: String,
     server: tokio::task::JoinHandle<()>,
     hits: Arc<AtomicUsize>,
+    paths: Arc<Mutex<HashMap<String, usize>>>,
 }
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -37,8 +38,11 @@ impl Drop for Harness {
 async fn harness() -> Harness {
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = hits.clone();
-    let upstream=Router::new().fallback(move |req:Request<Body>|{let hits=counter.clone();async move{
+    let paths = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+    let requests = paths.clone();
+    let upstream=Router::new().fallback(move |req:Request<Body>|{let hits=counter.clone();let paths=requests.clone();async move{
         hits.fetch_add(1,Ordering::Relaxed);
+        *paths.lock().unwrap().entry(req.uri().path().to_owned()).or_default() += 1;
         match req.uri().path(){
             "/master"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=10000\nmedia.m3u8?token=secret\n").into_response(),
             "/media.m3u8"=>{
@@ -68,6 +72,25 @@ async fn harness() -> Harness {
             "/compressed-gzip.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","gzip")],include_bytes!("fixtures/hls-probe/compressed-media.m3u8.gz").as_slice()).into_response(),
             "/compressed-master.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","zstd")],include_bytes!("fixtures/hls-probe/compressed-master.m3u8.zst").as_slice()).into_response(),
             "/image-prefixed.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nimage-prefixed.ts\n#EXT-X-ENDLIST\n").into_response(),
+            "/image-ranges.m3u8" | "/image-slow-ranges.m3u8" | "/image-changing.m3u8"=>{
+                let slow=req.uri().path()=="/image-slow-ranges.m3u8";
+                let changed=req.uri().path()=="/image-changing.m3u8" && paths.lock().unwrap()[req.uri().path()]>1;
+                let count=if slow{128}else if changed{224}else{192};
+                let mut manifest=String::from("#EXTM3U\n#EXT-X-TARGETDURATION:1\n");
+                let prefix=if slow{"image-slow-range"}else{"image-range"};
+                for index in 0..count{manifest.push_str(&format!("#EXTINF:1,\n{prefix}-{index:03}.png\n"));}
+                manifest.push_str("#EXT-X-ENDLIST\n");
+                ([("content-type","application/vnd.apple.mpegurl")],manifest).into_response()
+            },
+            path if path.starts_with("/image-range-") || path.starts_with("/image-slow-range-")=>{
+                for header in ["cookie","authorization","authx"]{assert!(!req.headers().contains_key(header));}
+                assert_eq!(req.headers()["range"],"bytes=0-4095");
+                let index=path.rsplit('-').next().unwrap().trim_end_matches(".png").parse::<usize>().unwrap();
+                let delay=if index<64{50}else if path.starts_with("/image-slow-range-"){2500}else{200};
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let bytes=include_bytes!("fixtures/hls-probe/image-prefixed.ts");
+                Response::builder().status(206).header("content-type","image/png").header("content-range",format!("bytes 0-4095/{}",bytes.len())).body(Body::from(&bytes[..4096])).unwrap()
+            },
             "/image-only.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\npicture.png\n#EXT-X-ENDLIST\n").into_response(),
             "/image-no-range.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nimage-no-range.png\n#EXT-X-ENDLIST\n").into_response(),
             "/image-no-range.png"=>([("content-type","image/png")],include_bytes!("fixtures/hls-probe/image-prefixed.ts").as_slice()).into_response(),
@@ -174,6 +197,7 @@ async fn harness() -> Harness {
         episode: ep.id,
         server,
         hits,
+        paths,
     }
 }
 async fn request(
@@ -2507,6 +2531,393 @@ async fn image_hls_without_range_support_is_not_silently_forwarded() {
                 && text(event, "message").contains("HLS 分片区间识别失败")
         })
     }));
+}
+
+async fn image_hls_episode(h: &Harness, path: &str) -> url::Url {
+    let url = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url)
+        .unwrap()
+        .join(path)
+        .unwrap();
+    sqlx::query("UPDATE episodes SET url=?,probe=?,probed_at=? WHERE id=?")
+        .bind(url.as_str())
+        .bind(json!({"probe_version":3,"kind":"hls","duration":192.0,"size":0,"warning":"","streams":[{"codec_type":"video","codec_name":"h264","width":64,"height":64}]}).to_string())
+        .bind(now())
+        .bind(&h.episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    url
+}
+
+async fn image_manifest_path(h: &Harness) -> String {
+    let (status, stream) = request(
+        h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":h.episode}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url"))
+        .unwrap()
+        .path()
+        .to_owned()
+}
+
+async fn cold_image_manifest_path(h: &Harness, path: &str) -> String {
+    let url = image_hls_episode(h, path).await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    // 区间测试先跳过起播预检，让首个显式清单请求处在冷缓存状态。
+    h.app
+        .cache_put(
+            &format!("native-direct-ready:v1:{}", hash(url.as_str())),
+            &json!({"ready":true,"reason":""}),
+            30,
+        )
+        .await
+        .unwrap();
+    image_manifest_path(h).await
+}
+
+async fn load_image_manifest(h: &Harness, path: &str) -> String {
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+async fn cached_image_ranges(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM cache WHERE key LIKE 'direct-ts:v1:%'")
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap()
+}
+
+async fn wait_image_ranges(h: &Harness, count: i64) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while cached_image_ranges(h).await < count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("后台识别应继续保存区间");
+}
+
+async fn wait_image_readiness(h: &Harness, url: &url::Url) {
+    let key = format!("native-direct-ready:v1:{}", hash(url.as_str()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(value) = h.app.cache_get(&key).await.unwrap() {
+                assert_eq!(value["ready"], true, "后台应缓存真实的成功结果");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+fn image_segment_hits(h: &Harness) -> HashMap<String, usize> {
+    h.paths
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.ends_with(".png"))
+        .map(|(path, count)| (path.clone(), *count))
+        .collect()
+}
+
+#[tokio::test]
+async fn cancelled_direct_manifest_saves_ranges_and_finishes_without_another_request() {
+    let h = harness().await;
+    let path = cold_image_manifest_path(&h, "/image-ranges.m3u8").await;
+    let app = h.app.clone();
+    let pending_path = path.clone();
+    let caller = tokio::spawn(async move {
+        router(app, "/nonexistent")
+            .oneshot(
+                Request::builder()
+                    .uri(pending_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    wait_image_ranges(&h, 64).await;
+    assert!(cached_image_ranges(&h).await < 192, "取消时清单尚未识别完");
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(cached_image_ranges(&h).await >= 64, "已完成批次不能丢失");
+
+    // 不再发请求，后台仍应完成；后续清单只读取缓存，早先确认的分片不重复请求。
+    wait_image_ranges(&h, 192).await;
+    let identified = image_segment_hits(&h);
+    assert_eq!(identified.len(), 192);
+    assert!(identified.values().all(|count| *count == 1));
+    let manifest = load_image_manifest(&h, &path).await;
+    assert_eq!(manifest.matches("#EXT-X-BYTERANGE:10340@112").count(), 192);
+    assert_eq!(image_segment_hits(&h), identified);
+    assert_eq!(h.app.direct_range_slots.available_permits(), 32);
+}
+
+#[tokio::test]
+async fn concurrent_requests_for_the_same_image_manifest_share_segment_inspection() {
+    let h = harness().await;
+    let path = cold_image_manifest_path(&h, "/image-ranges.m3u8").await;
+    let (first, second) = tokio::join!(
+        load_image_manifest(&h, &path),
+        load_image_manifest(&h, &path)
+    );
+    for manifest in [first, second] {
+        assert_eq!(manifest.matches("#EXT-X-BYTERANGE:10340@112").count(), 192);
+    }
+    let identified = image_segment_hits(&h);
+    assert_eq!(identified.len(), 192);
+    assert!(
+        identified.values().all(|count| *count == 1),
+        "同址并发清单不能重复请求分片"
+    );
+    assert_eq!(cached_image_ranges(&h).await, 192);
+}
+
+#[tokio::test]
+async fn changing_image_manifest_waits_for_the_old_job_and_identifies_only_new_segments() {
+    let h = harness().await;
+    let path = cold_image_manifest_path(&h, "/image-changing.m3u8").await;
+    let (first, second) = tokio::join!(
+        load_image_manifest(&h, &path),
+        load_image_manifest(&h, &path)
+    );
+    let mut counts = [
+        first.matches("#EXT-X-BYTERANGE:10340@112").count(),
+        second.matches("#EXT-X-BYTERANGE:10340@112").count(),
+    ];
+    counts.sort_unstable();
+    assert_eq!(counts, [192, 224], "更新清单不能复用旧任务的不完整结果");
+    let identified = image_segment_hits(&h);
+    assert_eq!(identified.len(), 224);
+    assert!(
+        identified.values().all(|count| *count == 1),
+        "新清单应复用已确认部分，不并行重复识别"
+    );
+    assert_eq!(cached_image_ranges(&h).await, 224);
+}
+
+#[tokio::test]
+async fn detail_stream_list_prewarms_only_the_current_hls_and_reuses_ranges() {
+    let h = harness().await;
+    let url = image_hls_episode(&h, "/image-slow-ranges.m3u8").await;
+    let alternative = url.join("/image-ranges.m3u8").unwrap();
+    sqlx::query(
+        "INSERT INTO episodes(id,film_id,line_name,line_order,title,number,url,active,probe,probed_at) \
+         SELECT ?,film_id,'备用线路',1,title,number,?,active,probe,probed_at FROM episodes WHERE id=?",
+    )
+    .bind(guid(&[&random()]))
+    .bind(alternative.as_str())
+    .bind(&h.episode)
+    .execute(&h.app.db)
+    .await
+    .unwrap();
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let list = format!("/v/api/v1/stream/list/{}", h.episode);
+    let (status, _) = request(&h, "GET", &list, json!({}), Some(&h.raw)).await;
+    assert_eq!(status, 200);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "预热不能阻塞详情响应"
+    );
+    assert!(cached_image_ranges(&h).await < 128);
+    assert_eq!(
+        request(&h, "GET", &list, json!({}), Some(&h.raw)).await.0,
+        200
+    );
+    wait_image_ranges(&h, 128).await;
+    wait_image_readiness(&h, &url).await;
+    let identified = image_segment_hits(&h);
+    assert_eq!(identified.len(), 128, "备选来源不应批量预热");
+    assert!(identified.values().all(|count| *count == 1));
+    assert_eq!(h.paths.lock().unwrap()["/image-slow-ranges.m3u8"], 1);
+    assert!(!h.paths.lock().unwrap().contains_key("/image-ranges.m3u8"));
+
+    let path = image_manifest_path(&h).await;
+    let manifest = load_image_manifest(&h, &path).await;
+    assert_eq!(manifest.matches("#EXT-X-BYTERANGE:10340@112").count(), 128);
+    assert_eq!(image_segment_hits(&h), identified, "随后清单命中预热区间");
+}
+
+#[tokio::test]
+async fn detail_stream_list_does_not_prewarm_when_proxy_is_allowed_or_access_is_denied() {
+    let h = harness().await;
+    let url = image_hls_episode(&h, "/image-slow-ranges.m3u8").await;
+    let list = format!("/v/api/v1/stream/list/{}", h.episode);
+    assert_eq!(
+        request(&h, "GET", &list, json!({}), Some(&h.raw)).await.0,
+        200
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(image_segment_hits(&h).is_empty());
+    assert!(
+        !h.paths
+            .lock()
+            .unwrap()
+            .contains_key("/image-slow-ranges.m3u8")
+    );
+    assert!(
+        h.app
+            .cache_get(&format!("native-direct-ready:v1:{}", hash(url.as_str())))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    assert_eq!(
+        request(&h, "GET", &list, json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        403
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(image_segment_hits(&h).is_empty());
+    assert!(
+        !h.paths
+            .lock()
+            .unwrap()
+            .contains_key("/image-slow-ranges.m3u8")
+    );
+}
+
+#[tokio::test]
+async fn queued_detail_prewarm_rechecks_episode_access_before_upstream_requests() {
+    let h = harness().await;
+    image_hls_episode(&h, "/image-slow-ranges.m3u8").await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let slots = h.app.probe_slots.acquire_many(2).await.unwrap();
+    let list = format!("/v/api/v1/stream/list/{}", h.episode);
+    assert_eq!(
+        request(&h, "GET", &list, json!({}), Some(&h.member_raw))
+            .await
+            .0,
+        200
+    );
+    let source = catalog::sources(&h.app).await.unwrap().remove(0);
+    access::save_usage(
+        &h.app,
+        &source.subscription_id,
+        &json!({"mode":"admins","user_ids":[]}),
+    )
+    .await
+    .unwrap();
+    drop(slots);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(image_segment_hits(&h).is_empty());
+    assert!(
+        !h.paths
+            .lock()
+            .unwrap()
+            .contains_key("/image-slow-ranges.m3u8")
+    );
+    assert_eq!(cached_image_ranges(&h).await, 0);
+}
+
+#[tokio::test]
+async fn direct_ready_timeout_leaves_preparation_running_and_does_not_cache_a_false_failure() {
+    let h = harness().await;
+    let url = image_hls_episode(&h, "/image-slow-ranges.m3u8").await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let path = image_manifest_path(&h).await;
+    assert!(cached_image_ranges(&h).await >= 64);
+    assert!(cached_image_ranges(&h).await < 128, "三秒预检应先结束等待");
+    let key = format!("native-direct-ready:v1:{}", hash(url.as_str()));
+    assert!(
+        h.app.cache_get(&key).await.unwrap().is_none(),
+        "等待超时不是来源失效，不能写入五秒失败缓存"
+    );
+    wait_image_ranges(&h, 128).await;
+    wait_image_readiness(&h, &url).await;
+    let identified = image_segment_hits(&h);
+    assert_eq!(identified.len(), 128);
+    assert!(identified.values().all(|count| *count == 1));
+    let manifest = load_image_manifest(&h, &path).await;
+    assert_eq!(manifest.matches("#EXT-X-BYTERANGE:10340@112").count(), 128);
+    let manifest_requests = h.paths.lock().unwrap()["/image-slow-ranges.m3u8"];
+    image_manifest_path(&h).await;
+    assert_eq!(
+        h.paths.lock().unwrap()["/image-slow-ranges.m3u8"],
+        manifest_requests,
+        "后台成功后下一次预检直接命中"
+    );
+    assert_eq!(image_segment_hits(&h), identified);
+}
+
+#[tokio::test]
+async fn image_segment_ranges_survive_one_hour_and_expire_after_twenty_four_hours() {
+    let h = harness().await;
+    let url = image_hls_episode(&h, "/compressed.m3u8").await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let path = image_manifest_path(&h).await;
+    let key = format!(
+        "direct-ts:v1:{}",
+        hash(url.join("/image-prefixed.png").unwrap().as_str())
+    );
+    let expires: i64 = sqlx::query_scalar("SELECT expires_at FROM cache WHERE key=?")
+        .bind(&key)
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap();
+    assert!((now() + 86400 - expires).abs() <= 2, "区间缓存应有效一天");
+    let identified = image_segment_hits(&h);
+    assert_eq!(identified["/image-prefixed.png"], 1);
+
+    // 模拟同一条缓存已保存一小时，避免测试真实等待。
+    sqlx::query("UPDATE cache SET expires_at=? WHERE key=?")
+        .bind(expires - 3601)
+        .bind(&key)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    assert!(
+        load_image_manifest(&h, &path)
+            .await
+            .contains("#EXT-X-BYTERANGE:10340@112")
+    );
+    assert_eq!(image_segment_hits(&h), identified, "一小时后仍命中区间");
+    sqlx::query("UPDATE cache SET expires_at=? WHERE key=?")
+        .bind(expires - 86401)
+        .bind(&key)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    assert!(
+        load_image_manifest(&h, &path)
+            .await
+            .contains("#EXT-X-BYTERANGE:10340@112")
+    );
+    assert_eq!(image_segment_hits(&h)["/image-prefixed.png"], 2);
+    assert!(h.app.cache_get(&key).await.unwrap().is_some());
 }
 
 #[tokio::test]

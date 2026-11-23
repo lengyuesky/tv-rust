@@ -3,12 +3,24 @@ use crate::{core::*, net};
 use axum::http::{HeaderMap, Method};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SegmentRange {
     pub length: u64,
     pub offset: u64,
+}
+
+pub(crate) struct RangeJob {
+    manifest: String,
+    finished: Preparation<BTreeMap<String, SegmentRange>>,
+}
+
+struct Identifying(App, String);
+impl Drop for Identifying {
+    fn drop(&mut self) {
+        self.0.direct_range_jobs.lock().unwrap().remove(&self.1);
+    }
 }
 
 pub(crate) fn image_segment(url: &url::Url) -> bool {
@@ -82,7 +94,7 @@ async fn save_ranges(app: &App, ranges: &[(String, SegmentRange)]) -> Result<()>
     if ranges.is_empty() {
         return Ok(());
     }
-    let expires = now() + 3600;
+    let expires = now() + 86400;
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     for chunk in ranges.chunks(250) {
         let mut query = sqlx::QueryBuilder::new("INSERT INTO cache(key,value,expires_at) ");
@@ -101,6 +113,46 @@ async fn save_ranges(app: &App, ranges: &[(String, SegmentRange)]) -> Result<()>
 }
 
 pub(crate) async fn ranges(
+    app: &App,
+    base: &url::Url,
+    input: &str,
+) -> Result<BTreeMap<String, SegmentRange>> {
+    let key = hash(base.as_str());
+    let manifest = hash(input);
+    loop {
+        let (pending, same_manifest) = {
+            let mut jobs = app.direct_range_jobs.lock().unwrap();
+            if let Some(job) = jobs.get(&key) {
+                (job.finished.clone(), job.manifest == manifest)
+            } else {
+                let (finished, pending) = tokio::sync::watch::channel(None);
+                jobs.insert(
+                    key.clone(),
+                    RangeJob {
+                        manifest: manifest.clone(),
+                        finished: pending.clone(),
+                    },
+                );
+                let guard = Identifying(app.clone(), key.clone());
+                let (app, base, input) = (app.clone(), base.clone(), input.to_owned());
+                // 请求结束只停止等待；同一清单共享识别，已确认区间继续保存。
+                tokio::spawn(async move {
+                    let result = identify_ranges(&app, &base, &input).await;
+                    drop(guard);
+                    finished.send_replace(Some(Arc::new(result)));
+                });
+                (pending, true)
+            }
+        };
+        let result = await_preparation(pending).await;
+        if same_manifest {
+            return result;
+        }
+        // 同址清单更新时等旧任务退出，再按新内容读取缓存，不能复用旧清单结果。
+    }
+}
+
+async fn identify_ranges(
     app: &App,
     base: &url::Url,
     input: &str,
@@ -174,7 +226,13 @@ pub(crate) async fn ranges(
     let mut failure = None;
     while let Some(range) = pending.next().await {
         match range {
-            Ok((url, range)) => identified.push((url, range)),
+            Ok((url, range)) => {
+                identified.push((url, range));
+                if identified.len() == 64 {
+                    save_ranges(app, &identified).await?;
+                    result.extend(identified.drain(..));
+                }
+            }
             Err(error) => {
                 failure = Some(error);
                 break;
@@ -182,7 +240,7 @@ pub(crate) async fn ranges(
         }
     }
     drop(pending);
-    // 一次提交已完成的识别结果，避免数百个分片分别写事务；失败重试仍可复用已完成部分。
+    // 每批提交避免逐分片写事务；清单失败时也保存最后一批，重试只识别缺失部分。
     save_ranges(app, &identified).await?;
     if let Some(error) = failure {
         return Err(error);

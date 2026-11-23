@@ -20,6 +20,24 @@ use tokio::sync::{Semaphore, watch};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub(crate) type Preparation<T> = watch::Receiver<Option<Arc<Result<T>>>>;
+
+pub(crate) async fn await_preparation<T: Clone>(mut pending: Preparation<T>) -> Result<T> {
+    loop {
+        if let Some(result) = pending.borrow().clone() {
+            return result
+                .as_ref()
+                .as_ref()
+                .cloned()
+                .map_err(|error| Error(error.0, error.1.clone()));
+        }
+        pending
+            .changed()
+            .await
+            .map_err(|_| Error::bad("后台直链准备已中断，请重试"))?;
+    }
+}
+
 #[derive(Debug)]
 pub struct Error(pub StatusCode, pub String);
 impl Error {
@@ -117,6 +135,8 @@ pub struct Inner {
     pub public_url: String,
     pub probe_slots: Semaphore,
     pub direct_range_slots: Semaphore,
+    pub(crate) direct_range_jobs: Mutex<HashMap<String, crate::hls_direct::RangeJob>>,
+    pub(crate) direct_ready_jobs: Mutex<HashMap<String, Preparation<()>>>,
     pub(crate) upstream_clients: crate::net::Clients,
     pub source_quality_slots: Semaphore,
     /// 正在后台识别画质的单集。识别不随发起它的请求结束，同一单集只识别一次。
@@ -234,6 +254,8 @@ impl App {
             public_url,
             probe_slots: Semaphore::new(2),
             direct_range_slots: Semaphore::new(32),
+            direct_range_jobs: Mutex::new(HashMap::new()),
+            direct_ready_jobs: Mutex::new(HashMap::new()),
             upstream_clients: crate::net::Clients::default(),
             source_quality_slots: Semaphore::new(1),
             probing: Mutex::new(std::collections::HashSet::new()),

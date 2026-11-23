@@ -9,7 +9,7 @@ use catalog::Episode;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Choice {
@@ -134,7 +134,105 @@ async fn prepare_direct_hls(app: &App, url: &str) -> Result<()> {
     Err(Error::bad("HLS 清单层级超出支持范围"))
 }
 
-async fn direct_ready(app: &App, e: &Episode, info: &probe::MediaInfo) -> Result<()> {
+struct PreparingDirect(App, String);
+impl Drop for PreparingDirect {
+    fn drop(&mut self) {
+        self.0.direct_ready_jobs.lock().unwrap().remove(&self.1);
+    }
+}
+
+fn cached_readiness(value: &Value) -> Result<()> {
+    if value["ready"] == true {
+        Ok(())
+    } else {
+        Err(Error::bad(text(value, "reason")))
+    }
+}
+
+async fn direct_episode(app: &App, user: &str, e: &Episode) -> Result<Episode> {
+    let fresh = catalog::available(app, user, &e.id).await?.0;
+    if fresh.url != e.url {
+        return Err(Error::bad("播放地址已更新，请重新加载来源"));
+    }
+    Ok(fresh)
+}
+
+async fn prepare_direct_hls_shared(app: &App, user: &str, e: &Episode) -> Result<()> {
+    let e = direct_episode(app, user, e).await?;
+    let key = format!("native-direct-ready:v1:{}", hash(&e.url));
+    if let Some(value) = app.cache_get(&key).await? {
+        return cached_readiness(&value);
+    }
+    let pending = {
+        let mut jobs = app.direct_ready_jobs.lock().unwrap();
+        if let Some(pending) = jobs.get(&key) {
+            pending.clone()
+        } else {
+            let (finished, pending) = tokio::sync::watch::channel(None);
+            jobs.insert(key.clone(), pending.clone());
+            let guard = PreparingDirect(app.clone(), key.clone());
+            let (app, user, e) = (app.clone(), user.to_owned(), e.clone());
+            tokio::spawn(async move {
+                let result = async {
+                    let result = {
+                        let _slot = app.probe_slots.acquire().await.unwrap();
+                        let fresh = direct_episode(&app, &user, &e).await?;
+                        if let Some(info) = probe::last_known(&fresh) {
+                            probe::require_available(&info)?;
+                            if info.encrypted {
+                                return Err(Error::bad(ENCRYPTED));
+                            }
+                        }
+                        if let Some(value) = app.cache_get(&key).await? {
+                            return cached_readiness(&value);
+                        }
+                        prepare_direct_hls(&app, &fresh.url).await
+                    };
+                    let fresh = direct_episode(&app, &user, &e).await?;
+                    let reason = result
+                        .as_ref()
+                        .err()
+                        .map(|error| error.1.as_str())
+                        .unwrap_or("");
+                    // 只缓存实际完成的预检，前台等待超时不能盖掉后台的成功结果。
+                    app.cache_put(
+                        &key,
+                        &json!({"ready":result.is_ok(),"reason":reason}),
+                        if result.is_ok() { 30 } else { 5 },
+                    )
+                    .await?;
+                    if reason == ENCRYPTED {
+                        probe::mark_encrypted(&app, &fresh).await?;
+                    }
+                    result
+                }
+                .await;
+                drop(guard);
+                finished.send_replace(Some(Arc::new(result)));
+            });
+            pending
+        }
+    };
+    let result = await_preparation(pending).await;
+    direct_episode(app, user, &e).await?;
+    result
+}
+
+pub(crate) fn warm_direct_hls(app: &App, who: &Identity, e: &Episode, hls: bool) {
+    if !hls || !*app.forbid_proxy.borrow() {
+        return;
+    }
+    let (app, user, e) = (app.clone(), who.user.id.clone(), e.clone());
+    tokio::spawn(async move {
+        if !*app.forbid_proxy.borrow() {
+            return;
+        }
+        // 仅准备已授权的当前单集，与起播预检共享后台任务和缓存。
+        let _ = prepare_direct_hls_shared(&app, &user, &e).await;
+    });
+}
+
+async fn direct_ready(app: &App, user: &str, e: &Episode, info: &probe::MediaInfo) -> Result<()> {
     probe::require_available(info)?;
     if info.kind != "hls" {
         // STRM 直链只能交付真实的媒体文件。既没有识别出视频、地址也不是媒体文件形态的
@@ -149,35 +247,12 @@ async fn direct_ready(app: &App, e: &Episode, info: &probe::MediaInfo) -> Result
     if info.encrypted {
         return Err(Error::bad(ENCRYPTED));
     }
-    let key = format!("native-direct-ready:v1:{}", hash(&e.url));
-    if let Some(value) = app.cache_get(&key).await? {
-        return if value["ready"] == true {
-            Ok(())
-        } else {
-            Err(Error::bad(text(&value, "reason")))
-        };
-    }
-    let result = tokio::time::timeout(Duration::from_secs(3), async {
-        let _slot = app.probe_slots.acquire().await.unwrap();
-        prepare_direct_hls(app, &e.url).await
-    })
-    .await
-    .unwrap_or_else(|_| Err(Error::bad("当前来源未能及时完成直链准备")));
-    let reason = result
-        .as_ref()
-        .err()
-        .map(|error| error.1.as_str())
-        .unwrap_or("");
-    app.cache_put(
-        &key,
-        &json!({"ready":result.is_ok(),"reason":reason}),
-        if result.is_ok() { 30 } else { 5 },
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        prepare_direct_hls_shared(app, user, e),
     )
-    .await?;
-    if reason == ENCRYPTED {
-        probe::mark_encrypted(app, e).await?;
-    }
-    result
+    .await
+    .unwrap_or_else(|_| Err(Error::bad("当前来源未能及时完成直链准备")))
 }
 
 pub(crate) async fn prepare_start(
@@ -186,7 +261,7 @@ pub(crate) async fn prepare_start(
     current: &Episode,
     info: &probe::MediaInfo,
 ) -> Result<(Episode, probe::MediaInfo, Option<String>)> {
-    let failure = match direct_ready(app, current, info).await {
+    let failure = match direct_ready(app, &who.user.id, current, info).await {
         Ok(()) => {
             let notice = app
                 .cache_get(&preparation_key(who, &current.id))
@@ -250,7 +325,7 @@ pub(crate) async fn prepare_start(
     }
     let mut selected = None;
     for (candidate, info, source) in measured {
-        if tokio::time::timeout_at(deadline, direct_ready(app, &candidate, &info))
+        if tokio::time::timeout_at(deadline, direct_ready(app, &who.user.id, &candidate, &info))
             .await
             .is_ok_and(|result| result.is_ok())
         {
@@ -274,7 +349,9 @@ pub(crate) async fn prepare_start(
                 .ok()?
                 .ok()
                 .filter(probe::verified)?;
-                direct_ready(app, &candidate, &info).await.ok()?;
+                direct_ready(app, &who.user.id, &candidate, &info)
+                    .await
+                    .ok()?;
                 Some((candidate, info, source))
             }))
             .buffer_unordered(2);
