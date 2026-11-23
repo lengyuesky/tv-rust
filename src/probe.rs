@@ -379,6 +379,21 @@ pub async fn get(app: &App, e: &Episode) -> Result<MediaInfo> {
     get_inner(app, e, false).await
 }
 
+pub(crate) fn client_only_status(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 404 | 408 | 410 | 429)
+}
+
+/// 服务器被拒绝不代表播放器所在网络也被拒绝；失效与临时错误不走此兜底。
+pub(crate) fn client_only(info: &MediaInfo) -> Option<u16> {
+    if info.kind != "hls" {
+        return None;
+    }
+    info.warning
+        .strip_prefix("媒体探测返回 HTTP ")
+        .and_then(|status| status.parse::<u16>().ok())
+        .filter(|status| client_only_status(*status))
+}
+
 pub(crate) fn require_available(info: &MediaInfo) -> Result<()> {
     if matches!(
         info.warning.as_str(),
@@ -389,19 +404,28 @@ pub(crate) fn require_available(info: &MediaInfo) -> Result<()> {
     if info.warning == IMAGE || info.warning == WEB_PAGE {
         return Err(Error::bad(&info.warning));
     }
-    if info.kind == "hls"
-        && let Some(status) = info
-            .warning
-            .strip_prefix("媒体探测返回 HTTP ")
-            .and_then(|status| status.parse::<u16>().ok())
-        && (400..500).contains(&status)
-        && !matches!(status, 408 | 429)
-    {
+    if let Some(status) = client_only(info) {
         return Err(Error::bad(format!(
             "HLS 清单被上游拒绝（HTTP {status}），请刷新来源或换源"
         )));
     }
     Ok(())
+}
+
+/// 只有起播准备明确选中的兜底可放行，网页和普通原生播放仍沿用严格检查。
+pub(crate) fn require_native_available(
+    info: &MediaInfo,
+    url: &str,
+    client_only_delivery: bool,
+) -> Result<()> {
+    if client_only_delivery
+        && !info.encrypted
+        && client_only(info).is_some()
+        && net::valid_url(url).is_ok_and(|url| url.path().to_ascii_lowercase().ends_with(".m3u8"))
+    {
+        return Ok(());
+    }
+    require_available(info)
 }
 
 pub async fn source_quality(
