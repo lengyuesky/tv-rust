@@ -2938,7 +2938,8 @@ async fn queued_detail_prewarm_rechecks_episode_access_before_upstream_requests(
     let h = harness().await;
     image_hls_episode(&h, "/image-slow-ranges.m3u8").await;
     playback::set_forbidden(&h.app, true).await.unwrap();
-    let slots = h.app.probe_slots.acquire_many(2).await.unwrap();
+    // 占满起播预检的名额，让预热排队到收回使用范围之后才开始。
+    let slots = h.app.direct_ready_slots.acquire_many(4).await.unwrap();
     let list = format!("/v/api/v1/stream/list/{}", h.episode);
     assert_eq!(
         request(&h, "GET", &list, json!({}), Some(&h.member_raw))

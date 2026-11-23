@@ -136,7 +136,7 @@ pub struct Inner {
     pub probe_slots: Semaphore,
     /// 起播预检的并发上限。预检会在后台跑完整张清单的区间识别，单独计数，
     /// 不占用画质探测名额，否则慢清单会让起播时的探测排队十几秒。
-    pub(crate) direct_ready_slots: Semaphore,
+    pub direct_ready_slots: Semaphore,
     pub direct_range_slots: Semaphore,
     pub(crate) direct_range_jobs: Mutex<HashMap<String, crate::hls_direct::RangeJob>>,
     pub(crate) direct_ready_jobs: Mutex<HashMap<String, Preparation<()>>>,
