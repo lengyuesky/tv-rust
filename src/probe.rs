@@ -20,6 +20,37 @@ pub struct MediaInfo {
     pub size: u64,
     pub streams: Vec<Value>,
     pub warning: String,
+    /// HLS 清单声明了分片加密。禁止转发时飞牛无法直链播放这类来源。
+    #[serde(default)]
+    pub encrypted: bool,
+}
+pub(crate) const WEB_PAGE: &str = "该地址返回网页播放器，需要额外解析，请换源";
+pub(crate) const IMAGE: &str = "媒体地址或分片返回图片，请刷新来源或换源";
+/// 网页播放器、分享页与错误页都以标记开头；媒体容器和 HLS 清单不会。
+pub(crate) fn is_web_page(data: &[u8], headers: &HeaderMap) -> bool {
+    let declared = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value.starts_with("text/html") || value.starts_with("application/xhtml")
+        });
+    declared
+        || String::from_utf8_lossy(&data[..data.len().min(256)])
+            .trim_start_matches('\u{feff}')
+            .trim_start()
+            .starts_with('<')
+}
+pub(crate) fn encrypted_manifest(manifest: &str) -> bool {
+    manifest.lines().map(str::trim).any(|line| {
+        line.strip_prefix("#EXT-X-KEY:")
+            .or_else(|| line.strip_prefix("#EXT-X-SESSION-KEY:"))
+            .is_some_and(|key| !key.split(',').any(|part| part.trim() == "METHOD=NONE"))
+    })
+}
+/// 探测已经识别出真实视频轨；未识别的非 HLS 地址不能当作可直链的媒体文件。
+pub(crate) fn verified(info: &MediaInfo) -> bool {
+    info.streams.iter().any(is_video_stream)
 }
 pub fn is_hls(data: &[u8]) -> bool {
     String::from_utf8_lossy(&data[..data.len().min(256)])
@@ -78,7 +109,7 @@ async fn local_probe(prefix: Vec<u8>, tail: Option<(u64, Vec<u8>)>) -> Result<Va
         format.as_str(),
         "png_pipe" | "jpeg_pipe" | "gif" | "webp_pipe" | "bmp_pipe" | "image2" | "image2pipe"
     ) {
-        return Err(Error::bad("媒体地址或分片返回图片，请刷新来源或换源"));
+        return Err(Error::bad(IMAGE));
     }
     Ok(value)
 }
@@ -193,7 +224,7 @@ fn media_duration(v: &Value) -> f64 {
 async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
     let (prefix, mut base, headers) = chunk(app, &e.url, "bytes=0-524287").await?;
     let mut info = MediaInfo {
-        probe_version: 2,
+        probe_version: 3,
         size: total_size(&headers),
         ..Default::default()
     };
@@ -220,6 +251,7 @@ async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
             base = new_base;
             manifest = String::from_utf8_lossy(&data).into_owned();
         }
+        info.encrypted = encrypted_manifest(&manifest);
         info.duration = manifest
             .lines()
             .filter_map(|line| line.strip_prefix("#EXTINF:"))
@@ -257,11 +289,8 @@ async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
             }
         }
     } else {
-        let head = String::from_utf8_lossy(&prefix[..prefix.len().min(128)])
-            .trim()
-            .to_ascii_lowercase();
-        if head.starts_with("<!doctype html") || head.starts_with("<html") {
-            return Err(Error::bad("该地址返回网页播放器，需要额外解析，请换源"));
+        if is_web_page(&prefix, &headers) {
+            return Err(Error::bad(WEB_PAGE));
         }
         info.kind = if prefix.get(4..8) == Some(b"ftyp") {
             "mp4"
@@ -294,7 +323,15 @@ async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
     Ok(info)
 }
 pub(crate) fn cached(e: &Episode) -> Option<MediaInfo> {
+    last_known(e).filter(|_| e.probed_at > now() - 21600)
+}
+
+/// 同一地址上一次的识别结果，不限时效。用于在重新识别完成前保留画质与可用性判断。
+pub(crate) fn last_known(e: &Episode) -> Option<MediaInfo> {
     let info = serde_json::from_str::<MediaInfo>(&e.probe).ok()?;
+    if e.probed_at <= 0 {
+        return None;
+    }
     let image_only = info
         .streams
         .iter()
@@ -309,11 +346,33 @@ pub(crate) fn cached(e: &Episode) -> Option<MediaInfo> {
             || net::valid_url(&e.url)
                 .ok()
                 .is_some_and(|url| url.path().to_ascii_lowercase().ends_with(".m3u8")));
-    (e.probed_at > now() - 21600
-        && !(info.kind == "hls" && info.streams.is_empty() && info.probe_version == 0)
+    (!(info.kind == "hls" && info.streams.is_empty() && info.probe_version == 0)
         && !(image_only && info.probe_version < 2)
         && !unrecognized_hls)
         .then_some(info)
+}
+
+/// 已确认不是媒体的非 HLS 地址沿用探测时的错误，避免每次请求都重新访问上游。
+fn settled(info: MediaInfo) -> Result<MediaInfo> {
+    if info.kind != "hls" && (info.warning == WEB_PAGE || info.warning == IMAGE) {
+        return Err(Error::bad(info.warning));
+    }
+    Ok(info)
+}
+
+/// 起播预检读到加密清单后补记，后续菜单排序与预检不必再次访问上游。
+pub(crate) async fn mark_encrypted(app: &App, e: &Episode) -> Result<()> {
+    let Some(mut info) = last_known(e).filter(|info| info.kind == "hls" && !info.encrypted) else {
+        return Ok(());
+    };
+    info.encrypted = true;
+    sqlx::query("UPDATE episodes SET probe=? WHERE id=? AND url=? AND active=1")
+        .bind(serde_json::to_string(&info).unwrap())
+        .bind(&e.id)
+        .bind(&e.url)
+        .execute(&app.db)
+        .await?;
+    Ok(())
 }
 
 pub async fn get(app: &App, e: &Episode) -> Result<MediaInfo> {
@@ -327,7 +386,7 @@ pub(crate) fn require_available(info: &MediaInfo) -> Result<()> {
     ) {
         return Err(Error::bad("媒体地址已失效，请刷新来源或选择其他播放源"));
     }
-    if info.warning == "媒体地址或分片返回图片，请刷新来源或换源" {
+    if info.warning == IMAGE || info.warning == WEB_PAGE {
         return Err(Error::bad(&info.warning));
     }
     if info.kind == "hls"
@@ -354,7 +413,7 @@ pub async fn source_quality(
 ) -> Result<MediaInfo> {
     let fresh = catalog::available(app, user, &e.id).await?.0;
     if !refresh && let Some(info) = cached(&fresh) {
-        return Ok(info);
+        return settled(info);
     }
     // 后台来源识别最多占用一个探测槽，保留另一个供网页和飞牛开始播放。
     let _background = if selected {
@@ -375,7 +434,7 @@ pub async fn source_quality(
 
 async fn get_inner(app: &App, e: &Episode, refresh: bool) -> Result<MediaInfo> {
     if !refresh && let Some(info) = cached(e) {
-        return Ok(info);
+        return settled(info);
     }
     let _slot = app
         .probe_slots
@@ -384,13 +443,29 @@ async fn get_inner(app: &App, e: &Episode, refresh: bool) -> Result<MediaInfo> {
         .map_err(|_| Error::bad("媒体探测已停止"))?;
     let fresh = catalog::episode(app, &e.id).await?;
     if !refresh && let Some(v) = cached(&fresh) {
-        return Ok(v);
+        return settled(v);
     }
     let result = tokio::time::timeout(Duration::from_secs(14), inspect(app, &fresh)).await;
     let info = match result {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) if e.1.contains("网页播放器") || e.1.contains("返回图片") => {
-            return Err(e);
+        Ok(Err(error)) if error.1 == WEB_PAGE || error.1 == IMAGE => {
+            // 记下确定性结论，来源菜单与起播预检据此跳过，不把网页当作媒体交付。
+            let info = MediaInfo {
+                probe_version: 3,
+                kind: "video".into(),
+                warning: error.1.clone(),
+                ..Default::default()
+            };
+            sqlx::query(
+                "UPDATE episodes SET probe=?,probed_at=? WHERE id=? AND url=? AND active=1",
+            )
+            .bind(serde_json::to_string(&info).unwrap())
+            .bind(now())
+            .bind(&e.id)
+            .bind(&fresh.url)
+            .execute(&app.db)
+            .await?;
+            return Err(error);
         }
         other => {
             let warning = match other {
@@ -399,7 +474,7 @@ async fn get_inner(app: &App, e: &Episode, refresh: bool) -> Result<MediaInfo> {
             };
             let path = net::valid_url(&fresh.url)?.path().to_lowercase();
             MediaInfo {
-                probe_version: 2,
+                probe_version: 3,
                 kind: if path.ends_with(".m3u8") || fresh.line_name.to_lowercase().contains("m3u8")
                 {
                     "hls"

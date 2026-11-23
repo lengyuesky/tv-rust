@@ -119,6 +119,8 @@ pub struct Inner {
     pub direct_range_slots: Semaphore,
     pub(crate) upstream_clients: crate::net::Clients,
     pub source_quality_slots: Semaphore,
+    /// 正在后台识别画质的单集。识别不随发起它的请求结束，同一单集只识别一次。
+    pub(crate) probing: Mutex<std::collections::HashSet<String>>,
     pub recommendation_slots: Semaphore,
     pub login_budget: Mutex<HashMap<String, (i64, usize)>>,
     pub refresh_lock: tokio::sync::Mutex<()>,
@@ -234,6 +236,7 @@ impl App {
             direct_range_slots: Semaphore::new(32),
             upstream_clients: crate::net::Clients::default(),
             source_quality_slots: Semaphore::new(1),
+            probing: Mutex::new(std::collections::HashSet::new()),
             recommendation_slots: Semaphore::new(4),
             login_budget: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),

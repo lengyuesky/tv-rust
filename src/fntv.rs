@@ -165,11 +165,47 @@ async fn selected_line_episodes(
         .or(active)
         .or(previous)
         .filter(|line| eps.iter().any(|e| &e.line_name == line))
-        .or_else(|| eps.first().map(|e| e.line_name.clone()));
+        .or_else(|| default_line(&eps));
     Ok(eps
         .into_iter()
         .filter(|e| Some(&e.line_name) == line.as_ref())
         .collect())
+}
+
+/// 地址或线路名看起来是可直接交付的媒体，而不是需要网页解析的播放页。
+pub(crate) fn media_like(e: &Episode) -> bool {
+    e.line_name.to_ascii_lowercase().contains("m3u8")
+        || net::valid_url(&e.url).is_ok_and(|url| {
+            let path = url.path().to_ascii_lowercase();
+            [
+                ".m3u8", ".mp4", ".mkv", ".flv", ".ts", ".mov", ".webm", ".avi",
+            ]
+            .iter()
+            .any(|extension| path.ends_with(extension))
+        })
+}
+
+/// 没有观看记录时的默认线路。多数采集源的第一条线路是网页播放器，
+/// 优先落在已识别出视频或地址形态为媒体的线路上，全部无法判断时沿用第一条。
+fn default_line(eps: &[Episode]) -> Option<String> {
+    let playable = |e: &Episode| match probe::last_known(e) {
+        Some(info) => {
+            probe::require_available(&info).is_ok()
+                && (info.kind == "hls" || probe::verified(&info))
+        }
+        None => media_like(e),
+    };
+    eps.iter()
+        .find(|e| playable(e))
+        .or_else(|| eps.first())
+        .map(|e| e.line_name.clone())
+}
+
+/// 原生直链只能交付真实媒体。既没有识别出视频、地址也不是媒体文件形态的非 HLS 线路
+/// 是需要网页解析的播放页或分享页，不作为备选来源；地址像媒体但画质未知的仍排在最后。
+fn deliverable(e: &Episode, info: &probe::MediaInfo) -> bool {
+    probe::require_available(info).is_ok()
+        && (info.kind == "hls" || probe::verified(info) || media_like(e))
 }
 
 async fn work_episodes(app: &App, who: &Identity, film: &Film) -> Result<Vec<Episode>> {
@@ -428,7 +464,15 @@ pub(crate) async fn stream_list(
     refresh: bool,
 ) -> Result<Value> {
     let e = resolve_episode(app, who, reference).await?;
-    let mut result = source_choices(app, who, &e.id, refresh).await?;
+    // 打开详情页时最多等三秒；没识别完的来源在后台继续，起播时通常已经就绪。
+    // 用户主动刷新时等满期限。
+    let budget = Duration::from_secs(8);
+    let wait = if refresh {
+        budget
+    } else {
+        Duration::from_secs(3)
+    };
+    let mut result = source_choices_within(app, who, &e.id, refresh, budget, wait).await?;
     let choices = result["files"].as_array().cloned().unwrap_or_default();
     result["qualities"] = json!(choices.iter().enumerate().map(|(index,file)|json!({
         "resolution":menu_label(file,choices.iter().filter(|other|other["source_id"]==file["source_id"]).count()>1),"bitrate":90_000_000 + index as u64 * 10001,"progressive":true,"is_m3u8":false
@@ -471,16 +515,28 @@ pub(crate) async fn stream_list(
     Ok(result)
 }
 
-pub(crate) async fn source_choices(
+/// 后台识别结束时把单集移出进行中集合，任务被取消或出错时同样生效。
+struct Probing(App, String);
+impl Drop for Probing {
+    fn drop(&mut self) {
+        self.0.probing.lock().unwrap().remove(&self.1);
+    }
+}
+
+/// `budget` 限制来源发现与识别的总时间；`probe_wait` 是其中等待画质识别的最长时间。
+/// 起播时只短暂等待，识别在后台继续并保存，下一次读取菜单时直接可用。
+pub(crate) async fn source_choices_within(
     app: &App,
     who: &Identity,
     reference: &str,
     refresh: bool,
+    budget: Duration,
+    probe_wait: Duration,
 ) -> Result<Value> {
     let e = resolve_episode(app, who, reference).await?;
     let (_, current, _) = catalog::available(app, &who.user.id, &e.id).await?;
     // 原生列表一次返回。限制整个发现与识别的时间，慢源不能无限拖住播放界面。
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + budget;
     let mut choices = BTreeMap::from([(e.id.clone(), e.clone())]);
     let discovered = timeout_at(
         (Instant::now() + Duration::from_secs(2)).min(deadline),
@@ -546,21 +602,56 @@ pub(crate) async fn source_choices(
             }
         }
     }
+    // 识别结果过期后先沿用同一地址上一次的结论，重新识别完成再覆盖；
+    // 菜单不会因为缓存到期而整体退回“画质待识别”。
     let mut info: HashMap<_, _> = choices
         .iter()
-        .map(|(id, episode)| (id.clone(), probe::cached(episode).unwrap_or_default()))
+        .map(|(id, episode)| (id.clone(), probe::last_known(episode).unwrap_or_default()))
         .collect();
     // 缓存命中立即显示；剩余来源共享后台探测上限，给实际播放保留容量。
+    // 识别任务独立于本次请求：慢源超过等待时间后继续识别并保存结果，
+    // 不会每次打开菜单都从头再等一遍。
     {
-        let probes = stream::iter(choices.values().cloned().map(|episode| async move {
-            let measured = probe::source_quality(app, &who.user.id, &episode, refresh, false).await;
-            (episode, measured)
-        }))
-        .buffer_unordered(4);
-        tokio::pin!(probes);
-        while let Ok(Some((episode, measured))) = timeout_at(deadline, probes.next()).await {
-            if let Ok(measured) = measured {
-                info.insert(episode.id.clone(), measured);
+        let (results, mut finished) = tokio::sync::mpsc::unbounded_channel();
+        for episode in choices.values() {
+            if !refresh && probe::cached(episode).is_some() {
+                continue;
+            }
+            if !app.probing.lock().unwrap().insert(episode.id.clone()) {
+                continue;
+            }
+            let guard = Probing(app.clone(), episode.id.clone());
+            let (app, user, episode, results) = (
+                app.clone(),
+                who.user.id.clone(),
+                episode.clone(),
+                results.clone(),
+            );
+            tokio::spawn(async move {
+                let measured = probe::source_quality(&app, &user, &episode, refresh, false).await;
+                drop(guard);
+                let _ = results.send((episode, measured));
+            });
+        }
+        drop(results);
+        let wait = deadline.min(Instant::now() + probe_wait);
+        while let Ok(Some((episode, measured))) = timeout_at(wait, finished.recv()).await {
+            match measured {
+                Ok(measured) => {
+                    info.insert(episode.id.clone(), measured);
+                }
+                // 确认是网页或图片的地址记下原因，后面据此从菜单中排除。
+                Err(error) if error.1 == probe::WEB_PAGE || error.1 == probe::IMAGE => {
+                    info.insert(
+                        episode.id.clone(),
+                        probe::MediaInfo {
+                            kind: "video".into(),
+                            warning: error.1,
+                            ..Default::default()
+                        },
+                    );
+                }
+                Err(_) => {}
             }
         }
     }
@@ -570,14 +661,17 @@ pub(crate) async fn source_choices(
     let mut audios = Vec::new();
     let mut subtitles = Vec::new();
     let mut choices: Vec<_> = choices.into_values().collect();
+    // 禁止转发时已知加密的 HLS 无法直链播放，排到可播放来源之后。
+    let forbidden = *app.forbid_proxy.borrow();
     choices.sort_by(|a, b| {
-        quality_rank(&info[&b.id])
-            .cmp(&quality_rank(&info[&a.id]))
+        (forbidden && info[&a.id].encrypted)
+            .cmp(&(forbidden && info[&b.id].encrypted))
+            .then(quality_rank(&info[&b.id]).cmp(&quality_rank(&info[&a.id])))
             .then(a.id.cmp(&b.id))
     });
     for episode in choices {
         let measured = &info[&episode.id];
-        if episode.id != e.id && probe::require_available(measured).is_err() {
+        if episode.id != e.id && !deliverable(&episode, measured) {
             continue;
         }
         match source_file(app, &who.user.id, &episode, measured).await {
@@ -1198,15 +1292,27 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
     }
     validate_item_media(app, &who, &item, &e).await?;
     catalog::available(app, &who.user.id, &e.id).await?;
-    let mut info = probe::get(app, &e).await?;
-    let mut preparation_notice = None;
-    if *app.forbid_proxy.borrow()
+    let prepares = *app.forbid_proxy.borrow()
         && selection.is_none()
         && matches!(
             path.as_str(),
             "/v/api/v1/play/info" | "/v/api/v1/stream" | "/v/api/v1/stream/directLink"
-        )
-    {
+        );
+    let mut info = match probe::get(app, &e).await {
+        Ok(info) => info,
+        // 当前来源确认是网页或图片时先保留原因，交给起播准备寻找同集的可用来源；
+        // 找不到替代时仍以这个原因拒绝起播。
+        Err(error) if prepares && (error.1 == probe::WEB_PAGE || error.1 == probe::IMAGE) => {
+            probe::MediaInfo {
+                kind: "video".into(),
+                warning: error.1,
+                ..Default::default()
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let mut preparation_notice = None;
+    if prepares {
         (e, info, preparation_notice) =
             native_playback::prepare_start(app, &who, &e, &info).await?;
         validate_item_media(app, &who, &item, &e).await?;

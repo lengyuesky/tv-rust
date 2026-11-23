@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use catalog::Episode;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
@@ -49,6 +50,9 @@ impl Choice {
     }
 }
 
+const ENCRYPTED: &str = "当前来源为加密 HLS，飞牛未能完成此格式的直链播放";
+const NOT_MEDIA: &str = "当前来源未返回可识别的视频，无法直链播放";
+
 async fn prepare_direct_hls(app: &App, url: &str) -> Result<()> {
     let mut url = url.to_owned();
     for _ in 0..4 {
@@ -65,14 +69,8 @@ async fn prepare_direct_hls(app: &App, url: &str) -> Result<()> {
             return Err(Error::bad("播放地址未返回 HLS 清单"));
         }
         let manifest = String::from_utf8(bytes).map_err(|_| Error::bad("HLS 清单编码无效"))?;
-        if manifest.lines().map(str::trim).any(|line| {
-            line.strip_prefix("#EXT-X-KEY:")
-                .or_else(|| line.strip_prefix("#EXT-X-SESSION-KEY:"))
-                .is_some_and(|key| !key.split(',').any(|part| part.trim() == "METHOD=NONE"))
-        }) {
-            return Err(Error::bad(
-                "当前来源为加密 HLS，飞牛未能完成此格式的直链播放",
-            ));
+        if probe::encrypted_manifest(&manifest) {
+            return Err(Error::bad(ENCRYPTED));
         }
         if manifest.contains("#EXT-X-STREAM-INF:") {
             let child = manifest
@@ -139,7 +137,17 @@ async fn prepare_direct_hls(app: &App, url: &str) -> Result<()> {
 async fn direct_ready(app: &App, e: &Episode, info: &probe::MediaInfo) -> Result<()> {
     probe::require_available(info)?;
     if info.kind != "hls" {
-        return Ok(());
+        // STRM 直链只能交付真实的媒体文件。既没有识别出视频、地址也不是媒体文件形态的
+        // 线路是网页播放器、分享页或拒绝页，不能当作可播放来源。地址是媒体文件但服务端
+        // 未能识别时仍交给播放器尝试：播放器所在网络可能读得到。
+        return if probe::verified(info) || fntv::media_like(e) {
+            Ok(())
+        } else {
+            Err(Error::bad(NOT_MEDIA))
+        };
+    }
+    if info.encrypted {
+        return Err(Error::bad(ENCRYPTED));
     }
     let key = format!("native-direct-ready:v1:{}", hash(&e.url));
     if let Some(value) = app.cache_get(&key).await? {
@@ -166,6 +174,9 @@ async fn direct_ready(app: &App, e: &Episode, info: &probe::MediaInfo) -> Result
         if result.is_ok() { 30 } else { 5 },
     )
     .await?;
+    if reason == ENCRYPTED {
+        probe::mark_encrypted(app, e).await?;
+    }
     result
 }
 
@@ -188,8 +199,24 @@ pub(crate) async fn prepare_start(
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     let original_film = catalog::film(app, &current.film_id).await?;
-    let sources =
-        tokio::time::timeout_at(deadline, fntv::source_choices(app, who, &current.id, false)).await;
+    // 来源发现只占一半时间，留出余量逐个确认备选；两者共用同一期限时，
+    // 首次播放或识别结果过期后会在发现阶段耗尽时间，一个备选也来不及检查。
+    let sources = tokio::time::timeout_at(
+        deadline,
+        fntv::source_choices_within(
+            app,
+            who,
+            &current.id,
+            false,
+            Duration::from_secs(4),
+            Duration::from_millis(1500),
+        ),
+    )
+    .await;
+    // 已识别出视频的备选按菜单顺序（画质从高到低）逐个确认；从未识别过的备选随后
+    // 现场识别。全新账号或识别结果尚未就绪时，也能在起播前找到可用来源。
+    let mut measured = Vec::new();
+    let mut unknown = Vec::new();
     if let Ok(Ok(sources)) = sources {
         for file in sources["files"].as_array().into_iter().flatten() {
             let id = text(file, "guid");
@@ -209,35 +236,78 @@ pub(crate) async fn prepare_start(
             {
                 continue;
             }
-            let Some(measured) = probe::cached(&candidate)
-                .filter(|info| info.streams.iter().any(probe::is_video_stream))
-            else {
-                continue;
-            };
-            if tokio::time::timeout_at(deadline, direct_ready(app, &candidate, &measured))
-                .await
-                .is_ok_and(|result| result.is_ok())
-            {
-                let original = catalog::source(app, &original_film.source_id).await?;
-                let notice = format!(
-                    "来源“{}”直链准备失败（{}），已换用同集来源“{}”",
-                    original.name, failure, source.name
-                );
-                app.cache_put(
-                    &preparation_key(who, &candidate.id),
-                    &json!({"notice":notice}),
-                    30,
-                )
-                .await?;
-                return Ok((candidate, measured, Some(notice)));
+            // HLS 备选在下面实时检查清单与首个分片，识别结果过期不影响候选资格；
+            // 文件直链没有实时检查，只采用仍在有效期内的识别结果。
+            let known = probe::last_known(&candidate)
+                .filter(|info| info.kind == "hls" || probe::cached(&candidate).is_some());
+            match known {
+                Some(info) if probe::verified(&info) => measured.push((candidate, info, source)),
+                // 已确认失效、被拒绝或不是媒体的来源不再尝试。
+                Some(_) => {}
+                None => unknown.push((candidate, source)),
             }
-            if tokio::time::Instant::now() >= deadline {
+        }
+    }
+    let mut selected = None;
+    for (candidate, info, source) in measured {
+        if tokio::time::timeout_at(deadline, direct_ready(app, &candidate, &info))
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            selected = Some((candidate, info, source));
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    if selected.is_none() && !unknown.is_empty() {
+        let user = who.user.id.as_str();
+        let checks =
+            futures_util::stream::iter(unknown.into_iter().map(|(candidate, source)| async move {
+                // 单个慢源最多占用四秒，不让它耗尽整个起播期限。
+                let info = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    probe::source_quality(app, user, &candidate, false, true),
+                )
+                .await
+                .ok()?
+                .ok()
+                .filter(probe::verified)?;
+                direct_ready(app, &candidate, &info).await.ok()?;
+                Some((candidate, info, source))
+            }))
+            .buffer_unordered(2);
+        tokio::pin!(checks);
+        while let Ok(Some(checked)) = tokio::time::timeout_at(deadline, checks.next()).await {
+            if checked.is_some() {
+                selected = checked;
                 break;
             }
         }
     }
+    if let Some((candidate, info, source)) = selected {
+        let original = catalog::source(app, &original_film.source_id).await?;
+        let notice = format!(
+            "来源“{}”直链准备失败（{}），已换用同集来源“{}”",
+            original.name, failure, source.name
+        );
+        app.cache_put(
+            &preparation_key(who, &candidate.id),
+            &json!({"notice":notice}),
+            30,
+        )
+        .await?;
+        return Ok((candidate, info, Some(notice)));
+    }
     // 没有确认可用的同集来源时，不改集、不改进度，也不突破禁止转发设置。
     probe::require_available(info)?;
+    if failure == NOT_MEDIA {
+        // 网页播放器交给飞牛只会得到含义不明的 -99985，这里直接说明原因。
+        return Err(Error::bad(
+            "当前来源没有返回可直接播放的视频（网页播放器或被上游拒绝）；暂时没有找到可用的同集来源，请稍后重试或换源",
+        ));
+    }
     Ok((current.clone(), info.clone(), None))
 }
 
@@ -675,14 +745,23 @@ async fn create_menu(
     current_play: &str,
     force_single: bool,
 ) -> Result<Option<Value>> {
-    let sources = fntv::source_choices(app, who, &e.id, false).await?;
+    // 起播不等待后台画质识别：未识别完的来源沿用上一次结论，识别继续在后台完成。
+    let sources = fntv::source_choices_within(
+        app,
+        who,
+        &e.id,
+        false,
+        Duration::from_secs(8),
+        Duration::from_millis(1500),
+    )
+    .await?;
     let files = sources["files"]
         .as_array()
         .ok_or_else(|| Error::bad("没有可用的播放来源"))?;
     let current = catalog::episode(app, &e.id).await?;
     if !force_single
         && files.len() <= 1
-        && probe::cached(&current).is_none_or(|info| info.kind != "hls")
+        && probe::last_known(&current).is_none_or(|info| info.kind != "hls")
     {
         return Ok(None);
     }
@@ -692,8 +771,14 @@ async fn create_menu(
     for (index, file) in files.iter().enumerate() {
         let (target, _, source) =
             catalog::available(app, &who.user.id, &text(file, "guid")).await?;
-        let kind = probe::cached(&target).unwrap_or_default().kind;
-        let extension = if kind == "hls" { "m3u8" } else { "mp4" };
+        // 识别结果过期后仍按上一次识别的格式交付；尚未识别的线路按地址判断，
+        // HLS 不会被当成 MP4 地址。
+        let kind = probe::last_known(&target).unwrap_or_default().kind;
+        let hls = kind == "hls"
+            || kind.is_empty()
+                && net::valid_url(&target.url)
+                    .is_ok_and(|url| url.path().to_ascii_lowercase().ends_with(".m3u8"));
+        let extension = if hls { "m3u8" } else { "mp4" };
         choices.push(Choice {
             episode_id: target.id.clone(),
             source_id: source.id,

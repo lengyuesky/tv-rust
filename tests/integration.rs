@@ -61,6 +61,9 @@ async fn harness() -> Harness {
                 }
             },
             "/blocked.m3u8"=>StatusCode::from_u16(444).unwrap().into_response(),
+            // 采集源的“云播”线路：返回网页播放器或拒绝页，地址没有媒体扩展名。
+            "/play/web-page"=>"<head>\n    <meta charset=\"utf-8\">\n    <title>player</title>\n</head><body></body>".into_response(),
+            "/share/denied"=>(StatusCode::FORBIDDEN,[("content-type","text/html; charset=utf-8")],"<!DOCTYPE html>\n<html lang=\"en\"><head><title>403 Forbidden</title></head></html>").into_response(),
             "/compressed.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","zstd")],include_bytes!("fixtures/hls-probe/compressed-media.m3u8.zst").as_slice()).into_response(),
             "/compressed-gzip.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","gzip")],include_bytes!("fixtures/hls-probe/compressed-media.m3u8.gz").as_slice()).into_response(),
             "/compressed-master.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","zstd")],include_bytes!("fixtures/hls-probe/compressed-master.m3u8.zst").as_slice()).into_response(),
@@ -2242,7 +2245,7 @@ async fn image_prefixed_hls_replaces_cached_picture_metadata_with_real_video() {
     let e = catalog::episode(&h.app, &e.id).await.unwrap();
     let info = tv_rust::probe::get(&h.app, &e).await.unwrap();
     let quality = tv_rust::probe::quality(&info);
-    assert_eq!(info.probe_version, 2);
+    assert_eq!(info.probe_version, 3);
     assert_eq!(quality["codec"], "h264");
     assert_eq!(quality["width"].as_f64(), Some(64.0));
     assert_eq!(quality["height"].as_f64(), Some(64.0));
@@ -3578,7 +3581,11 @@ async fn encrypted_hls_metadata_is_probed_from_bounded_local_resources() {
     let e = catalog::episode(&h.app, &e.id).await.unwrap();
     let info = tv_rust::probe::get(&h.app, &e).await.unwrap();
     assert_eq!(info.kind, "hls");
-    assert_eq!(info.probe_version, 2);
+    assert_eq!(info.probe_version, 3);
+    assert!(
+        info.encrypted,
+        "加密清单在识别时记录，禁止转发时据此排序和预检"
+    );
     assert!(info.duration >= 1.0);
     assert!(
         info.streams
@@ -4936,6 +4943,208 @@ async fn native_forbidden_proxy_skips_a_rejected_manifest_before_issuing_playbac
     );
     assert_eq!(stream["data"]["header"], json!({}));
     assert_eq!(stream["data"]["playback_mode"], "direct");
+}
+
+#[tokio::test]
+async fn native_playback_never_delivers_web_player_pages_as_media() {
+    let h = harness().await;
+    let primary = catalog::sources(&h.app).await.unwrap().remove(0);
+    let base = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url).unwrap();
+    let page = base.join("/play/web-page").unwrap();
+    let clear = base.join("/clear.m3u8").unwrap();
+    let subscription = catalog::import(&h.app, &json!({"name":"网页线路备选订阅","content":json!({"api_site":{"playable":{"name":"可播放备选源","api":primary.api}}}).to_string()})).await.unwrap();
+    let alternate = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|source| source.subscription_id == subscription)
+        .unwrap();
+
+    // 没有观看记录时，默认线路跳过网页播放器，落在能直接交付媒体的线路上。
+    let mixed = catalog::ingest(&h.app,&primary,&json!({"vod_id":8702,"vod_name":"默认线路验收","vod_year":"2026","type_name":"电影","vod_play_from":"jsyun$$$jsm3u8","vod_play_url":format!("正片${page}$$$正片${clear}")}),true).await.unwrap().unwrap();
+    let media_line = catalog::episodes(&h.app, &mixed.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|episode| episode.line_name == "jsm3u8")
+        .unwrap();
+    let (status, info) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/info",
+        json!({"item_guid":mixed.id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{info}");
+    assert_eq!(info["data"]["media_guid"], media_line.id);
+
+    let original = catalog::ingest(&h.app,&primary,&json!({"vod_id":8701,"vod_name":"网页播放器线路验收","vod_year":"2026","type_name":"电视剧","vod_play_from":"jsyun","vod_play_url":format!("第05集${page}")}),true).await.unwrap().unwrap();
+    let original = catalog::episodes(&h.app, &original.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let target = catalog::ingest(&h.app,&alternate,&json!({"vod_id":8703,"vod_name":"网页播放器线路验收","vod_year":"2026","type_name":"电视剧","vod_play_from":"lzm3u8","vod_play_url":format!("第05集${clear}")}),true).await.unwrap().unwrap();
+    let target = catalog::episodes(&h.app, &target.id)
+        .await
+        .unwrap()
+        .remove(0);
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(json!({"probe_version":2,"kind":"hls","duration":120.0,"size":0,"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1280,"height":720,"avg_frame_rate":"24/1"}],"warning":""}).to_string())
+        .bind(now()).bind(&target.id).execute(&h.app.db).await.unwrap();
+    playback::set_forbidden(&h.app, true).await.unwrap();
+
+    // 当前来源是网页播放器：不把网页当作 MP4 交付，换到同集的可播放来源。
+    let (status, info) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/info",
+        json!({"item_guid":original.id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{info}");
+    assert_eq!(info["data"]["media_guid"], target.id);
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":target.id,"item_guid":info["data"]["guid"]}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{stream}");
+    assert_eq!(stream["data"]["source_name"], "可播放备选源");
+    assert!(text(&stream["data"], "playback_notice").contains("网页播放器"));
+    assert_eq!(
+        stream["data"]["direct_link_qualities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "网页播放器不进入来源菜单"
+    );
+    let fresh = catalog::episode(&h.app, &original.id).await.unwrap();
+    let before = h.hits.load(Ordering::Relaxed);
+    let error = tv_rust::probe::get(&h.app, &fresh).await.err().unwrap();
+    assert!(error.1.contains("网页播放器"));
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        before,
+        "已确认的网页地址不重复访问上游"
+    );
+
+    // 当前来源被上游拒绝、地址也不是媒体文件：同样换到同集的可播放来源。
+    // 备选来源此前从未识别过，起播准备现场识别它，而不是把拒绝页交给播放器。
+    let denied = base.join("/share/denied").unwrap();
+    sqlx::query("UPDATE episodes SET url=?,probe='{}',probed_at=0 WHERE id=?")
+        .bind(denied.as_str())
+        .bind(&original.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE episodes SET probe='{}',probed_at=0 WHERE id=?")
+        .bind(&target.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cache WHERE key LIKE 'native-direct-%'")
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":original.id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{stream}");
+    assert_eq!(stream["data"]["file_stream"]["guid"], target.id);
+    assert!(text(&stream["data"], "playback_notice").contains("未返回可识别的视频"));
+    assert_eq!(
+        stream["data"]["direct_link_qualities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "未识别出视频且地址不是媒体文件的线路不进入来源菜单"
+    );
+    assert_eq!(stream["data"]["playback_mode"], "direct");
+
+    // 没有任何可用的同集来源时直接说明原因，不交付一个播放器只会报 -99985 的地址。
+    sqlx::query("UPDATE episodes SET active=0 WHERE id=?")
+        .bind(&target.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let (status, refused) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":original.id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(text(&refused, "msg").contains("没有返回可直接播放的视频"));
+    assert!(*h.app.forbid_proxy.borrow());
+}
+
+#[tokio::test]
+async fn native_forbidden_proxy_recovers_with_stale_probes_while_source_discovery_is_slow() {
+    let h = harness().await;
+    let (original, target) = native_direct_fallback_fixture(&h).await;
+    let primary = catalog::sources(&h.app).await.unwrap().remove(0);
+    let slow_subscription = catalog::import(&h.app, &json!({"name":"慢速识别订阅","content":json!({"api_site":{"slow":{"name":"慢速识别源","api":primary.api}}}).to_string()})).await.unwrap();
+    let slow = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|source| source.subscription_id == slow_subscription)
+        .unwrap();
+    let url = url::Url::parse(&original.url)
+        .unwrap()
+        .join("/slow")
+        .unwrap();
+    catalog::ingest(&h.app,&slow,&json!({"vod_id":8604,"vod_name":"禁止转发直链预检","vod_year":"2026","type_name":"电视剧","vod_play_from":"yun","vod_play_url":format!("第01集${url}#第05集${url}")}),true).await.unwrap().unwrap();
+    // 识别结果已过期。一个迟迟识别不完的来源占住后台识别，不应拖垮整个起播准备。
+    sqlx::query("UPDATE episodes SET probed_at=? WHERE id=?")
+        .bind(now() - 7 * 3600)
+        .bind(&target.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let started = std::time::Instant::now();
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":original.id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{stream}");
+    assert_eq!(
+        stream["data"]["file_stream"]["guid"], target.id,
+        "来源发现超时前留出时间确认备选来源"
+    );
+    assert!(text(&stream["data"], "playback_notice").contains("加密 HLS"));
+    assert!(started.elapsed() < Duration::from_secs(12));
+    let labels: Vec<_> = stream["data"]["direct_link_qualities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|choice| text(choice, "resolution"))
+        .collect();
+    assert_eq!(
+        labels.len(),
+        2,
+        "未识别的非媒体地址不进入菜单，加密来源仍可显式选择：{labels:?}"
+    );
+    assert_eq!(labels[0], "可直链测试源");
 }
 
 #[tokio::test]
