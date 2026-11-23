@@ -1569,6 +1569,26 @@ section {
 .source-row > span {
   white-space: nowrap;
 }
+.source-row .source-health {
+  display: inline-block;
+  max-width: 100%;
+  margin-top: 6px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  color: var(--muted);
+  background: #ffffff08;
+  overflow-wrap: anywhere;
+}
+.source-health.available,
+.source-health.partial {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.source-health.unreachable,
+.source-health.web {
+  color: #e3b48d;
+  background: #e3b48d14;
+}
 .user-row {
   display: flex;
   align-items: center;

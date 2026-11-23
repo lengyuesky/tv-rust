@@ -322,8 +322,25 @@ async fn inspect(app: &App, e: &Episode) -> Result<MediaInfo> {
     }
     Ok(info)
 }
+/// 上游明确拒绝；超时与限流仍按临时故障处理。
+pub(crate) fn rejected_status(warning: &str) -> Option<u16> {
+    warning
+        .strip_prefix("媒体探测返回 HTTP ")
+        .and_then(|status| status.parse::<u16>().ok())
+        .filter(|status| (400..500).contains(status) && !matches!(status, 408 | 429))
+}
+fn deterministic_failure(info: &MediaInfo) -> bool {
+    rejected_status(&info.warning).is_some() || info.warning == WEB_PAGE || info.warning == IMAGE
+}
 pub(crate) fn cached(e: &Episode) -> Option<MediaInfo> {
-    last_known(e).filter(|_| e.probed_at > now() - 21600)
+    last_known(e).filter(|info| {
+        let ttl = if deterministic_failure(info) {
+            86400
+        } else {
+            21600
+        };
+        e.probed_at > now() - ttl
+    })
 }
 
 /// 同一地址上一次的识别结果，不限时效。用于在重新识别完成前保留画质与可用性判断。
@@ -331,6 +348,10 @@ pub(crate) fn last_known(e: &Episode) -> Option<MediaInfo> {
     let info = serde_json::from_str::<MediaInfo>(&e.probe).ok()?;
     if e.probed_at <= 0 {
         return None;
+    }
+    // 拒绝、网页和图片已是确定性结论，不受旧版未识别媒体的失效规则影响。
+    if deterministic_failure(&info) {
+        return Some(info);
     }
     let image_only = info
         .streams

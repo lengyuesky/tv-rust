@@ -65,6 +65,7 @@ import {
   qualityLabel,
   type VideoQuality,
 } from "./playback-quality";
+import { sourceHealthStatus, type SourceHealth } from "./source-health";
 
 type Obj = Record<string, any>;
 const time = (s: number) =>
@@ -2366,6 +2367,15 @@ function UsageSelector({
   );
 }
 
+function SourceHealthBadge({ health }: { health?: SourceHealth }) {
+  const status = sourceHealthStatus(health);
+  return status ? (
+    <small className={`source-health ${status.kind}`} title={status.title}>
+      {status.label}
+    </small>
+  ) : null;
+}
+
 function SettingsPage({
   me,
   refreshMe,
@@ -2639,6 +2649,7 @@ function SettingsPage({
                         · {s.source_key}
                       </small>
                       {s.note && <small>{s.note}</small>}
+                      <SourceHealthBadge health={s.health} />
                     </div>
                     <span className="muted small">
                       {!s.present
