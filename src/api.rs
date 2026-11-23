@@ -76,7 +76,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
             .collect();
     if path == "/api/health" {
         return Ok(json_response(
-            json!({"ok":true,"version":env!("CARGO_PKG_VERSION")}),
+            json!({"ok":true,"version":env!("CARGO_PKG_VERSION"),"build_revision":build_revision()}),
         ));
     }
     if path == "/api/status" {
@@ -133,7 +133,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
     match (method.as_str(), path.as_str()) {
         ("GET", "/api/me") => {
             return Ok(json_response(
-                json!({"preferences":preferences::get(app,&who.user.id).await?,"user":who.user,"forbid_proxy":*app.forbid_proxy.borrow(),"public_url":app.public_url,"version":env!("CARGO_PKG_VERSION")}),
+                json!({"preferences":preferences::get(app,&who.user.id).await?,"user":who.user,"forbid_proxy":*app.forbid_proxy.borrow(),"public_url":app.public_url,"version":env!("CARGO_PKG_VERSION"),"build_revision":build_revision()}),
             ));
         }
         ("PATCH", "/api/me/preferences") => {

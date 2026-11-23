@@ -52,6 +52,15 @@ async fn harness() -> Harness {
                 ([("content-type","application/vnd.apple.mpegurl")],body).into_response()
             },
             "/encrypted.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],include_str!("fixtures/hls-probe/media.m3u8")).into_response(),
+            "/clear.m3u8"=>([("content-type","application/vnd.apple.mpegurl")],"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nclear-segment.ts\n#EXT-X-ENDLIST\n").into_response(),
+            "/clear-segment.ts"=>{
+                if ["authorization","cookie","authx"].iter().any(|key|req.headers().contains_key(*key)) {
+                    StatusCode::FORBIDDEN.into_response()
+                } else {
+                    ([("content-type","video/mp2t")],&include_bytes!("fixtures/hls-probe/image-prefixed.ts")[112..]).into_response()
+                }
+            },
+            "/blocked.m3u8"=>StatusCode::from_u16(444).unwrap().into_response(),
             "/compressed.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","zstd")],include_bytes!("fixtures/hls-probe/compressed-media.m3u8.zst").as_slice()).into_response(),
             "/compressed-gzip.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","gzip")],include_bytes!("fixtures/hls-probe/compressed-media.m3u8.gz").as_slice()).into_response(),
             "/compressed-master.m3u8"=>([("content-type","application/vnd.apple.mpegurl"),("content-encoding","zstd")],include_bytes!("fixtures/hls-probe/compressed-master.m3u8.zst").as_slice()).into_response(),
@@ -2644,6 +2653,14 @@ async fn concurrent_direct_manifests_limit_pressure_and_retry_a_transient_segmen
     )
     .await;
     assert_eq!(status, 200);
+    // 起播预检会准备区间；清空夹具缓存后仍须实际覆盖两个并发清单的冷识别。
+    sqlx::query("DELETE FROM cache WHERE key LIKE 'direct-ts:v1:%'")
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    attempts.lock().unwrap().clear();
+    maximum.store(0, Ordering::SeqCst);
+    peers.lock().unwrap().clear();
     let path = url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url"))
         .unwrap()
         .path()
@@ -2700,13 +2717,19 @@ async fn concurrent_direct_manifests_limit_pressure_and_retry_a_transient_segmen
             .unwrap()
             .path()
             .to_owned();
+    let prepared_attempts = attempts.lock().unwrap()["/zz-gone.png"];
+    assert_eq!(prepared_attempts, 1, "预检只请求一次失效分片");
     for _ in 0..2 {
         let (status, error) = request(&h, "GET", &unavailable_path, json!({}), None).await;
         assert_eq!(status, 400);
         assert!(text(&error, "error").contains("HTTP 410"));
     }
     let attempts = attempts.lock().unwrap();
-    assert_eq!(attempts["/zz-gone.png"], 2, "失效地址不自动重试");
+    assert_eq!(
+        attempts["/zz-gone.png"],
+        prepared_attempts + 2,
+        "失效地址不自动重试"
+    );
     for index in 0..4 {
         assert_eq!(
             attempts[&format!("/extra-{index:03}.png")],
@@ -4743,6 +4766,178 @@ async fn native_hls_fixture(h: &Harness, extensionless: bool) -> Vec<catalog::Ep
     catalog::episodes(&h.app, &film.id).await.unwrap()
 }
 
+async fn native_direct_fallback_fixture(h: &Harness) -> (catalog::Episode, catalog::Episode) {
+    let primary = catalog::sources(&h.app).await.unwrap().remove(0);
+    let base = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url).unwrap();
+    let subscription = catalog::import(&h.app, &json!({"name":"直链预检来源","content":json!({"api_site":{"clear":{"name":"可直链测试源","api":primary.api}}}).to_string()})).await.unwrap();
+    let alternate = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|source| source.subscription_id == subscription)
+        .unwrap();
+    let hidden_subscription = catalog::import(&h.app, &json!({"name":"受限直链来源","usage":{"mode":"admins","user_ids":[]},"content":json!({"api_site":{"hidden":{"name":"受限直链源","api":primary.api}}}).to_string()})).await.unwrap();
+    let hidden = catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|source| source.subscription_id == hidden_subscription)
+        .unwrap();
+    let mut episodes = Vec::new();
+    for (source, id, path, width, height) in [
+        (&primary, 8601, "/encrypted.m3u8", 1920, 1080),
+        (&alternate, 8602, "/clear.m3u8", 1280, 720),
+        (&hidden, 8603, "/clear.m3u8?hidden=1", 3840, 2160),
+    ] {
+        let url = base.join(path).unwrap();
+        let film = catalog::ingest(&h.app,source,&json!({"vod_id":id,"vod_name":"禁止转发直链预检","vod_year":"2026","type_name":"电视剧","vod_play_from":"lzm3u8","vod_play_url":format!("第01集${url}#第05集${url}")}),true).await.unwrap().unwrap();
+        let episode = catalog::episodes(&h.app, &film.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|episode| episode.title == "第05集")
+            .unwrap();
+        sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+            .bind(json!({"probe_version":2,"kind":"hls","duration":120.0,"size":0,"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":width,"height":height,"avg_frame_rate":"24/1"}],"warning":""}).to_string())
+            .bind(now()).bind(&episode.id).execute(&h.app.db).await.unwrap();
+        episodes.push(catalog::episode(&h.app, &episode.id).await.unwrap());
+    }
+    (episodes.remove(0), episodes.remove(0))
+}
+
+#[tokio::test]
+async fn native_forbidden_proxy_selects_a_ready_same_episode_and_keeps_source_progress() {
+    let h = harness().await;
+    let (original, target) = native_direct_fallback_fixture(&h).await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    for (user, episode, position) in [
+        (&h.other.user.id, &original, 89.0),
+        (&h.other.user.id, &target, 7.0),
+        (&h.who.user.id, &target, 30.0),
+    ] {
+        sqlx::query("INSERT INTO progress VALUES(?,?,?,?,?,?,?)")
+            .bind(user)
+            .bind(&episode.film_id)
+            .bind(&episode.id)
+            .bind(position)
+            .bind(120.0)
+            .bind(0)
+            .bind(now())
+            .execute(&h.app.db)
+            .await
+            .unwrap();
+    }
+    let (status, info) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/info",
+        json!({"item_guid":original.id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(info["data"]["media_guid"], target.id);
+    assert_eq!(info["data"]["ts"], 7, "切换来源读取目标自己的进度");
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":target.id,"item_guid":info["data"]["guid"]}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(stream["data"]["file_stream"]["guid"], target.id);
+    assert_eq!(stream["data"]["source_name"], "可直链测试源");
+    assert_eq!(stream["data"]["playback_mode"], "direct");
+    assert_eq!(stream["data"]["header"], json!({}));
+    assert!(text(&stream["data"], "playback_notice").contains("加密 HLS"));
+    assert!(!stream.to_string().contains("受限直链源"));
+    let link = text(&stream["data"]["direct_link_qualities"][0], "url");
+    let (_, recorded) = request(&h,"POST","/v/api/v1/play/record",json!({"media_guid":target.id,"play_link":link,"ts":12,"bitrate":stream["data"]["video_stream"]["bps"]}),Some(&h.member_raw)).await;
+    assert_eq!(recorded["data"], true);
+    let (_, logs) = request(&h, "GET", "/api/logs", json!({}), Some(&h.member_raw)).await;
+    assert!(
+        logs["items"][0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "direct_source_selected")
+    );
+    for (user, episode, expected) in [
+        (&h.other.user.id, &original, 89.0),
+        (&h.other.user.id, &target, 12.0),
+        (&h.who.user.id, &target, 30.0),
+    ] {
+        let actual: f64 =
+            sqlx::query_scalar("SELECT position FROM progress WHERE user_id=? AND film_id=?")
+                .bind(user)
+                .bind(&episode.film_id)
+                .fetch_one(&h.app.db)
+                .await
+                .unwrap();
+        assert_eq!(actual, expected);
+    }
+    let (status, explicit) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream/directLink",
+        json!({"media_guid":target.id,"direct_link_quality_index":1}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        explicit["data"]["file_stream"]["guid"], original.id,
+        "显式选源不会被预检再次替换"
+    );
+    assert_eq!(explicit["data"]["playback_mode"], "direct");
+    assert!(*h.app.forbid_proxy.borrow());
+}
+
+#[tokio::test]
+async fn native_forbidden_proxy_skips_a_rejected_manifest_before_issuing_playback() {
+    let h = harness().await;
+    let (original, target) = native_direct_fallback_fixture(&h).await;
+    let url = url::Url::parse(&original.url)
+        .unwrap()
+        .join("/blocked.m3u8")
+        .unwrap();
+    sqlx::query("UPDATE episodes SET url=? WHERE id=?")
+        .bind(url.as_str())
+        .bind(&original.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let original = catalog::episode(&h.app, &original.id).await.unwrap();
+    let probe = tv_rust::probe::source_quality(&h.app, &h.other.user.id, &original, true, true)
+        .await
+        .unwrap();
+    assert!(probe.warning.contains("444"));
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":original.id}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(stream["data"]["file_stream"]["guid"], target.id);
+    assert!(text(&stream["data"], "playback_notice").contains("HTTP 444"));
+    assert_eq!(
+        stream["data"]["direct_link_qualities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "已确认被上游拒绝的来源不会继续进入菜单"
+    );
+    assert_eq!(stream["data"]["header"], json!({}));
+    assert_eq!(stream["data"]["playback_mode"], "direct");
+}
+
 #[tokio::test]
 async fn native_hls_uses_a_ready_manifest_instead_of_the_strm_file_channel() {
     let h = harness().await;
@@ -5380,23 +5575,6 @@ async fn native_hls_rpc_reuses_its_manifest_link_and_proxies_all_child_resources
 async fn expired_media_is_reported_before_playback_and_failed_switch_keeps_the_old_source() {
     let h = harness().await;
     let eps = native_hls_fixture(&h, false).await;
-    let gone = url::Url::parse(&eps[1].url)
-        .unwrap()
-        .join("/gone.m3u8")
-        .unwrap();
-    sqlx::query("UPDATE episodes SET url=?,probe='',probed_at=0 WHERE id=?")
-        .bind(gone.as_str())
-        .bind(&eps[1].id)
-        .execute(&h.app.db)
-        .await
-        .unwrap();
-    assert!(
-        playback::start(&h.app, &h.who, &eps[1].id)
-            .await
-            .unwrap_err()
-            .1
-            .contains("媒体地址已失效")
-    );
     let (_, stream) = request(
         &h,
         "POST",
@@ -5419,6 +5597,23 @@ async fn expired_media_is_reported_before_playback_and_failed_switch_keeps_the_o
         .iter()
         .find(|quality| quality["bitrate"] != stream["data"]["video_stream"]["bps"])
         .unwrap();
+    let gone = url::Url::parse(&eps[1].url)
+        .unwrap()
+        .join("/gone.m3u8")
+        .unwrap();
+    sqlx::query("UPDATE episodes SET url=?,probe='',probed_at=0 WHERE id=?")
+        .bind(gone.as_str())
+        .bind(&eps[1].id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    assert!(
+        playback::start(&h.app, &h.who, &eps[1].id)
+            .await
+            .unwrap_err()
+            .1
+            .contains("媒体地址已失效")
+    );
     let (status, failed) = request(
         &h,
         "POST",
@@ -5429,7 +5624,7 @@ async fn expired_media_is_reported_before_playback_and_failed_switch_keeps_the_o
     )
     .await;
     assert_eq!(status, 400);
-    assert!(text(&failed, "msg").contains("媒体地址已失效"));
+    assert!(text(&failed, "msg").contains("播放地址已更新"));
     assert!(
         !playback::latest(&h.app, &h.who, &eps[0].id)
             .await
@@ -5437,6 +5632,19 @@ async fn expired_media_is_reported_before_playback_and_failed_switch_keeps_the_o
             .ended
     );
     assert!(playback::latest(&h.app, &h.who, &eps[1].id).await.is_err());
+    let (_, refreshed) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/stream/list/{}", eps[0].id),
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(
+        refreshed["data"]["qualities"].as_array().unwrap().len(),
+        1,
+        "刷新菜单不再提供已失效的来源"
+    );
     for path in [
         "/v/api/v1/play/info",
         "/v/api/v1/stream",

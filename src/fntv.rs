@@ -577,6 +577,9 @@ pub(crate) async fn source_choices(
     });
     for episode in choices {
         let measured = &info[&episode.id];
+        if episode.id != e.id && probe::require_available(measured).is_err() {
+            continue;
+        }
         match source_file(app, &who.user.id, &episode, measured).await {
             Ok(value) => files.push(value),
             Err(error) if episode.id == e.id => return Err(error),
@@ -1195,8 +1198,20 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
     }
     validate_item_media(app, &who, &item, &e).await?;
     catalog::available(app, &who.user.id, &e.id).await?;
+    let mut info = probe::get(app, &e).await?;
+    let mut preparation_notice = None;
+    if *app.forbid_proxy.borrow()
+        && selection.is_none()
+        && matches!(
+            path.as_str(),
+            "/v/api/v1/play/info" | "/v/api/v1/stream" | "/v/api/v1/stream/directLink"
+        )
+    {
+        (e, info, preparation_notice) =
+            native_playback::prepare_start(app, &who, &e, &info).await?;
+        validate_item_media(app, &who, &item, &e).await?;
+    }
     let f = catalog::film(app, &e.film_id).await?;
-    let info = probe::get(app, &e).await?;
     if matches!(
         path.as_str(),
         "/v/api/v1/play/info"
@@ -1334,6 +1349,11 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 }
             }
             let mut play = playback::get(app, &play_id).await?;
+            if let Some(notice) = preparation_notice {
+                playback::event(app, &play, "direct_source_selected", &notice).await?;
+                response["playback_notice"] = json!(notice);
+                native_playback::clear_preparation(app, &who, &e.id).await?;
+            }
             if info.kind == "hls" && !*app.forbid_proxy.borrow() && play.mode == "direct" {
                 // 原生 HLS 通道需要携带本站认证读取同源资源；在协商时记录所选方式，
                 // 客户端的文件信息与后续实际媒体交付保持一致。

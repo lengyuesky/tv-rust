@@ -72,6 +72,9 @@ pub fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+pub fn build_revision() -> &'static str {
+    option_env!("TV_BUILD_REVISION").unwrap_or("development")
+}
 pub fn hash(v: impl AsRef<[u8]>) -> String {
     Sha256::digest(v.as_ref())
         .iter()

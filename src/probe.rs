@@ -330,6 +330,18 @@ pub(crate) fn require_available(info: &MediaInfo) -> Result<()> {
     if info.warning == "媒体地址或分片返回图片，请刷新来源或换源" {
         return Err(Error::bad(&info.warning));
     }
+    if info.kind == "hls"
+        && let Some(status) = info
+            .warning
+            .strip_prefix("媒体探测返回 HTTP ")
+            .and_then(|status| status.parse::<u16>().ok())
+        && (400..500).contains(&status)
+        && !matches!(status, 408 | 429)
+    {
+        return Err(Error::bad(format!(
+            "HLS 清单被上游拒绝（HTTP {status}），请刷新来源或换源"
+        )));
+    }
     Ok(())
 }
 

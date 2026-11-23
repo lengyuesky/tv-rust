@@ -121,6 +121,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           build-contexts: web-output=./web/dist
+          build-args: TV_BUILD_REVISION=${{ github.sha }}
           labels: |
             org.opencontainers.image.title=TV Rust
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

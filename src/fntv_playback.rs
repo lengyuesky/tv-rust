@@ -8,7 +8,7 @@ use axum::{
 use catalog::Episode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Choice {
@@ -47,6 +47,210 @@ impl Choice {
         // 此字段是原生菜单选择码；HLS 清单的带宽仍来自真实探测字段。
         json!({"resolution":self.resolution,"bitrate":self.bitrate,"progressive":true,"is_m3u8":false})
     }
+}
+
+async fn prepare_direct_hls(app: &App, url: &str) -> Result<()> {
+    let mut url = url.to_owned();
+    for _ in 0..4 {
+        let response = net::request(app, Method::GET, &url, &HeaderMap::new()).await?;
+        if !response.status().is_success() {
+            return Err(Error::bad(format!(
+                "HLS 清单返回 HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let base = net::valid_url(response.url().as_str())?;
+        let bytes = net::bytes(response, 4 * 1024 * 1024, false).await?;
+        if !probe::is_hls(&bytes) {
+            return Err(Error::bad("播放地址未返回 HLS 清单"));
+        }
+        let manifest = String::from_utf8(bytes).map_err(|_| Error::bad("HLS 清单编码无效"))?;
+        if manifest.lines().map(str::trim).any(|line| {
+            line.strip_prefix("#EXT-X-KEY:")
+                .or_else(|| line.strip_prefix("#EXT-X-SESSION-KEY:"))
+                .is_some_and(|key| !key.split(',').any(|part| part.trim() == "METHOD=NONE"))
+        }) {
+            return Err(Error::bad(
+                "当前来源为加密 HLS，飞牛未能完成此格式的直链播放",
+            ));
+        }
+        if manifest.contains("#EXT-X-STREAM-INF:") {
+            let child = manifest
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .ok_or_else(|| Error::bad("HLS 主清单缺少媒体地址"))?;
+            url = base
+                .join(child)
+                .map_err(|_| Error::bad("HLS 子清单地址无效"))?
+                .to_string();
+            continue;
+        }
+        // 图片头分片必须在起播前准备真实区间，慢源不让客户端无限等待整张清单。
+        let ranges = hls_direct::ranges(app, &base, &manifest).await?;
+        let segment = manifest
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .ok_or_else(|| Error::bad("HLS 清单缺少媒体分片"))?;
+        let segment = base
+            .join(segment)
+            .map_err(|_| Error::bad("HLS 分片地址无效"))?;
+        if !ranges.contains_key(segment.as_str()) {
+            let offset = manifest
+                .lines()
+                .map(str::trim)
+                .take_while(|line| line.is_empty() || line.starts_with('#'))
+                .find_map(|line| line.strip_prefix("#EXT-X-BYTERANGE:"))
+                .and_then(|range| range.split_once('@'))
+                .and_then(|(_, offset)| offset.parse::<u64>().ok())
+                .unwrap_or(0);
+            let end = offset
+                .checked_add(4095)
+                .ok_or_else(|| Error::bad("HLS 分片区间无效"))?;
+            let mut headers = HeaderMap::new();
+            headers.insert("range", format!("bytes={offset}-{end}").parse().unwrap());
+            let response = net::request(app, Method::GET, segment.as_str(), &headers).await?;
+            if !response.status().is_success() {
+                return Err(Error::bad(format!(
+                    "首个媒体分片返回 HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            let bytes = net::bytes(response, 4096, true).await?;
+            let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(128)])
+                .trim()
+                .to_ascii_lowercase();
+            if bytes.is_empty()
+                || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+                || prefix.starts_with("<!doctype")
+                || prefix.starts_with("<html")
+                || prefix.starts_with('{')
+                || prefix.starts_with('[')
+            {
+                return Err(Error::bad("首个分片未返回可直接播放的媒体"));
+            }
+        }
+        return Ok(());
+    }
+    Err(Error::bad("HLS 清单层级超出支持范围"))
+}
+
+async fn direct_ready(app: &App, e: &Episode, info: &probe::MediaInfo) -> Result<()> {
+    probe::require_available(info)?;
+    if info.kind != "hls" {
+        return Ok(());
+    }
+    let key = format!("native-direct-ready:v1:{}", hash(&e.url));
+    if let Some(value) = app.cache_get(&key).await? {
+        return if value["ready"] == true {
+            Ok(())
+        } else {
+            Err(Error::bad(text(&value, "reason")))
+        };
+    }
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let _slot = app.probe_slots.acquire().await.unwrap();
+        prepare_direct_hls(app, &e.url).await
+    })
+    .await
+    .unwrap_or_else(|_| Err(Error::bad("当前来源未能及时完成直链准备")));
+    let reason = result
+        .as_ref()
+        .err()
+        .map(|error| error.1.as_str())
+        .unwrap_or("");
+    app.cache_put(
+        &key,
+        &json!({"ready":result.is_ok(),"reason":reason}),
+        if result.is_ok() { 30 } else { 5 },
+    )
+    .await?;
+    result
+}
+
+pub(crate) async fn prepare_start(
+    app: &App,
+    who: &Identity,
+    current: &Episode,
+    info: &probe::MediaInfo,
+) -> Result<(Episode, probe::MediaInfo, Option<String>)> {
+    let failure = match direct_ready(app, current, info).await {
+        Ok(()) => {
+            let notice = app
+                .cache_get(&preparation_key(who, &current.id))
+                .await?
+                .map(|value| text(&value, "notice"))
+                .filter(|notice| !notice.is_empty());
+            return Ok((current.clone(), info.clone(), notice));
+        }
+        Err(error) => error.1,
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let original_film = catalog::film(app, &current.film_id).await?;
+    let sources =
+        tokio::time::timeout_at(deadline, fntv::source_choices(app, who, &current.id, false)).await;
+    if let Ok(Ok(sources)) = sources {
+        for file in sources["files"].as_array().into_iter().flatten() {
+            let id = text(file, "guid");
+            if id == current.id {
+                continue;
+            }
+            let (candidate, _, source) = catalog::available(app, &who.user.id, &id).await?;
+            let candidate_film = catalog::film(app, &candidate.film_id).await?;
+            if crate::fntv_identity::key(&candidate_film)
+                != crate::fntv_identity::key(&original_film)
+            {
+                continue;
+            }
+            if fntv::validate_item_media(app, who, &current.id, &candidate)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let Some(measured) = probe::cached(&candidate)
+                .filter(|info| info.streams.iter().any(probe::is_video_stream))
+            else {
+                continue;
+            };
+            if tokio::time::timeout_at(deadline, direct_ready(app, &candidate, &measured))
+                .await
+                .is_ok_and(|result| result.is_ok())
+            {
+                let original = catalog::source(app, &original_film.source_id).await?;
+                let notice = format!(
+                    "来源“{}”直链准备失败（{}），已换用同集来源“{}”",
+                    original.name, failure, source.name
+                );
+                app.cache_put(
+                    &preparation_key(who, &candidate.id),
+                    &json!({"notice":notice}),
+                    30,
+                )
+                .await?;
+                return Ok((candidate, measured, Some(notice)));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    // 没有确认可用的同集来源时，不改集、不改进度，也不突破禁止转发设置。
+    probe::require_available(info)?;
+    Ok((current.clone(), info.clone(), None))
+}
+
+fn preparation_key(who: &Identity, episode: &str) -> String {
+    format!("native-direct-selected:v1:{}:{episode}", who.auth_hash)
+}
+
+pub(crate) async fn clear_preparation(app: &App, who: &Identity, episode: &str) -> Result<()> {
+    sqlx::query("DELETE FROM cache WHERE key=?")
+        .bind(preparation_key(who, episode))
+        .execute(&app.db)
+        .await?;
+    Ok(())
 }
 
 fn choice_index(selector: &str) -> Result<usize> {

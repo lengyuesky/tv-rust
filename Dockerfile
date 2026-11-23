@@ -20,9 +20,10 @@ RUN mkdir src && printf 'fn main() {}\n' > src/main.rs && touch src/lib.rs \
     && rm -rf src
 COPY migrations/ ./migrations/
 COPY src/ ./src/
+ARG TV_BUILD_REVISION=development
 # 仅清理占位项目的产物，确保始终编译真实源码并保留已构建的依赖。
 RUN cargo clean --release --package tv-rust \
-    && cargo build --release --locked --jobs "$(nproc)" \
+    && TV_BUILD_REVISION="$TV_BUILD_REVISION" cargo build --release --locked --jobs "$(nproc)" \
     && cp target/release/tv-rust /usr/local/bin/tv-rust
 
 FROM debian:bookworm-slim AS runtime
