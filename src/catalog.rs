@@ -1,6 +1,6 @@
 use crate::{access, core::*, net, probe};
 use axum::http::{HeaderMap, Method};
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
@@ -21,6 +21,25 @@ pub struct Source {
 impl Source {
     pub fn active(&self) -> bool {
         self.enabled && self.present && self.upstream_enabled
+    }
+}
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct SourceHealth {
+    pub probed: u64,
+    pub verified: u64,
+    pub rejected: u64,
+    pub web_pages: u64,
+    pub last_probed_at: i64,
+}
+impl SourceHealth {
+    fn rank(&self) -> u8 {
+        if self.verified > 0 {
+            0
+        } else if self.probed > 0 && self.rejected == self.probed {
+            2
+        } else {
+            1
+        }
     }
 }
 #[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -550,6 +569,73 @@ pub async fn sources(app: &App) -> Result<Vec<Source>> {
         .fetch_all(&app.db)
         .await?)
 }
+/// 批量汇总指定视频源近七天的活跃线路；不触发探测，也不改变视频源启停。
+async fn source_health(app: &App, source_ids: &[String]) -> Result<BTreeMap<String, SourceHealth>> {
+    let mut health: BTreeMap<_, _> = source_ids
+        .iter()
+        .map(|id| (id.clone(), SourceHealth::default()))
+        .collect();
+    if health.is_empty() {
+        return Ok(health);
+    }
+    let mut rows = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT f.source_id,e.probe,e.probed_at FROM films f \
+         JOIN episodes e ON e.film_id=f.id \
+         WHERE f.source_id IN (SELECT value FROM json_each(?)) \
+         AND e.active=1 AND e.probed_at>=?",
+    )
+    .bind(serde_json::to_string(source_ids).unwrap())
+    .bind(now() - 7 * 86400)
+    .fetch(&app.db);
+    while let Some((source, raw, probed_at)) = rows.try_next().await? {
+        let summary = health.get_mut(&source).unwrap();
+        summary.probed += 1;
+        summary.last_probed_at = summary.last_probed_at.max(probed_at);
+        let Ok(info) = serde_json::from_str::<probe::MediaInfo>(&raw) else {
+            continue;
+        };
+        if probe::rejected_status(&info.warning).is_some() {
+            summary.rejected += 1;
+        } else if info.warning == probe::WEB_PAGE {
+            summary.web_pages += 1;
+        } else if info.warning != probe::IMAGE
+            && info
+                .streams
+                .iter()
+                .any(|stream| probe::is_video_stream(stream) && stream["codec_name"] != "png")
+        {
+            summary.verified += 1;
+        }
+    }
+    Ok(health)
+}
+
+/// 菜单只汇总候选所属的视频源，按影片 id 返回排序档位；查询次数不随线路数增长。
+pub(crate) async fn source_health_ranks(
+    app: &App,
+    episodes: &[Episode],
+) -> Result<BTreeMap<String, u8>> {
+    let film_ids: HashSet<_> = episodes.iter().map(|episode| &episode.film_id).collect();
+    if film_ids.len() < 2 {
+        return Ok(BTreeMap::new());
+    }
+    let films: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id,source_id FROM films WHERE id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(serde_json::to_string(&film_ids).unwrap())
+    .fetch_all(&app.db)
+    .await?;
+    let source_ids: HashSet<_> = films.iter().map(|(_, source)| source.clone()).collect();
+    if source_ids.len() < 2 {
+        return Ok(BTreeMap::new());
+    }
+    let health = source_health(app, &source_ids.into_iter().collect::<Vec<_>>()).await?;
+    Ok(films
+        .into_iter()
+        .map(|(film, source)| (film, health[&source].rank()))
+        .collect())
+}
+
 pub async fn source(app: &App, id: &str) -> Result<Source> {
     sqlx::query_as("SELECT * FROM sources WHERE id=?")
         .bind(id)
@@ -1129,6 +1215,20 @@ pub async fn subscription_list(app: &App) -> Result<Value> {
             .fetch_all(&app.db)
             .await?;
     let current: Vec<Source> = sqlx::query_as("SELECT s.* FROM sources s JOIN subscriptions sub ON sub.id=s.subscription_id WHERE sub.removed_at=0 AND s.present=1 ORDER BY s.name,s.id").fetch_all(&app.db).await?;
+    let source_ids = current
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    let health = source_health(app, &source_ids).await?;
+    let current: Vec<_> = current
+        .into_iter()
+        .map(|source| {
+            let summary = &health[&source.id];
+            let mut value = json!(source);
+            value["health"] = json!(summary);
+            value
+        })
+        .collect();
     Ok(
         json!({"subscriptions":rows.into_iter().map(|Subscription{id,name,url,interval_seconds,updated_at,checked_at,error,all_users}| {
             let user_ids: Vec<String> = members.iter().filter(|(sub,_)|sub==&id).map(|(_,user)|user.clone()).collect();

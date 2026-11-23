@@ -663,10 +663,13 @@ pub(crate) async fn source_choices_within(
     let mut choices: Vec<_> = choices.into_values().collect();
     // 禁止转发时已知加密的 HLS 无法直链播放，排到可播放来源之后。
     let forbidden = *app.forbid_proxy.borrow();
+    let source_health = catalog::source_health_ranks(app, &choices).await?;
+    let health_rank = |episode: &Episode| source_health.get(&episode.film_id).copied().unwrap_or(1);
     choices.sort_by(|a, b| {
         (forbidden && info[&a.id].encrypted)
             .cmp(&(forbidden && info[&b.id].encrypted))
             .then(quality_rank(&info[&b.id]).cmp(&quality_rank(&info[&a.id])))
+            .then_with(|| health_rank(a).cmp(&health_rank(b)))
             .then(a.id.cmp(&b.id))
     });
     for episode in choices {

@@ -3055,6 +3055,555 @@ async fn source_quality_refreshes_updated_media_instead_of_reusing_old_dimension
     drop(background_slot);
 }
 
+fn source_health_probe(warning: &str, streams: Vec<Value>) -> Value {
+    json!({"probe_version":3,"kind":"hls","duration":120,"size":0,"streams":streams,"warning":warning})
+}
+
+async fn save_source_health_probe(h: &Harness, episode: &str, info: Value, probed_at: i64) {
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(info.to_string())
+        .bind(probed_at)
+        .bind(episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deterministic_probe_failures_cache_for_twenty_four_hours_and_refresh_immediately() {
+    let h = harness().await;
+    let blocked = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url)
+        .unwrap()
+        .join("/blocked.m3u8")
+        .unwrap();
+    sqlx::query("UPDATE episodes SET url=? WHERE id=?")
+        .bind(blocked.as_str())
+        .bind(&h.episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    for warning in [
+        "媒体探测返回 HTTP 400",
+        "媒体探测返回 HTTP 403",
+        "媒体探测返回 HTTP 404",
+        "媒体探测返回 HTTP 410",
+        "媒体探测返回 HTTP 444",
+        "媒体探测返回 HTTP 499",
+        "该地址返回网页播放器，需要额外解析，请换源",
+        "媒体地址或分片返回图片，请刷新来源或换源",
+    ] {
+        let mut info = source_health_probe(warning, vec![]);
+        // 旧的非 HLS 识别也要保留明确结论，不能被“未识别 m3u8”规则反复重探。
+        info["kind"] = json!("video");
+        info["probe_version"] = json!(0);
+        save_source_health_probe(&h, &h.episode, info.clone(), now() - 21600 - 60).await;
+        let episode = catalog::episode(&h.app, &h.episode).await.unwrap();
+        let hits = h.hits.load(Ordering::Relaxed);
+        let slot = h.app.source_quality_slots.acquire().await.unwrap();
+        let cached = tokio::time::timeout(
+            Duration::from_secs(1),
+            tv_rust::probe::source_quality(&h.app, &h.who.user.id, &episode, false, false),
+        )
+        .await
+        .expect("六小时后的确定性结论仍命中缓存，不占用后台探测槽");
+        if warning.contains("网页播放器") || warning.contains("返回图片") {
+            assert_eq!(cached.err().unwrap().1, warning);
+        } else {
+            assert_eq!(cached.unwrap().warning, warning);
+        }
+        assert_eq!(h.hits.load(Ordering::Relaxed), hits, "{warning}");
+        drop(slot);
+
+        save_source_health_probe(&h, &h.episode, info, now() - 86400 - 60).await;
+        let episode = catalog::episode(&h.app, &h.episode).await.unwrap();
+        let expired = tv_rust::probe::get(&h.app, &episode).await.unwrap();
+        assert_eq!(expired.warning, "媒体探测返回 HTTP 444");
+        assert_eq!(h.hits.load(Ordering::Relaxed), hits + 1, "{warning}");
+        let episode = catalog::episode(&h.app, &h.episode).await.unwrap();
+        let refreshed =
+            tv_rust::probe::source_quality(&h.app, &h.who.user.id, &episode, true, false)
+                .await
+                .unwrap();
+        assert_eq!(refreshed.warning, "媒体探测返回 HTTP 444");
+        assert_eq!(
+            h.hits.load(Ordering::Relaxed),
+            hits + 2,
+            "主动刷新立即重探刚保存的拒绝结果"
+        );
+    }
+}
+
+#[tokio::test]
+async fn temporary_probe_failures_and_old_unrecognized_media_keep_the_existing_cache_policy() {
+    let h = harness().await;
+    let blocked = url::Url::parse(&catalog::episode(&h.app, &h.episode).await.unwrap().url)
+        .unwrap()
+        .join("/blocked.m3u8")
+        .unwrap();
+    sqlx::query("UPDATE episodes SET url=? WHERE id=?")
+        .bind(blocked.as_str())
+        .bind(&h.episode)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    for info in [
+        source_health_probe("媒体探测返回 HTTP 408", vec![]),
+        source_health_probe("媒体探测返回 HTTP 429", vec![]),
+        source_health_probe("媒体探测返回 HTTP 500", vec![]),
+        source_health_probe("服务端探测超时，仍尝试客户端直连", vec![]),
+        source_health_probe("", vec![]),
+        source_health_probe(
+            "",
+            vec![json!({"codec_type":"video","codec_name":"h264","width":640,"height":360})],
+        ),
+    ] {
+        save_source_health_probe(&h, &h.episode, info.clone(), now() - 21600 + 60).await;
+        let episode = catalog::episode(&h.app, &h.episode).await.unwrap();
+        let hits = h.hits.load(Ordering::Relaxed);
+        let cached = tv_rust::probe::get(&h.app, &episode).await.unwrap();
+        assert_eq!(cached.warning, text(&info, "warning"));
+        assert_eq!(h.hits.load(Ordering::Relaxed), hits);
+        save_source_health_probe(&h, &h.episode, info, now() - 21600 - 60).await;
+        let episode = catalog::episode(&h.app, &h.episode).await.unwrap();
+        assert_eq!(
+            tv_rust::probe::get(&h.app, &episode).await.unwrap().warning,
+            "媒体探测返回 HTTP 444"
+        );
+        assert_eq!(h.hits.load(Ordering::Relaxed), hits + 1);
+    }
+    for info in [
+        json!({"probe_version":3,"kind":"video","duration":0,"size":0,"warning":"","streams":[]}),
+        json!({"probe_version":0,"kind":"hls","duration":0,"size":0,"warning":"","streams":[]}),
+        json!({"probe_version":1,"kind":"video","duration":0,"size":0,"warning":"","streams":[{"codec_type":"video","codec_name":"png","width":16,"height":16}]}),
+    ] {
+        save_source_health_probe(&h, &h.episode, info, now()).await;
+        let episode = catalog::episode(&h.app, &h.episode).await.unwrap();
+        let hits = h.hits.load(Ordering::Relaxed);
+        tv_rust::probe::get(&h.app, &episode).await.unwrap();
+        assert_eq!(
+            h.hits.load(Ordering::Relaxed),
+            hits + 1,
+            "旧的未识别 HLS 与图片画质缓存仍应立即重新识别"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_include_recent_active_source_health_only_for_admins() {
+    let h = harness().await;
+    let primary = catalog::sources(&h.app).await.unwrap().remove(0);
+    sqlx::query("UPDATE episodes SET probed_at=0")
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let subscription = catalog::import(
+        &h.app,
+        &json!({"name":"视频源可用性订阅","content":json!({"api_site":{
+            "blocked":{"name":"拒绝源","api":primary.api},
+            "healthy":{"name":"可用源","api":primary.api},
+            "unprobed":{"name":"未探测源","api":primary.api}
+        }}).to_string()}),
+    )
+    .await
+    .unwrap();
+    let sources = catalog::sources(&h.app).await.unwrap();
+    let blocked = sources
+        .iter()
+        .find(|source| source.source_key == "blocked")
+        .unwrap();
+    let healthy = sources
+        .iter()
+        .find(|source| source.source_key == "healthy")
+        .unwrap();
+    let unprobed = sources
+        .iter()
+        .find(|source| source.source_key == "unprobed")
+        .unwrap();
+    assert_eq!(blocked.subscription_id, subscription);
+    let recent = now();
+    let video = json!({"codec_type":"video","codec_name":"h264","width":1920,"height":1080});
+    let probes = [
+        (
+            source_health_probe("", vec![video.clone()]),
+            recent - 120,
+            true,
+        ),
+        (
+            source_health_probe(
+                "",
+                vec![
+                    json!({"codec_type":"video","codec_name":"png","disposition":{"attached_pic":true}}),
+                    json!({"codec_type":"video","codec_name":"hevc"}),
+                ],
+            ),
+            recent - 110,
+            true,
+        ),
+        (
+            source_health_probe("媒体探测返回 HTTP 444", vec![]),
+            recent - 100,
+            true,
+        ),
+        (
+            source_health_probe("媒体探测返回 HTTP 403", vec![]),
+            recent - 90,
+            true,
+        ),
+        (
+            source_health_probe("媒体探测返回 HTTP 404", vec![]),
+            recent - 80,
+            true,
+        ),
+        (
+            source_health_probe("媒体探测返回 HTTP 410", vec![]),
+            recent - 70,
+            true,
+        ),
+        (
+            source_health_probe("该地址返回网页播放器，需要额外解析，请换源", vec![]),
+            recent - 60,
+            true,
+        ),
+        (
+            source_health_probe("媒体地址或分片返回图片，请刷新来源或换源", vec![]),
+            recent - 50,
+            true,
+        ),
+        (
+            source_health_probe("媒体探测返回 HTTP 408", vec![]),
+            recent - 40,
+            true,
+        ),
+        (
+            source_health_probe("媒体探测返回 HTTP 429", vec![]),
+            recent - 30,
+            true,
+        ),
+        (
+            source_health_probe("媒体探测返回 HTTP 500", vec![]),
+            recent - 20,
+            true,
+        ),
+        (source_health_probe("", vec![]), recent - 10, true),
+        (
+            source_health_probe(
+                "",
+                vec![
+                    json!({"codec_type":"video","codec_name":"png","disposition":{"attached_pic":1}}),
+                ],
+            ),
+            recent - 9,
+            true,
+        ),
+        (
+            source_health_probe("", vec![json!({"codec_type":"video","codec_name":"png"})]),
+            recent - 8,
+            true,
+        ),
+        (
+            source_health_probe("", vec![video.clone()]),
+            recent - 8 * 86400,
+            true,
+        ),
+        (
+            source_health_probe("媒体探测返回 HTTP 444", vec![]),
+            recent,
+            false,
+        ),
+        (source_health_probe("", vec![]), 0, true),
+        (json!({}), recent - 7, true),
+    ];
+    let lines = (1..=probes.len())
+        .map(|number| format!("第{number}集${}", primary.api))
+        .collect::<Vec<_>>()
+        .join("#");
+    let film = catalog::ingest(
+        &h.app,
+        &primary,
+        &json!({"vod_id":831,"vod_name":"视频源可用性摘要验收","vod_year":"2026","type_name":"电视剧","vod_play_from":"线路","vod_play_url":lines}),
+        true,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let episodes = catalog::episodes(&h.app, &film.id).await.unwrap();
+    for (episode, (info, at, active)) in episodes.iter().zip(probes) {
+        save_source_health_probe(&h, &episode.id, info, at).await;
+        if !active {
+            sqlx::query("UPDATE episodes SET active=0 WHERE id=?")
+                .bind(&episode.id)
+                .execute(&h.app.db)
+                .await
+                .unwrap();
+        }
+    }
+    for (source, count, warning, streams, at) in [
+        (blocked, 3, "媒体探测返回 HTTP 444", vec![], recent - 60),
+        (healthy, 2, "", vec![video], recent - 30),
+    ] {
+        let lines = (1..=count)
+            .map(|number| format!("第{number}集${}", primary.api))
+            .collect::<Vec<_>>()
+            .join("#");
+        let film = catalog::ingest(
+            &h.app,
+            source,
+            &json!({"vod_id":832,"vod_name":"其他视频源可用性摘要","vod_year":"2026","type_name":"电视剧","vod_play_from":"线路","vod_play_url":lines}),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for episode in catalog::episodes(&h.app, &film.id).await.unwrap() {
+            save_source_health_probe(
+                &h,
+                &episode.id,
+                source_health_probe(warning, streams.clone()),
+                at,
+            )
+            .await;
+        }
+    }
+    sqlx::query("UPDATE sources SET enabled=0 WHERE id=?")
+        .bind(&blocked.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    let hits = h.hits.load(Ordering::Relaxed);
+    let (status, listing) = request(&h, "GET", "/api/subscriptions", json!({}), Some(&h.raw)).await;
+    assert_eq!(status, 200);
+    let source = |id: &str| {
+        listing["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["id"] == id)
+            .unwrap()
+    };
+    assert_eq!(
+        source(&primary.id)["health"],
+        json!({"probed":15,"verified":2,"rejected":4,"web_pages":1,"last_probed_at":recent-7})
+    );
+    assert_eq!(
+        source(&blocked.id)["health"],
+        json!({"probed":3,"verified":0,"rejected":3,"web_pages":0,"last_probed_at":recent-60})
+    );
+    assert_eq!(
+        source(&healthy.id)["health"],
+        json!({"probed":2,"verified":2,"rejected":0,"web_pages":0,"last_probed_at":recent-30})
+    );
+    assert_eq!(
+        source(&unprobed.id)["health"],
+        json!({"probed":0,"verified":0,"rejected":0,"web_pages":0,"last_probed_at":0})
+    );
+    assert_eq!(
+        source(&blocked.id)["enabled"],
+        false,
+        "摘要不改变管理员的启停选择"
+    );
+    let (status, denied) = request(
+        &h,
+        "GET",
+        "/api/subscriptions",
+        json!({}),
+        Some(&h.member_raw),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(denied.get("sources").is_none());
+    assert!(!denied.to_string().contains("health"));
+    assert_eq!(
+        request(&h, "GET", "/api/subscriptions", json!({}), None)
+            .await
+            .0,
+        401
+    );
+    let (_, ordinary) = request(&h, "GET", "/api/sources", json!({}), Some(&h.member_raw)).await;
+    assert!(
+        ordinary["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| source.get("health").is_none())
+    );
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        hits,
+        "摘要只读库，不发起媒体探测"
+    );
+}
+
+#[tokio::test]
+async fn native_source_choices_use_source_health_after_quality_and_before_id() {
+    let h = harness().await;
+    let primary = catalog::sources(&h.app).await.unwrap().remove(0);
+    let api_site: serde_json::Map<String, Value> = (0..7)
+        .map(|index| {
+            (
+                format!("health-{index}"),
+                json!({"name":format!("排序源{index}"),"api":primary.api}),
+            )
+        })
+        .collect();
+    let subscription = catalog::import(
+        &h.app,
+        &json!({"name":"来源排序可用性订阅","content":json!({"api_site":api_site}).to_string()}),
+    )
+    .await
+    .unwrap();
+    let media = url::Url::parse(&primary.api)
+        .unwrap()
+        .join("/clear.m3u8")
+        .unwrap();
+    let mut candidates = Vec::new();
+    for (index, source) in catalog::sources(&h.app)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|source| source.subscription_id == subscription)
+        .enumerate()
+    {
+        let film = catalog::ingest(
+            &h.app,
+            &source,
+            &json!({"vod_id":8400+index,"vod_name":"来源可用性排序剧集","vod_year":"2026","type_name":"电视剧","vod_play_from":"线路","vod_play_url":format!("第03集${media}")}),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let episode = catalog::episodes(&h.app, &film.id).await.unwrap().remove(0);
+        candidates.push((source, film, episode));
+    }
+    // 让原来的 id 顺序把拒绝源放在健康源之前，确保新排序确实覆盖这一情形。
+    candidates.sort_by(|a, b| a.2.id.cmp(&b.2.id));
+    let names = [
+        "全部拒绝源",
+        "待探测源",
+        "网页记录源",
+        "健康源",
+        "720p 源",
+        "1080p 历史源",
+        "加密 4K 源",
+    ];
+    let recent = now();
+    for (index, (source, _, episode)) in candidates.iter().enumerate() {
+        sqlx::query("UPDATE sources SET name=? WHERE id=?")
+            .bind(names[index])
+            .bind(&source.id)
+            .execute(&h.app.db)
+            .await
+            .unwrap();
+        if index >= 4 {
+            let (width, height) = match index {
+                4 => (1280, 720),
+                5 => (1920, 1080),
+                _ => (3840, 2160),
+            };
+            let mut info = source_health_probe(
+                "",
+                vec![
+                    json!({"codec_type":"video","codec_name":"h264","width":width,"height":height}),
+                ],
+            );
+            info["encrypted"] = json!(index == 6);
+            save_source_health_probe(
+                &h,
+                &episode.id,
+                info,
+                if index == 5 {
+                    recent - 8 * 86400
+                } else {
+                    recent
+                },
+            )
+            .await;
+        }
+        let (count, warning, streams, at) = match index {
+            0 | 5 => (3, "媒体探测返回 HTTP 444", vec![], recent),
+            1 => (
+                1,
+                "",
+                vec![json!({"codec_type":"video","codec_name":"h264"})],
+                recent - 8 * 86400,
+            ),
+            2 => (
+                1,
+                "该地址返回网页播放器，需要额外解析，请换源",
+                vec![],
+                recent,
+            ),
+            3 => (
+                1,
+                "",
+                vec![json!({"codec_type":"video","codec_name":"h264"})],
+                recent,
+            ),
+            _ => continue,
+        };
+        let lines = (1..=count)
+            .map(|number| format!("第{number}集${media}"))
+            .collect::<Vec<_>>()
+            .join("#");
+        let history = catalog::ingest(
+            &h.app,
+            source,
+            &json!({"vod_id":8500+index,"vod_name":format!("排序源历史样本{index}"),"vod_year":"2026","type_name":"电视剧","vod_play_from":"历史线路","vod_play_url":lines}),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for episode in catalog::episodes(&h.app, &history.id).await.unwrap() {
+            save_source_health_probe(
+                &h,
+                &episode.id,
+                source_health_probe(warning, streams.clone()),
+                at,
+            )
+            .await;
+        }
+    }
+    let slot = h.app.source_quality_slots.acquire().await.unwrap();
+    let path = format!("/v/api/v1/stream/list/{}", candidates[1].2.id);
+    let menu_names = |value: &Value| {
+        value["data"]["qualities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|choice| text(choice, "resolution"))
+            .collect::<Vec<_>>()
+    };
+    let expected = |indices: &[usize]| {
+        indices
+            .iter()
+            .map(|index| names[*index].to_string())
+            .collect::<Vec<_>>()
+    };
+    let (status, normal) = request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(status, 200);
+    assert_eq!(menu_names(&normal), expected(&[6, 5, 4, 3, 1, 2, 0]));
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (status, forbidden) = request(&h, "GET", &path, json!({}), Some(&h.member_raw)).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        menu_names(&forbidden),
+        expected(&[5, 4, 3, 1, 2, 0, 6]),
+        "禁止转发的加密优先级和画质优先级不变；未知画质先健康、再中性、最后全部拒绝，同档保留 id 顺序"
+    );
+    for (_, _, episode) in candidates.iter().take(4) {
+        assert_eq!(
+            catalog::episode(&h.app, &episode.id)
+                .await
+                .unwrap()
+                .probed_at,
+            0,
+            "未识别线路通过该视频源的其他近期探测记录排序"
+        );
+    }
+    drop(slot);
+}
+
 #[tokio::test]
 async fn background_source_quality_leaves_playback_capacity_and_rechecks_revoked_access() {
     let h = harness().await;
