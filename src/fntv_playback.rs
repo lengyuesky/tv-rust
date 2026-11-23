@@ -21,6 +21,8 @@ struct Choice {
     link: String,
     #[serde(default)]
     kind: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    client_only: bool,
 }
 
 impl Choice {
@@ -260,7 +262,7 @@ pub(crate) async fn prepare_start(
     who: &Identity,
     current: &Episode,
     info: &probe::MediaInfo,
-) -> Result<(Episode, probe::MediaInfo, Option<String>)> {
+) -> Result<(Episode, probe::MediaInfo, Option<String>, bool)> {
     let failure = match direct_ready(app, &who.user.id, current, info).await {
         Ok(()) => {
             let notice = app
@@ -268,7 +270,7 @@ pub(crate) async fn prepare_start(
                 .await?
                 .map(|value| text(&value, "notice"))
                 .filter(|notice| !notice.is_empty());
-            return Ok((current.clone(), info.clone(), notice));
+            return Ok((current.clone(), info.clone(), notice, false));
         }
         Err(error) => error.1,
     };
@@ -375,9 +377,21 @@ pub(crate) async fn prepare_start(
             30,
         )
         .await?;
-        return Ok((candidate, info, Some(notice)));
+        return Ok((candidate, info, Some(notice), false));
     }
-    // 没有确认可用的同集来源时，不改集、不改进度，也不突破禁止转发设置。
+    // 没有确认可用的同集来源时，才让播放器所在网络尝试被服务器拒绝的清单。
+    if *app.forbid_proxy.borrow()
+        && let Some(status) = probe::client_only(info)
+        && probe::require_native_available(info, &current.url, true).is_ok()
+    {
+        let original = catalog::source(app, &original_film.source_id).await?;
+        let notice = format!(
+            "服务器无法读取来源“{}”的清单（HTTP {status}），已交给播放器直接连接上游尝试；如仍失败请换源",
+            original.name
+        );
+        return Ok((current.clone(), info.clone(), Some(notice), true));
+    }
+    // 不改集、不改进度，也不突破禁止转发设置。
     probe::require_available(info)?;
     if failure == NOT_MEDIA {
         // 网页播放器交给飞牛只会得到含义不明的 -99985，这里直接说明原因。
@@ -385,7 +399,7 @@ pub(crate) async fn prepare_start(
             "当前来源没有返回可直接播放的视频（网页播放器或被上游拒绝）；暂时没有找到可用的同集来源，请稍后重试或换源",
         ));
     }
-    Ok((current.clone(), info.clone(), None))
+    Ok((current.clone(), info.clone(), None, false))
 }
 
 fn preparation_key(who: &Identity, episode: &str) -> String {
@@ -754,8 +768,10 @@ async fn activate(
     choice: &Choice,
 ) -> Result<playback::Play> {
     let e = validate_choice(app, who, menu, choice).await?;
-    // 探测不占用切换锁；切换事务只处理已经可播放的媒体。
-    probe::require_available(&probe::get(app, &e).await?)?;
+    // 探测不占用切换锁，避免慢源阻塞其他会话。
+    let info = probe::get(app, &e).await?;
+    let client_only = choice.client_only && *app.forbid_proxy.borrow();
+    probe::require_native_available(&info, &e.url, client_only)?;
     let _lock = app.native_switch_lock.lock().await;
     let fresh: Menu = sqlx::query_as("SELECT * FROM fntv_playback_menus WHERE id=?")
         .bind(&menu.id)
@@ -773,7 +789,7 @@ async fn activate(
             return playback::get(app, id).await;
         }
     }
-    let started = playback::start(app, who, &e.id).await?;
+    let started = playback::start_native(app, who, &e.id, client_only).await?;
     let id = text(&started, "id");
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let current: Menu = sqlx::query_as("SELECT * FROM fntv_playback_menus WHERE id=?")
@@ -814,8 +830,9 @@ pub(crate) async fn stream_menu(
     e: &Episode,
     origin: &str,
     current_play: &str,
+    client_only: bool,
 ) -> Result<Option<Value>> {
-    create_menu(app, who, e, origin, current_play, false).await
+    create_menu(app, who, e, origin, current_play, false, client_only).await
 }
 
 pub(crate) async fn proxy_menu(
@@ -825,7 +842,7 @@ pub(crate) async fn proxy_menu(
     origin: &str,
     current_play: &str,
 ) -> Result<()> {
-    create_menu(app, who, e, origin, current_play, true).await?;
+    create_menu(app, who, e, origin, current_play, true, false).await?;
     Ok(())
 }
 
@@ -836,6 +853,7 @@ async fn create_menu(
     origin: &str,
     current_play: &str,
     force_single: bool,
+    client_only: bool,
 ) -> Result<Option<Value>> {
     // 起播不等待后台画质识别：未识别完的来源沿用上一次结论，识别继续在后台完成。
     let sources = fntv::source_choices_within(
@@ -886,6 +904,8 @@ async fn create_menu(
             media_url: target.url,
             link: format!("{origin}/v/native-menu/{token}/{index}.{extension}"),
             kind,
+            // 仅本次准备选中的来源获准兜底，其他菜单项不能借此绕过预检。
+            client_only: client_only && target.id == e.id && *app.forbid_proxy.borrow(),
         });
     }
     let grouped = catalog::history_film_ids(app, &who.user.id, &e.film_id).await?;
@@ -990,6 +1010,21 @@ pub(crate) async fn current_link(
         )),
         None => Ok(None),
     }
+}
+
+/// 后续协商只沿用已签发菜单的兜底标记，不因本次探测失败临时放宽。
+pub(crate) async fn client_only_delivery(app: &App, who: &Identity, e: &Episode) -> Result<bool> {
+    if !*app.forbid_proxy.borrow() {
+        return Ok(false);
+    }
+    let menu: Option<Menu> = sqlx::query_as("SELECT * FROM fntv_playback_menus WHERE auth_hash=? AND (reference_episode_id=? OR active_play_id IN (SELECT id FROM plays WHERE episode_id=?)) AND closed=0 AND expires_at>? ORDER BY rowid DESC LIMIT 1")
+        .bind(&who.auth_hash).bind(&e.id).bind(&e.id).bind(now()).fetch_optional(&app.db).await?;
+    let Some(menu) = menu else { return Ok(false) };
+    menu.valid(who)?;
+    Ok(menu
+        .choices()?
+        .iter()
+        .any(|choice| choice.client_only && choice.episode_id == e.id && choice.media_url == e.url))
 }
 
 pub(crate) async fn payload_for_link(
@@ -1285,13 +1320,27 @@ fn playlist_link(
     ))
 }
 
+struct DirectManifestError {
+    error: Error,
+    upstream_status: Option<u16>,
+}
+
+impl From<Error> for DirectManifestError {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            upstream_status: None,
+        }
+    }
+}
+
 async fn direct_manifest(
     app: &App,
     p: &playback::Play,
     menu: &Menu,
     token: &str,
     url: &str,
-) -> Result<String> {
+) -> std::result::Result<String, DirectManifestError> {
     static URI: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r#"URI="([^"]+)""#).unwrap());
     // 只读取并解压有界清单。视频、音频、密钥和初始化分片仍由客户端直接读取上游。
@@ -1299,17 +1348,18 @@ async fn direct_manifest(
         .await
         .map_err(|error| Error(error.0, format!("HLS 清单读取失败：{}", error.1)))?;
     if !response.status().is_success() {
-        return Err(Error::bad(format!(
-            "HLS 清单返回 HTTP {}，请刷新来源或换源",
-            response.status().as_u16()
-        )));
+        let status = response.status().as_u16();
+        return Err(DirectManifestError {
+            error: Error::bad(format!("HLS 清单返回 HTTP {status}，请刷新来源或换源")),
+            upstream_status: Some(status),
+        });
     }
     let base = net::valid_url(response.url().as_str())?;
     let bytes = net::bytes(response, 4 * 1024 * 1024, false)
         .await
         .map_err(|error| Error(error.0, format!("HLS 清单读取失败：{}", error.1)))?;
     if !probe::is_hls(&bytes) {
-        return Err(Error::bad("播放地址未返回有效 HLS 清单，请刷新来源或换源"));
+        return Err(Error::bad("播放地址未返回有效 HLS 清单，请刷新来源或换源").into());
     }
     let input = String::from_utf8(bytes).map_err(|_| Error::bad("HLS 清单编码无效"))?;
     let ranges = hls_direct::ranges(app, &base, &input).await?;
@@ -1457,7 +1507,11 @@ async fn media_inner(
         .any(|name| request.headers().contains_key(*name));
     if request.method() == Method::HEAD {
         let info = probe::get(app, &e).await?;
-        probe::require_available(&info)?;
+        probe::require_native_available(
+            &info,
+            &e.url,
+            choice.client_only && *app.forbid_proxy.borrow(),
+        )?;
         let play = playback::owned(
             app,
             &who,
@@ -1501,9 +1555,25 @@ async fn media_inner(
         if choice.is_hls() {
             let manifest = match direct_manifest(app, &p, &menu, token, &media_url).await {
                 Ok(manifest) => manifest,
+                Err(error)
+                    if choice.client_only
+                        && *app.forbid_proxy.borrow()
+                        && error.upstream_status.is_some_and(probe::client_only_status) =>
+                {
+                    let fresh_who = identity(app, &menu).await?;
+                    validate_choice(app, &fresh_who, &menu, &choice).await?;
+                    let source = catalog::source(app, &choice.source_id).await?;
+                    let notice = format!(
+                        "服务器无法读取来源“{}”的清单（HTTP {}），已交给播放器直连上游尝试；如仍失败请换源",
+                        source.name,
+                        error.upstream_status.unwrap()
+                    );
+                    playback::event(app, &p, "client_direct_attempt", &notice).await?;
+                    return Ok(Redirect::temporary(&media_url).into_response());
+                }
                 Err(error) => {
-                    playback::event(app, &p, "manifest_error", &error.1).await?;
-                    return Err(error);
+                    playback::event(app, &p, "manifest_error", &error.error.1).await?;
+                    return Err(error.error);
                 }
             };
             let fresh_who = identity(app, &menu).await?;

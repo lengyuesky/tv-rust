@@ -104,6 +104,7 @@ async fn harness() -> Harness {
                 }else{([("content-type","image/png")],bytes.as_slice()).into_response()}
             },
             "/picture.png"=>([("content-type","image/png")],&include_bytes!("fixtures/hls-probe/image-prefixed.ts")[..112]).into_response(),
+            "/missing.m3u8"=>StatusCode::NOT_FOUND.into_response(),
             "/gone.m3u8"=>StatusCode::GONE.into_response(),
             "/key.bin"=>include_bytes!("fixtures/hls-probe/key.bin").as_slice().into_response(),
             "/segment-0.ts"=>include_bytes!("fixtures/hls-probe/segment-0.ts").as_slice().into_response(),
@@ -6407,6 +6408,416 @@ async fn native_forbidden_proxy_recovers_with_stale_probes_while_source_discover
         "未识别的非媒体地址不进入菜单，加密来源仍可显式选择：{labels:?}"
     );
     assert_eq!(labels[0], "可直链测试源");
+}
+
+async fn native_client_direct_fixture(h: &Harness, path: &str) -> catalog::Episode {
+    let episode = catalog::episode(&h.app, &h.episode).await.unwrap();
+    let url = url::Url::parse(&episode.url).unwrap().join(path).unwrap();
+    sqlx::query("UPDATE episodes SET url=?,probe='',probed_at=0 WHERE id=?")
+        .bind(url.as_str())
+        .bind(&episode.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+    catalog::episode(&h.app, &episode.id).await.unwrap()
+}
+
+async fn cache_native_client_direct_probe(
+    h: &Harness,
+    episode: &catalog::Episode,
+    warning: &str,
+    encrypted: bool,
+) {
+    sqlx::query("UPDATE episodes SET probe=?,probed_at=? WHERE id=?")
+        .bind(json!({"probe_version":3,"kind":"hls","duration":0.0,"size":0,"streams":[],"warning":warning,"encrypted":encrypted}).to_string())
+        .bind(now())
+        .bind(&episode.id)
+        .execute(&h.app.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn native_client_direct_attempt_is_the_last_resort_and_preserves_progress_binding() {
+    let h = harness().await;
+    let episode = native_client_direct_fixture(&h, "/blocked.m3u8?token=fixture").await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (status, info) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/info",
+        json!({"media_guid":episode.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{info}");
+    assert_eq!(info["data"]["media_guid"], episode.id);
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":episode.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{stream}");
+    assert_eq!(stream["data"]["file_stream"]["guid"], episode.id);
+    assert_eq!(stream["data"]["playback_mode"], "direct");
+    assert_eq!(stream["data"]["header"], json!({}));
+    assert_eq!(
+        stream["data"]["playback_notice"],
+        "服务器无法读取来源“测试源”的清单（HTTP 444），已交给播放器直接连接上游尝试；如仍失败请换源"
+    );
+    assert_eq!(
+        stream["data"]["direct_link_qualities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let delivered = text(&stream["data"]["direct_link_qualities"][0], "url");
+    let link = url::Url::parse(&delivered).unwrap();
+    assert!(link.path().starts_with("/v/native-menu/") && link.path().ends_with(".m3u8"));
+    let play = playback::latest(&h.app, &h.who, &episode.id).await.unwrap();
+    let (status, played) = request(
+        &h,
+        "POST",
+        "/v/api/v1/play/play",
+        json!({"media_guid":episode.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{played}");
+    assert_eq!(played["data"]["play_link"], delivered);
+
+    let head = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(link.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert_eq!(
+        head.headers()["content-type"],
+        "application/vnd.apple.mpegurl"
+    );
+    assert!(!head.headers().contains_key("location"));
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(link.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response.headers()["location"].to_str().unwrap(),
+        episode.url
+    );
+
+    let before = h.hits.load(Ordering::Relaxed);
+    for (name, value) in [
+        ("authorization", format!("Bearer {}", h.raw)),
+        ("cookie", format!("session={}", h.raw)),
+        ("authx", h.raw.clone()),
+    ] {
+        let response = router(h.app.clone(), "/nonexistent")
+            .oneshot(
+                Request::builder()
+                    .uri(link.path())
+                    .header(name, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "{name} 不能借兜底向上游跳转");
+        assert!(!response.headers().contains_key("location"));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(text(&error, "error").contains("禁止转发"));
+    }
+    assert_eq!(
+        h.hits.load(Ordering::Relaxed),
+        before,
+        "认证头请求不读取上游媒体"
+    );
+    let (status, refused) = request(
+        &h,
+        "GET",
+        &format!("/v/api/v1/media/range/{}", episode.id),
+        json!({}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(text(&refused, "msg").contains("禁止转发"));
+
+    let (status, recorded) = request(&h, "POST", "/v/api/v1/play/record", json!({"media_guid":episode.id,"play_link":delivered,"ts":12,"bitrate":stream["data"]["video_stream"]["bps"]}), Some(&h.raw)).await;
+    assert_eq!(status, 200, "{recorded}");
+    assert_eq!(recorded["data"], true);
+    let progress: (String, f64) =
+        sqlx::query_as("SELECT episode_id,position FROM progress WHERE user_id=? AND film_id=?")
+            .bind(&h.who.user.id)
+            .bind(&episode.film_id)
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap();
+    assert_eq!(progress, (episode.id.clone(), 12.0));
+    let current = playback::latest(&h.app, &h.who, &episode.id).await.unwrap();
+    assert_eq!(current.id, play.id);
+    assert_eq!(current.native_link_hash, play.native_link_hash);
+    assert_eq!(current.mode, "direct");
+    let (_, logs) = request(&h, "GET", "/api/logs", json!({}), Some(&h.raw)).await;
+    let events = logs["items"][0]["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "client_direct_attempt"
+                && text(event, "message").contains("服务器无法读取")
+                && text(event, "message").contains("播放器直连上游"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "manifest_error" || event["event"] == "bytes_received")
+    );
+    assert!(*h.app.forbid_proxy.borrow());
+}
+
+#[tokio::test]
+async fn native_client_direct_fallback_does_not_change_web_or_allowed_proxy_start() {
+    let h = harness().await;
+    let episode = native_client_direct_fixture(&h, "/blocked.m3u8").await;
+    for forbidden in [false, true] {
+        playback::set_forbidden(&h.app, forbidden).await.unwrap();
+        let (status, web) = request(
+            &h,
+            "POST",
+            "/api/plays",
+            json!({"episode_id":episode.id}),
+            Some(&h.raw),
+        )
+        .await;
+        assert_eq!(status, 400, "{web}");
+        assert_eq!(
+            web["error"],
+            "HLS 清单被上游拒绝（HTTP 444），请刷新来源或换源"
+        );
+        let (status, native) = request(
+            &h,
+            "POST",
+            "/v/api/v1/stream",
+            json!({"media_guid":episode.id}),
+            Some(&h.raw),
+        )
+        .await;
+        assert_eq!(status, if forbidden { 200 } else { 400 }, "{native}");
+        if !forbidden {
+            assert_eq!(native["msg"], web["error"]);
+        }
+    }
+    // 即使同一账号已有兜底菜单，网页入口也不能沿用它的放行标记。
+    let (status, web) = request(
+        &h,
+        "POST",
+        "/api/plays",
+        json!({"episode_id":episode.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(text(&web, "error").contains("HLS 清单被上游拒绝（HTTP 444）"));
+    assert!(
+        playback::start(&h.app, &h.who, &episode.id)
+            .await
+            .unwrap_err()
+            .1
+            .contains("HTTP 444")
+    );
+    playback::set_forbidden(&h.app, false).await.unwrap();
+    let (status, native) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":episode.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 400, "关闭禁止转发后仍沿用原有失败：{native}");
+    assert!(text(&native, "msg").contains("HLS 清单被上游拒绝（HTTP 444）"));
+}
+
+#[tokio::test]
+async fn native_client_direct_fallback_keeps_expired_encrypted_and_non_manifest_sources_rejected() {
+    let h = harness().await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    for (path, warning, encrypted, message) in [
+        ("/missing.m3u8", None, false, "媒体地址已失效"),
+        ("/gone.m3u8", None, false, "媒体地址已失效"),
+        (
+            "/share/denied",
+            Some("媒体探测返回 HTTP 403"),
+            false,
+            "HTTP 403",
+        ),
+        (
+            "/blocked.m3u8",
+            Some("媒体探测返回 HTTP 444"),
+            true,
+            "HTTP 444",
+        ),
+    ] {
+        let episode = native_client_direct_fixture(&h, path).await;
+        if let Some(warning) = warning {
+            cache_native_client_direct_probe(&h, &episode, warning, encrypted).await;
+        }
+        for path in [
+            "/v/api/v1/play/info",
+            "/v/api/v1/stream",
+            "/v/api/v1/stream/directLink",
+            "/v/api/v1/play/play",
+        ] {
+            let (status, response) = request(
+                &h,
+                "POST",
+                path,
+                json!({"media_guid":episode.id}),
+                Some(&h.raw),
+            )
+            .await;
+            assert_eq!(status, 400, "{path}: {response}");
+            assert!(text(&response, "msg").contains(message), "{response}");
+            assert!(response["data"].is_null());
+        }
+    }
+    let plays: i64 = sqlx::query_scalar("SELECT count(*) FROM plays")
+        .fetch_one(&h.app.db)
+        .await
+        .unwrap();
+    assert_eq!(plays, 0, "失效、加密及没有清单后缀的拒绝来源不签发兜底会话");
+}
+
+#[tokio::test]
+async fn native_client_direct_fallback_retries_and_returns_a_recovered_manifest_unchanged() {
+    let h = harness().await;
+    let episode = native_client_direct_fixture(&h, "/clear.m3u8").await;
+    // 起播沿用此前被拒绝的结论，但交付时上游已经恢复。
+    cache_native_client_direct_probe(&h, &episode, "媒体探测返回 HTTP 444", false).await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":episode.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{stream}");
+    assert!(text(&stream["data"], "playback_notice").contains("HTTP 444"));
+    let link = url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url")).unwrap();
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(link.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/vnd.apple.mpegurl"
+    );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(!response.headers().contains_key("location"));
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let segment = url::Url::parse(&episode.url)
+        .unwrap()
+        .join("clear-segment.ts")
+        .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        format!("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n{segment}\n#EXT-X-ENDLIST\n")
+            .as_bytes()
+    );
+    let (_, logs) = request(&h, "GET", "/api/logs", json!({}), Some(&h.raw)).await;
+    assert!(
+        !logs["items"][0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "client_direct_attempt"
+                || event["event"] == "manifest_error")
+    );
+}
+
+#[tokio::test]
+async fn native_client_direct_fallback_does_not_relax_previously_issued_normal_menus() {
+    let h = harness().await;
+    let episode = native_client_direct_fixture(&h, "/blocked.m3u8").await;
+    cache_native_client_direct_probe(&h, &episode, "", false).await;
+    playback::set_forbidden(&h.app, true).await.unwrap();
+    let (status, stream) = request(
+        &h,
+        "POST",
+        "/v/api/v1/stream",
+        json!({"media_guid":episode.id}),
+        Some(&h.raw),
+    )
+    .await;
+    assert_eq!(status, 200, "{stream}");
+    assert!(stream["data"].get("playback_notice").is_none());
+    let link = url::Url::parse(&text(&stream["data"]["direct_link_qualities"][0], "url")).unwrap();
+    let response = router(h.app.clone(), "/nonexistent")
+        .oneshot(
+            Request::builder()
+                .uri(link.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(!response.headers().contains_key("location"));
+    // 后续探测确认被拒绝，也不能让原本没有兜底标记的菜单自动变成跳转通道。
+    let episode = catalog::episode(&h.app, &episode.id).await.unwrap();
+    tv_rust::probe::source_quality(&h.app, &h.who.user.id, &episode, true, true)
+        .await
+        .unwrap();
+    for method in ["GET", "HEAD"] {
+        let response = router(h.app.clone(), "/nonexistent")
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(link.path())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert!(!response.headers().contains_key("location"));
+    }
+    let (_, logs) = request(&h, "GET", "/api/logs", json!({}), Some(&h.raw)).await;
+    let events = logs["items"][0]["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "manifest_error")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "client_direct_attempt")
+    );
 }
 
 #[tokio::test]

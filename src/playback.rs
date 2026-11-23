@@ -172,9 +172,18 @@ pub(crate) async fn register_assets(
     Ok(())
 }
 pub async fn start(app: &App, who: &Identity, episode_id: &str) -> Result<Value> {
+    start_native(app, who, episode_id, false).await
+}
+
+pub(crate) async fn start_native(
+    app: &App,
+    who: &Identity,
+    episode_id: &str,
+    client_only: bool,
+) -> Result<Value> {
     let (e, f, source) = catalog::available(app, &who.user.id, episode_id).await?;
     let info = probe::get(app, &e).await?;
-    probe::require_available(&info)?;
+    probe::require_native_available(&info, &e.url, client_only && *app.forbid_proxy.borrow())?;
     let id = guid(&[&random()]);
     let access = random();
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;

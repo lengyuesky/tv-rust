@@ -1317,9 +1317,10 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
     };
     let mut preparation_notice = None;
     let mut preparation_from = None;
+    let mut client_only = false;
     if prepares {
         let original = e.clone();
-        (e, info, preparation_notice) =
+        (e, info, preparation_notice, client_only) =
             native_playback::prepare_start(app, &who, &e, &info).await?;
         // 缓存提示不代表再次换源，只承接本次真正换源前的单集位置。
         if path == "/v/api/v1/play/info" && e.id != original.id {
@@ -1335,7 +1336,10 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
             | "/v/api/v1/stream/directLink"
             | "/v/api/v1/play/play"
     ) {
-        probe::require_available(&info)?;
+        if !client_only && probe::client_only(&info).is_some() {
+            client_only = native_playback::client_only_delivery(app, &who, &e).await?;
+        }
+        probe::require_native_available(&info, &e.url, client_only && *app.forbid_proxy.borrow())?;
     }
     catalog::available(app, &who.user.id, &e.id).await?;
     let source = catalog::source(app, &f.source_id).await?;
@@ -1446,7 +1450,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                     )
                 }
             } else {
-                let started = playback::start(app, &who, &e.id).await?;
+                let started = playback::start_native(app, &who, &e.id, client_only).await?;
                 let play_id = text(&started, "id");
                 // 飞牛 STRM 以交付的 URL 作为 play_link。片段给每次播放独立身份，
                 // 不改变上游 HTTP 地址或签名，也不会将本站凭据交给视频源。
@@ -1478,6 +1482,7 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                     &e,
                     &native_playback::origin(app, &headers)?,
                     &play_id,
+                    client_only,
                 )
                 .await?
             };
@@ -1496,7 +1501,17 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
             }
             let mut play = playback::get(app, &play_id).await?;
             if let Some(notice) = preparation_notice {
-                playback::event(app, &play, "direct_source_selected", &notice).await?;
+                playback::event(
+                    app,
+                    &play,
+                    if client_only {
+                        "client_direct_issued"
+                    } else {
+                        "direct_source_selected"
+                    },
+                    &notice,
+                )
+                .await?;
                 response["playback_notice"] = json!(notice);
                 native_playback::clear_preparation(app, &who, &e.id).await?;
             }
