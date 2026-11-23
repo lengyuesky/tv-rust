@@ -315,6 +315,21 @@ fn preparation_key(who: &Identity, episode: &str) -> String {
     format!("native-direct-selected:v1:{}:{episode}", who.auth_hash)
 }
 
+pub(crate) async fn update_preparation_notice(
+    app: &App,
+    who: &Identity,
+    episode: &str,
+    notice: &str,
+) -> Result<()> {
+    // 保留准备时的过期时间，让后续协商读到同一句提示。
+    sqlx::query("UPDATE cache SET value=? WHERE key=?")
+        .bind(json!({"notice":notice}).to_string())
+        .bind(preparation_key(who, episode))
+        .execute(&app.db)
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn clear_preparation(app: &App, who: &Identity, episode: &str) -> Result<()> {
     sqlx::query("DELETE FROM cache WHERE key=?")
         .bind(preparation_key(who, episode))

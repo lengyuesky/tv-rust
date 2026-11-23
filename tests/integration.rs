@@ -4946,6 +4946,308 @@ async fn native_forbidden_proxy_skips_a_rejected_manifest_before_issuing_playbac
 }
 
 #[tokio::test]
+async fn native_forbidden_proxy_auto_switch_resumes_only_newer_same_episode_progress() {
+    type ProgressRow = (String, String, String, f64, f64, i64, i64);
+
+    for (name, original_progress, target_progress, duration, expected, resumed) in [
+        (
+            "原来源更新且目标无进度",
+            Some(("第05集", 627.0, 2)),
+            None,
+            1200.0,
+            622,
+            true,
+        ),
+        (
+            "原来源进度更新",
+            Some(("第05集", 627.0, 2)),
+            Some(("第05集", 7.0, 1)),
+            1200.0,
+            622,
+            true,
+        ),
+        (
+            "目标来源进度更新",
+            Some(("第05集", 627.0, 1)),
+            Some(("第05集", 37.0, 2)),
+            1200.0,
+            37,
+            false,
+        ),
+        (
+            "更新时间相同",
+            Some(("第05集", 627.0, 2)),
+            Some(("第05集", 7.0, 2)),
+            1200.0,
+            7,
+            false,
+        ),
+        (
+            "原来源记录属于别集",
+            Some(("第01集", 627.0, 2)),
+            Some(("第05集", 7.0, 1)),
+            1200.0,
+            7,
+            false,
+        ),
+        (
+            "目标来源记录属于别集",
+            Some(("第05集", 627.0, 1)),
+            Some(("第01集", 37.0, 2)),
+            1200.0,
+            622,
+            true,
+        ),
+        (
+            "原位置恰到片尾前三十秒",
+            Some(("第05集", 1170.0, 2)),
+            Some(("第05集", 7.0, 1)),
+            1200.0,
+            7,
+            false,
+        ),
+        (
+            "原位置尚未到片尾区域",
+            Some(("第05集", 1169.0, 2)),
+            Some(("第05集", 7.0, 1)),
+            1200.0,
+            1164,
+            true,
+        ),
+        (
+            "原位置已超过目标时长",
+            Some(("第05集", 1250.0, 2)),
+            None,
+            1200.0,
+            0,
+            false,
+        ),
+        (
+            "回退位置不小于零",
+            Some(("第05集", 3.0, 2)),
+            None,
+            1200.0,
+            0,
+            true,
+        ),
+        (
+            "目标时长未知",
+            Some(("第05集", 627.0, 2)),
+            None,
+            0.0,
+            622,
+            true,
+        ),
+        (
+            "原来源没有进度",
+            None,
+            Some(("第05集", 7.0, 1)),
+            1200.0,
+            7,
+            false,
+        ),
+        (
+            "目标自己的进度仍裁剪时长",
+            Some(("第05集", 627.0, 1)),
+            Some(("第05集", 1250.0, 2)),
+            1200.0,
+            1200,
+            false,
+        ),
+    ] {
+        let h = harness().await;
+        let (original, target) = native_direct_fallback_fixture(&h).await;
+        playback::set_forbidden(&h.app, true).await.unwrap();
+        let mut info: Value = serde_json::from_str(&target.probe).unwrap();
+        info["duration"] = json!(duration);
+        sqlx::query("UPDATE episodes SET probe=? WHERE id=?")
+            .bind(info.to_string())
+            .bind(&target.id)
+            .execute(&h.app.db)
+            .await
+            .unwrap();
+        let updated = now() - 60;
+        for (user, film, progress) in [
+            (&h.other.user.id, &original.film_id, original_progress),
+            (&h.other.user.id, &target.film_id, target_progress),
+            // 其他账号的更新记录不参与本次续播。
+            (&h.who.user.id, &target.film_id, Some(("第05集", 999.0, 3))),
+        ] {
+            if let Some((title, position, updated_at)) = progress {
+                let episode = catalog::episodes(&h.app, film)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|episode| episode.title == title)
+                    .unwrap();
+                sqlx::query("INSERT INTO progress VALUES(?,?,?,?,?,?,?)")
+                    .bind(user)
+                    .bind(film)
+                    .bind(&episode.id)
+                    .bind(position)
+                    .bind(1200.0)
+                    .bind(0)
+                    .bind(updated + updated_at)
+                    .execute(&h.app.db)
+                    .await
+                    .unwrap();
+            }
+        }
+        let before: Vec<ProgressRow> =
+            sqlx::query_as("SELECT * FROM progress ORDER BY user_id,film_id")
+                .fetch_all(&h.app.db)
+                .await
+                .unwrap();
+        let (status, info) = request(
+            &h,
+            "POST",
+            "/v/api/v1/play/info",
+            json!({"item_guid":original.id}),
+            Some(&h.member_raw),
+        )
+        .await;
+        assert_eq!(status, 200, "{name}: {info}");
+        assert_eq!(info["data"]["media_guid"], target.id, "{name}");
+        assert_eq!(info["data"]["ts"], expected, "{name}");
+        let key = format!(
+            "native-direct-selected:v1:{}:{}",
+            h.other.auth_hash, target.id
+        );
+        let cached = h.app.cache_get(&key).await.unwrap().unwrap();
+        let notice = text(&cached, "notice");
+        assert!(notice.contains("加密 HLS"), "{name}: {notice}");
+        assert_eq!(notice.contains("并从原来源的"), resumed, "{name}: {notice}");
+        if resumed {
+            assert!(
+                notice.ends_with(&format!(
+                    "，并从原来源的 {} 分 {} 秒继续",
+                    expected / 60,
+                    expected % 60
+                )),
+                "{name}: {notice}"
+            );
+        }
+        if name == "原来源更新且目标无进度" {
+            // 已有换源提示的缓存不让目标来源普通起播再次继承位置。
+            let (status, ordinary) = request(
+                &h,
+                "POST",
+                "/v/api/v1/play/info",
+                json!({"media_guid":target.id}),
+                Some(&h.member_raw),
+            )
+            .await;
+            assert_eq!(status, 200, "{ordinary}");
+            assert_eq!(ordinary["data"]["media_guid"], target.id);
+            assert_eq!(ordinary["data"]["ts"], 0);
+        }
+        let (status, stream) = request(
+            &h,
+            "POST",
+            "/v/api/v1/stream",
+            json!({"media_guid":target.id,"item_guid":info["data"]["guid"]}),
+            Some(&h.member_raw),
+        )
+        .await;
+        assert_eq!(status, 200, "{name}: {stream}");
+        assert_eq!(stream["data"]["file_stream"]["guid"], target.id, "{name}");
+        assert_eq!(stream["data"]["playback_mode"], "direct", "{name}");
+        assert_eq!(text(&stream["data"], "playback_notice"), notice, "{name}");
+        assert!(h.app.cache_get(&key).await.unwrap().is_none(), "{name}");
+        let (status, logs) = request(&h, "GET", "/api/logs", json!({}), Some(&h.member_raw)).await;
+        assert_eq!(status, 200, "{name}: {logs}");
+        let selected = logs["items"][0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event"] == "direct_source_selected")
+            .unwrap();
+        assert_eq!(selected["message"], notice, "{name}");
+        let after: Vec<ProgressRow> =
+            sqlx::query_as("SELECT * FROM progress ORDER BY user_id,film_id")
+                .fetch_all(&h.app.db)
+                .await
+                .unwrap();
+        assert_eq!(after, before, "{name}: 起播准备和协商不新增或改写进度");
+
+        if name == "原来源更新且目标无进度" {
+            let link = text(&stream["data"]["direct_link_qualities"][0], "url");
+            let (status, recorded) = request(
+                &h,
+                "POST",
+                "/v/api/v1/play/record",
+                json!({"media_guid":target.id,"play_link":link,"ts":632,
+                    "bitrate":stream["data"]["video_stream"]["bps"]}),
+                Some(&h.member_raw),
+            )
+            .await;
+            assert_eq!(status, 200, "{recorded}");
+            assert_eq!(recorded["data"], true);
+            let reported: Vec<ProgressRow> =
+                sqlx::query_as("SELECT * FROM progress ORDER BY user_id,film_id")
+                    .fetch_all(&h.app.db)
+                    .await
+                    .unwrap();
+            assert_eq!(reported.len(), before.len() + 1);
+            for row in &before {
+                assert!(
+                    reported.contains(row),
+                    "客户端回传不修改原来源或其他账号的进度"
+                );
+            }
+            let target_progress = reported
+                .iter()
+                .find(|row| row.0 == h.other.user.id && row.1 == target.film_id)
+                .unwrap();
+            assert_eq!(target_progress.2, target.id);
+            assert_eq!(target_progress.3, 632.0);
+            let (status, ordinary) = request(
+                &h,
+                "POST",
+                "/v/api/v1/play/info",
+                json!({"media_guid":target.id}),
+                Some(&h.member_raw),
+            )
+            .await;
+            assert_eq!(status, 200, "{ordinary}");
+            assert_eq!(
+                ordinary["data"]["ts"], 632,
+                "普通起播使用目标自己的位置，不回退"
+            );
+            let original_index = stream["data"]["direct_link_qualities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|choice| choice["resolution"] == "测试源")
+                .unwrap();
+            let (status, explicit) = request(
+                &h,
+                "POST",
+                "/v/api/v1/stream/directLink",
+                json!({"media_guid":target.id,"direct_link_quality_index":original_index}),
+                Some(&h.member_raw),
+            )
+            .await;
+            assert_eq!(status, 200, "{explicit}");
+            assert_eq!(
+                explicit["data"]["file_stream"]["guid"], original.id,
+                "显式选源不被自动替换"
+            );
+            assert_eq!(explicit["data"]["playback_mode"], "direct");
+            assert!(explicit["data"]["playback_notice"].is_null());
+            let selections: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM play_events WHERE event='direct_source_selected'",
+            )
+            .fetch_one(&h.app.db)
+            .await
+            .unwrap();
+            assert_eq!(selections, 1, "显式选源不产生自动换源续播事件");
+            assert!(*h.app.forbid_proxy.borrow());
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_playback_never_delivers_web_player_pages_as_media() {
     let h = harness().await;
     let primary = catalog::sources(&h.app).await.unwrap().remove(0);

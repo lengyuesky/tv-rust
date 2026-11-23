@@ -1312,9 +1312,15 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
         Err(error) => return Err(error),
     };
     let mut preparation_notice = None;
+    let mut preparation_from = None;
     if prepares {
+        let original = e.clone();
         (e, info, preparation_notice) =
             native_playback::prepare_start(app, &who, &e, &info).await?;
+        // 缓存提示不代表再次换源，只承接本次真正换源前的单集位置。
+        if path == "/v/api/v1/play/info" && e.id != original.id {
+            preparation_from = Some(original);
+        }
         validate_item_media(app, &who, &item, &e).await?;
     }
     let f = catalog::film(app, &e.film_id).await?;
@@ -1332,15 +1338,16 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
     let (video, audio, subtitle) = tracks(&e, &info, &source.name);
     match path.as_str() {
         "/v/api/v1/play/info" => {
-            let prior: Option<(String, f64)> = sqlx::query_as(
-                "SELECT episode_id,position FROM progress WHERE user_id=? AND film_id=?",
+            let prior: Option<(String, f64, i64)> = sqlx::query_as(
+                "SELECT episode_id,position,updated_at FROM progress WHERE user_id=? AND film_id=?",
             )
             .bind(&who.user.id)
             .bind(&f.id)
             .fetch_optional(&app.db)
             .await?;
             let mut ts = 0.0;
-            if let Some((previous, position)) = prior {
+            let mut target_updated_at = None;
+            if let Some((previous, position, updated_at)) = prior {
                 let same_episode = previous == e.id || {
                     let hint = catalog::switch_episode_hint(
                         app,
@@ -1356,10 +1363,39 @@ async fn inner(app: &App, request: Request) -> Result<Response> {
                 };
                 if same_episode {
                     ts = position;
+                    target_updated_at = Some(updated_at);
+                }
+            }
+            let mut resumed = false;
+            if let Some(original) = preparation_from {
+                let prior: Option<(f64, i64)> = sqlx::query_as(
+                    "SELECT position,updated_at FROM progress WHERE user_id=? AND film_id=? AND episode_id=?",
+                )
+                .bind(&who.user.id)
+                .bind(&original.film_id)
+                .bind(&original.id)
+                .fetch_optional(&app.db)
+                .await?;
+                // 先按记录位置排除片尾，避免回退后把已看完的内容误作续播。
+                if let Some((position, updated_at)) = prior
+                    && target_updated_at.is_none_or(|target| updated_at > target)
+                    && (info.duration <= 0.0 || position < (info.duration - 30.0).max(0.0))
+                {
+                    ts = (position - 5.0).max(0.0);
+                    resumed = true;
                 }
             }
             if info.duration > 0.0 {
                 ts = ts.min(info.duration);
+            }
+            if resumed && let Some(notice) = preparation_notice.as_mut() {
+                let seconds = ts as u64;
+                notice.push_str(&format!(
+                    "，并从原来源的 {} 分 {} 秒继续",
+                    seconds / 60,
+                    seconds % 60
+                ));
+                native_playback::update_preparation_notice(app, &who, &e.id, notice).await?;
             }
             let mut item_row = row(app, &who, &f, Some(&e), false).await?;
             let work = identity::work(app, &f).await?;
